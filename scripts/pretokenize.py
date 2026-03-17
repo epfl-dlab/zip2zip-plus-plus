@@ -26,6 +26,7 @@ def main():
     parser.add_argument("--dataset", type=str, default="HuggingFaceFW/fineweb")
     parser.add_argument("--dataset_name", type=str, default="sample-10BT")
     parser.add_argument("--dataset_split", type=str, default="train")
+    parser.add_argument("--column", type=str, default="text")
     parser.add_argument("--tokens_per_shard", type=int, default=100_000_000)
     parser.add_argument("--target_tokens", type=float, default=10.5e9)
     parser.add_argument("--min_doc_length", type=int, default=50)
@@ -68,7 +69,10 @@ def main():
             return
 
     for sample in ds:
-        text = sample["text"]
+        if args.column not in sample:
+            raise KeyError(f"Column '{args.column}' not found in sample. Available columns: {list(sample.keys())}")
+
+        text = sample[args.column]
         if not text or len(text) < args.min_doc_length:
             continue
 
