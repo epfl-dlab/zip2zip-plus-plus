@@ -4,7 +4,8 @@ version = "0.1.0"
 description = "Pretraining zip2zip language models with inference-time adaptive tokenization via LZW compression"
 requires-python = ">=3.12"
 dependencies = [
-    "torch>=2.5.0",
+    "torch>=2.12.0.dev20260310",
+    "triton>=3.6.0",
     "numpy",
     "zip2zip-compression>=0.3.3",
     "torchtitan",
@@ -26,6 +27,13 @@ packages = ["src/zip2zip_core"]
 [tool.uv]
 cache-dir = ".uv-cache"
 
+[[tool.uv.index]]
+name = "pytorch-nightly-cu130"
+url = "https://download.pytorch.org/whl/nightly/cu130"
+explicit = true
+
 [tool.uv.sources]
+torch = { index = "pytorch-nightly-cu130" }
+triton = { index = "pytorch-nightly-cu130" }
 zip2zip-compression = { path = "ext/zip2zip-compression" }
 torchtitan = { path = "ext/torchtitan" }

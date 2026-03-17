@@ -6,9 +6,8 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64
 #SBATCH --time=12:00:00
-#SBATCH --output=%x_%j.log
-#SBATCH --error=%x_%j.err
 #SBATCH --environment=verl_swiss
+#SBATCH --output=%x_%j.out
 #SBATCH --account=a0101
 
 set -euo pipefail
@@ -16,18 +15,14 @@ set -euo pipefail
 # ---------- paths ----------
 export SCRATCH=/iopsstor/scratch/cscs/nathanrchn
 export HF_HOME=$SCRATCH/.cache/huggingface
-PROJECT_DIR=$(dirname "$(dirname "$(readlink -f "$0")")")
+PROJECT_DIR=/capstor/scratch/cscs/nathanrchn/zip2zip-core
 
-# Ensure container python takes precedence over miniconda
-export PATH=/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin:$PATH
-
-# Activate the uv venv (assumes `uv sync` was run beforehand)
-export VIRTUAL_ENV=$PROJECT_DIR/.venv
-export PATH=$VIRTUAL_ENV/bin:$PATH
+# Use the uv venv (has torch nightly with varlen_attn + all deps)
+export PYTHON=$PROJECT_DIR/.venv/bin/python
 
 # ---------- training config (override via environment) ----------
 DATA_DIR=${DATA_DIR:-$SCRATCH/zip2zip-data/fineweb-llama3-tokens}
-OUTPUT_DIR=${OUTPUT_DIR:-$SCRATCH/zip2zip-outputs/zip2zip-1b}
+OUTPUT_DIR=${OUTPUT_DIR:-/users/nathanrchn/capstor_scratch/zip2zip-outputs}
 MAX_SUBTOKENS=${MAX_SUBTOKENS:-4}
 ENCODER_DIM=${ENCODER_DIM:-512}
 ENCODER_INTERMEDIATE_SIZE=${ENCODER_INTERMEDIATE_SIZE:-2048}
@@ -44,7 +39,7 @@ SAVE_FREQ=${SAVE_FREQ:-1000}
 LOG_FREQ=${LOG_FREQ:-10}
 RESUME_FROM=${RESUME_FROM:-}
 
-mkdir -p "$(dirname "$OUTPUT_DIR")"
+mkdir -p "$OUTPUT_DIR"
 
 # ---------- NCCL / network ----------
 export NCCL_DEBUG=WARN
@@ -69,12 +64,11 @@ if [ -n "$RESUME_FROM" ]; then
 fi
 
 srun --export=ALL bash -c '
-export PATH=/usr/local/bin:/usr/bin:$PATH
 export LOCAL_RANK=$((SLURM_LOCALID))
 export RANK=$((SLURM_NODEID * 4 + SLURM_LOCALID))
 export CUDA_VISIBLE_DEVICES=$LOCAL_RANK
 export PYTHONUNBUFFERED=1
-python -m zip2zip_core.train \
+'"$PYTHON"' -m zip2zip_core.train \
     --data_dir '"$DATA_DIR"' \
     --output_dir '"$OUTPUT_DIR"' \
     --max_subtokens '"$MAX_SUBTOKENS"' \
