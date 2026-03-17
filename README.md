@@ -67,6 +67,19 @@ MAX_SUBTOKENS=3 STEPS=12000 RESUME_FROM=/path/to/step_6000 \
     sbatch scripts/train.sbatch
 ```
 
+Enable [Weights & Biases](https://wandb.ai) logging:
+
+```bash
+WANDB=1 WANDB_PROJECT=zip2zip-core WANDB_RUN_NAME=my-run \
+    sbatch scripts/train.sbatch
+```
+
+Set your API key in `scripts/train.sbatch` or export it before submitting:
+
+```bash
+export WANDB_API_KEY=<your-wandb-api-key>
+```
+
 ### 3. Curriculum training
 
 Run phases sequentially, resuming from the previous checkpoint:

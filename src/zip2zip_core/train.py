@@ -136,6 +136,9 @@ def main():
     parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--compile", action="store_true", default=True)
     parser.add_argument("--no_compile", action="store_true")
+    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument("--wandb_project", type=str, default="zip2zip-core")
+    parser.add_argument("--wandb_name", type=str, default=None)
     args = parser.parse_args()
 
     if args.no_compile:
@@ -156,6 +159,15 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
         print(f"World size: {world_size}")
         print(f"Config: {json.dumps(vars(args), indent=2)}")
+
+        if args.wandb:
+            import wandb
+
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_name,
+                config=vars(args),
+            )
 
     # Build model
     config = zip2zip_llama_configs[args.model_config]
@@ -287,6 +299,18 @@ def main():
                     f"tokens={total_tokens_seen/1e9:.2f}B"
                 )
 
+                if args.wandb:
+                    wandb.log(
+                        {
+                            "loss": loss_tensor.item(),
+                            "lr": lr,
+                            "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                            "tokens_per_sec": tokens_per_sec,
+                            "total_tokens": total_tokens_seen,
+                        },
+                        step=step,
+                    )
+
             log_loss = 0.0
             log_tokens = 0
             start_time = time.time()
@@ -300,6 +324,8 @@ def main():
 
     if rank == 0:
         print("Training complete!")
+        if args.wandb:
+            wandb.finish()
 
     dist.destroy_process_group()
 

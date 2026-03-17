@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64
 #SBATCH --time=12:00:00
-#SBATCH --environment=verl_swiss
+#SBATCH --environment=/capstor/scratch/cscs/nathanrchn/images/vs:251215/env.toml
 #SBATCH --output=%x_%j.out
 #SBATCH --account=a0101
 
@@ -19,6 +19,8 @@ PROJECT_DIR=/capstor/scratch/cscs/nathanrchn/zip2zip-core
 
 # Use the uv venv (has torch nightly with varlen_attn + all deps)
 export PYTHON=$PROJECT_DIR/.venv/bin/python
+
+export WANDB_API_KEY=<your-wandb-api-key>
 
 # ---------- training config (override via environment) ----------
 DATA_DIR=${DATA_DIR:-$SCRATCH/zip2zip-data/fineweb-llama3-tokens}
@@ -38,6 +40,9 @@ WARMUP_STEPS=${WARMUP_STEPS:-500}
 SAVE_FREQ=${SAVE_FREQ:-1000}
 LOG_FREQ=${LOG_FREQ:-10}
 RESUME_FROM=${RESUME_FROM:-}
+WANDB=${WANDB:-}
+WANDB_PROJECT=${WANDB_PROJECT:-zip2zip-core}
+WANDB_RUN_NAME=${WANDB_RUN_NAME:-}
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -63,6 +68,14 @@ if [ -n "$RESUME_FROM" ]; then
     RESUME_FLAG="--resume_from $RESUME_FROM"
 fi
 
+WANDB_FLAG=""
+if [ -n "$WANDB" ]; then
+    WANDB_FLAG="--wandb --wandb_project $WANDB_PROJECT"
+    if [ -n "$WANDB_RUN_NAME" ]; then
+        WANDB_FLAG="$WANDB_FLAG --wandb_name $WANDB_RUN_NAME"
+    fi
+fi
+
 srun --export=ALL bash -c '
 export LOCAL_RANK=$((SLURM_LOCALID))
 export RANK=$((SLURM_NODEID * 4 + SLURM_LOCALID))
@@ -85,5 +98,6 @@ export PYTHONUNBUFFERED=1
     --warmup_steps '"$WARMUP_STEPS"' \
     --save_freq '"$SAVE_FREQ"' \
     --log_freq '"$LOG_FREQ"' \
-    '"$RESUME_FLAG"'
+    '"$RESUME_FLAG"' \
+    '"$WANDB_FLAG"'
 '
