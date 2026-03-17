@@ -1,0 +1,31 @@
+[project]
+name = "zip2zip-core"
+version = "0.1.0"
+description = "Pretraining zip2zip language models with inference-time adaptive tokenization via LZW compression"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.5.0",
+    "numpy",
+    "zip2zip-compression>=0.3.3",
+    "torchtitan",
+]
+
+[project.optional-dependencies]
+data = [
+    "transformers>=4.47.0",
+    "datasets>=3.6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zip2zip_core"]
+
+[tool.uv]
+cache-dir = ".uv-cache"
+
+[tool.uv.sources]
+zip2zip-compression = { path = "ext/zip2zip-compression" }
+torchtitan = { path = "ext/torchtitan" }

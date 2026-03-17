@@ -1,0 +1,6 @@
+[submodule "ext/torchtitan"]
+	path = ext/torchtitan
+	url = https://github.com/pytorch/torchtitan.git
+[submodule "ext/zip2zip-compression"]
+	path = ext/zip2zip-compression
+	url = https://github.com/epfl-dlab/zip2zip-compression.git

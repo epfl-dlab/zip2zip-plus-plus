@@ -1,0 +1,10 @@
+.uv-cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+*.so
+*.dylib
+target/
