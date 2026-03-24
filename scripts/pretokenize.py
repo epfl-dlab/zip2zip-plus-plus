@@ -1,7 +1,7 @@
 """Pre-tokenize a text dataset with the Llama 3 tokenizer.
 
 Saves tokenized data as numpy files for efficient loading during training.
-Each shard contains ~100M tokens.
+Each shard contains ~100M tokens. Uses all available CPUs for parallel tokenization.
 
 Usage:
     python scripts/pretokenize.py \
@@ -13,6 +13,8 @@ Usage:
 
 import argparse
 import os
+import time
+from multiprocessing import cpu_count
 
 import numpy as np
 from datasets import load_dataset
@@ -30,9 +32,13 @@ def main():
     parser.add_argument("--tokens_per_shard", type=int, default=100_000_000)
     parser.add_argument("--target_tokens", type=float, default=10.5e9)
     parser.add_argument("--min_doc_length", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=10_000)
+    parser.add_argument("--num_workers", type=int, default=0, help="Number of workers (0 = all CPUs)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
+
+    num_workers = args.num_workers if args.num_workers > 0 else cpu_count()
 
     print(f"Loading tokenizer from {args.model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -43,13 +49,35 @@ def main():
     print(f"vocab_size={vocab_size}, bos={bos_id}, eos={eos_id}")
     print(f"Output dir: {args.output_dir}")
     print(f"Target: {args.target_tokens/1e9:.1f}B tokens")
+    print(f"Using {num_workers} workers, batch_size={args.batch_size}")
 
-    print("Loading dataset (streaming)...")
+    print("Loading dataset...")
     ds = load_dataset(
         args.dataset,
         name=args.dataset_name,
         split=args.dataset_split,
-        streaming=True,
+    )
+
+    # Filter short documents
+    ds = ds.filter(
+        lambda x: x[args.column] is not None and len(x[args.column]) >= args.min_doc_length,
+        num_proc=num_workers,
+    )
+
+    # Tokenize in parallel using datasets .map()
+    def tokenize(batch):
+        all_tokens = []
+        for text in batch[args.column]:
+            tokens = tokenizer.encode(text, add_special_tokens=False)
+            all_tokens.append([bos_id] + tokens + [eos_id])
+        return {"tokens": all_tokens}
+
+    ds = ds.map(
+        tokenize,
+        batched=True,
+        batch_size=args.batch_size,
+        num_proc=num_workers,
+        remove_columns=ds.column_names,
     )
 
     shard_idx = 0
@@ -68,17 +96,10 @@ def main():
             print("Already have enough tokens!")
             return
 
+    start_time = time.time()
+
     for sample in ds:
-        if args.column not in sample:
-            raise KeyError(f"Column '{args.column}' not found in sample. Available columns: {list(sample.keys())}")
-
-        text = sample[args.column]
-        if not text or len(text) < args.min_doc_length:
-            continue
-
-        tokens = tokenizer.encode(text, add_special_tokens=False)
-        tokens = [bos_id] + tokens + [eos_id]
-        token_buffer.extend(tokens)
+        token_buffer.extend(sample["tokens"])
         docs_processed += 1
 
         while len(token_buffer) >= args.tokens_per_shard:
@@ -88,7 +109,9 @@ def main():
 
             total_tokens += args.tokens_per_shard
             token_buffer = token_buffer[args.tokens_per_shard:]
-            print(f"Saved shard {shard_idx}: {shard_path} ({total_tokens/1e9:.2f}B tokens, {docs_processed} docs)")
+            elapsed = time.time() - start_time
+            tok_per_sec = total_tokens / elapsed
+            print(f"Saved shard {shard_idx}: {shard_path} ({total_tokens/1e9:.2f}B tokens, {docs_processed} docs, {tok_per_sec/1e6:.2f}M tok/s)")
             shard_idx += 1
 
             if total_tokens >= target_tokens:
@@ -105,8 +128,11 @@ def main():
         total_tokens += len(token_buffer)
         print(f"Saved final shard {shard_idx}: {shard_path} ({total_tokens/1e9:.2f}B tokens)")
 
+    elapsed = time.time() - start_time
+    tok_per_sec = total_tokens / elapsed if elapsed > 0 else 0
     print(f"\nDone! Total: {total_tokens/1e9:.2f}B tokens in {shard_idx+1} shards")
     print(f"Documents processed: {docs_processed}")
+    print(f"Elapsed: {elapsed:.1f}s, Average: {tok_per_sec/1e6:.2f}M tok/s")
 
 
 if __name__ == "__main__":

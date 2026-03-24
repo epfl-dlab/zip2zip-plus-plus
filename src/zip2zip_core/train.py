@@ -244,8 +244,12 @@ def main():
     step = start_step
     log_loss = 0.0
     log_base_loss = 0.0
+    log_compression = 0.0
     log_type_loss = 0.0
     log_type_acc = 0.0
+    log_base_type_acc = 0.0
+    log_hyper_type_acc = 0.0
+    log_hyper_ratio = 0.0
     log_tokens = 0
     start_time = time.time()
     use_token_type_head = args.token_type_loss_weight > 0
@@ -261,8 +265,12 @@ def main():
         optimizer.zero_grad()
         accum_loss = 0.0
         accum_base_loss = 0.0
+        accum_compression = 0.0
         accum_type_loss = 0.0
         accum_type_acc = 0.0
+        accum_base_type_acc = 0.0
+        accum_hyper_type_acc = 0.0
+        accum_hyper_ratio = 0.0
 
         for micro_step in range(args.gradient_accumulation_steps):
             input_dict, labels = next(data_iter)
@@ -298,9 +306,11 @@ def main():
                 # Token type loss: predict if next token is base (0) or hyper (1)
                 if use_token_type_head:
                     type_targets = (labels >= config.vocab_size).float().flatten(0, 1)
+                    valid_targets = type_targets[valid_mask]
+                    valid_type_logits = token_type_logits.flatten(0, 1).float()[valid_mask]
                     type_loss = F.binary_cross_entropy_with_logits(
-                        token_type_logits.flatten(0, 1).float()[valid_mask],
-                        type_targets[valid_mask],
+                        valid_type_logits,
+                        valid_targets,
                         reduction="mean",
                     )
                     backward_loss = backward_loss + args.token_type_loss_weight * type_loss
@@ -308,11 +318,20 @@ def main():
                 loss.backward()
             accum_loss += backward_loss.item() / args.gradient_accumulation_steps
             accum_base_loss += base_token_loss.item() / args.gradient_accumulation_steps
+            accum_compression += (n_base_tokens.float().sum() / (valid_mask.sum())).item() / args.gradient_accumulation_steps
             if use_token_type_head:
                 accum_type_loss += type_loss.item() / args.gradient_accumulation_steps
                 with torch.no_grad():
-                    type_preds = (token_type_logits.flatten(0, 1)[valid_mask] > 0).float()
-                    accum_type_acc += (type_preds == type_targets[valid_mask]).float().mean().item() / args.gradient_accumulation_steps
+                    type_preds = (valid_type_logits > 0).float()
+                    accum_type_acc += (type_preds == valid_targets).float().mean().item() / args.gradient_accumulation_steps
+                    # Per-class accuracy
+                    base_mask_cls = valid_targets == 0
+                    hyper_mask_cls = valid_targets == 1
+                    if base_mask_cls.any():
+                        accum_base_type_acc += (type_preds[base_mask_cls] == 0).float().mean().item() / args.gradient_accumulation_steps
+                    if hyper_mask_cls.any():
+                        accum_hyper_type_acc += (type_preds[hyper_mask_cls] == 1).float().mean().item() / args.gradient_accumulation_steps
+                    accum_hyper_ratio += hyper_mask_cls.float().mean().item() / args.gradient_accumulation_steps
 
         # Gradient clipping
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -321,9 +340,13 @@ def main():
 
         log_loss += accum_loss
         log_base_loss += accum_base_loss
+        log_compression += accum_compression
         if use_token_type_head:
             log_type_loss += accum_type_loss
             log_type_acc += accum_type_acc
+            log_base_type_acc += accum_base_type_acc
+            log_hyper_type_acc += accum_hyper_type_acc
+            log_hyper_ratio += accum_hyper_ratio
         log_tokens += args.local_batch_size * args.seq_len * args.gradient_accumulation_steps
 
         # Logging
@@ -331,20 +354,32 @@ def main():
             elapsed = time.time() - start_time
             avg_loss = log_loss / args.log_freq
             avg_base_loss = log_base_loss / args.log_freq
+            avg_compression = log_compression / args.log_freq
 
             # All-reduce loss for global average
             loss_tensor = torch.tensor(avg_loss, device=device)
             base_loss_tensor = torch.tensor(avg_base_loss, device=device)
+            compression_tensor = torch.tensor(avg_compression, device=device)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
             dist.all_reduce(base_loss_tensor, op=dist.ReduceOp.AVG)
+            dist.all_reduce(compression_tensor, op=dist.ReduceOp.AVG)
 
             if use_token_type_head:
                 avg_type_loss = log_type_loss / args.log_freq
                 avg_type_acc = log_type_acc / args.log_freq
+                avg_base_type_acc = log_base_type_acc / args.log_freq
+                avg_hyper_type_acc = log_hyper_type_acc / args.log_freq
+                avg_hyper_ratio = log_hyper_ratio / args.log_freq
                 type_loss_tensor = torch.tensor(avg_type_loss, device=device)
                 type_acc_tensor = torch.tensor(avg_type_acc, device=device)
+                base_type_acc_tensor = torch.tensor(avg_base_type_acc, device=device)
+                hyper_type_acc_tensor = torch.tensor(avg_hyper_type_acc, device=device)
+                hyper_ratio_tensor = torch.tensor(avg_hyper_ratio, device=device)
                 dist.all_reduce(type_loss_tensor, op=dist.ReduceOp.AVG)
                 dist.all_reduce(type_acc_tensor, op=dist.ReduceOp.AVG)
+                dist.all_reduce(base_type_acc_tensor, op=dist.ReduceOp.AVG)
+                dist.all_reduce(hyper_type_acc_tensor, op=dist.ReduceOp.AVG)
+                dist.all_reduce(hyper_ratio_tensor, op=dist.ReduceOp.AVG)
 
             tokens_per_sec = log_tokens * world_size / elapsed
 
@@ -353,9 +388,14 @@ def main():
                 log_msg = (
                     f"step={step:6d} | loss={base_loss_tensor.item():.4f} | "
                     f"backward_loss={loss_tensor.item():.4f} | "
+                    f"compression={compression_tensor.item():.2f} | "
                 )
                 if use_token_type_head:
-                    log_msg += f"type_loss={type_loss_tensor.item():.4f} | type_acc={type_acc_tensor.item():.4f} | "
+                    log_msg += (
+                        f"type_loss={type_loss_tensor.item():.4f} | type_acc={type_acc_tensor.item():.4f} | "
+                        f"base_acc={base_type_acc_tensor.item():.4f} | hyper_acc={hyper_type_acc_tensor.item():.4f} | "
+                        f"hyper_ratio={hyper_ratio_tensor.item():.4f} | "
+                    )
                 log_msg += (
                     f"lr={lr:.2e} | grad_norm={grad_norm:.4f} | "
                     f"tok/s={tokens_per_sec:.0f} | "
@@ -367,6 +407,7 @@ def main():
                     log_dict = {
                         "loss": base_loss_tensor.item(),
                         "backward_loss": loss_tensor.item(),
+                        "compression": compression_tensor.item(),
                         "lr": lr,
                         "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
                         "tokens_per_sec": tokens_per_sec,
@@ -375,12 +416,19 @@ def main():
                     if use_token_type_head:
                         log_dict["type_loss"] = type_loss_tensor.item()
                         log_dict["type_acc"] = type_acc_tensor.item()
+                        log_dict["base_type_acc"] = base_type_acc_tensor.item()
+                        log_dict["hyper_type_acc"] = hyper_type_acc_tensor.item()
+                        log_dict["hyper_ratio"] = hyper_ratio_tensor.item()
                     wandb.log(log_dict, step=step)
 
             log_loss = 0.0
             log_base_loss = 0.0
+            log_compression = 0.0
             log_type_loss = 0.0
             log_type_acc = 0.0
+            log_base_type_acc = 0.0
+            log_hyper_type_acc = 0.0
+            log_hyper_ratio = 0.0
             log_tokens = 0
             start_time = time.time()
 
