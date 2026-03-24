@@ -1,6 +1,7 @@
 """Zip2Zip dataset and data loading utilities."""
 
 import os
+import random
 from functools import partial
 
 import numpy as np
@@ -10,9 +11,19 @@ from torch.distributed.checkpoint.stateful import Stateful
 
 from zip2zip_compression import LZWCompressor
 
+# Special tokens for compression/decompression task (unused Llama3 special token slots)
+COMPRESS_TOKEN_ID = 128002
+DECOMPRESS_TOKEN_ID = 128003
+
 
 class Zip2ZipDataset(IterableDataset, Stateful):
     """Pre-tokenized dataset with on-the-fly LZW compression.
+
+    Supports two modes:
+    - "lm": Language modeling on compressed sequences (original behavior).
+    - "compress": Compression/decompression task. Sequences have format
+      <DECOMPRESS> base_tokens <COMPRESS> compressed_tokens (or reverse).
+      Loss is only computed on the second part.
 
     Yields (input_dict, labels) where codebook is compacted to only contain
     entries that appear in the token sequence (variable size per sample).
@@ -30,6 +41,7 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         pad_token_id: int = 128001,
         rank: int = 0,
         world_size: int = 1,
+        mode: str = "lm",
     ):
         self.data_dir = data_dir
         self.seq_len = seq_len
@@ -37,6 +49,7 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         self.max_codebook_size = max_codebook_size
         self.initial_vocab_size = initial_vocab_size
         self.pad_token_id = pad_token_id
+        self.mode = mode
         self.base_chunk_len = seq_len * 2
 
         shard_files = sorted(
@@ -55,7 +68,7 @@ class Zip2ZipDataset(IterableDataset, Stateful):
             max_codebook_size=max_codebook_size,
             max_subtokens=max_subtokens,
             pad_token_id=pad_token_id,
-            disabled_ids=[bos_token_id, eos_token_id],
+            disabled_ids=[bos_token_id, eos_token_id, COMPRESS_TOKEN_ID, DECOMPRESS_TOKEN_ID],
         )
 
     def _codebook_to_tensor(self, codebook) -> torch.LongTensor:
@@ -116,13 +129,8 @@ class Zip2ZipDataset(IterableDataset, Stateful):
 
         return x_new, y_new, compact_cb
 
-    def __iter__(self):
-        worker_info = get_worker_info()
-        if worker_info is not None:
-            shards = self.shard_files[worker_info.id :: worker_info.num_workers]
-        else:
-            shards = self.shard_files
-
+    def _iter_lm(self, shards):
+        """Original language modeling mode: next-token prediction on compressed sequences."""
         while True:
             for shard_idx in range(self._shard_idx, len(shards)):
                 self._shard_idx = shard_idx
@@ -146,6 +154,14 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                         continue
 
                     compressed = compressed[: self.seq_len + 1]
+
+                    # Count base tokens represented by compressed sequence
+                    cb_dict = codebook.to_dict()
+                    n_base_tokens = sum(
+                        len(cb_dict[tok]) if tok >= self.initial_vocab_size else 1
+                        for tok in compressed
+                    )
+
                     x = torch.LongTensor(compressed[:-1])
                     y = torch.LongTensor(compressed[1:])
                     cb = self._codebook_to_tensor(codebook)
@@ -153,11 +169,111 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                     # Remap to compact codebook
                     x, y, cb = self._remap_hyper_ids(x, y, cb)
 
-                    yield {"input": x, "codebook": cb}, y
+                    yield {"input": x, "codebook": cb, "n_base_tokens": n_base_tokens}, y
 
             # Loop
             self._shard_idx = 0
             self._offset = 0
+
+    def _iter_compress(self, shards):
+        """Compression/decompression task mode.
+
+        Produces sequences of the form:
+          <DECOMPRESS> base_tokens <COMPRESS> compressed_tokens  (compression direction)
+          <COMPRESS> compressed_tokens <DECOMPRESS> base_tokens  (decompression direction)
+
+        Loss is only computed on the second part (labels set to -100 for the first part).
+        Direction is chosen randomly (50/50) per sample.
+        """
+        vocab = self.initial_vocab_size
+        target_total = self.seq_len - 1  # content budget (excluding 2 special tokens)
+
+        while True:
+            for shard_idx in range(self._shard_idx, len(shards)):
+                self._shard_idx = shard_idx
+                shard = np.load(shards[shard_idx])
+                offset = self._offset
+                self._offset = 0
+
+                while offset + self.base_chunk_len <= len(shard):
+                    chunk = shard[offset : offset + self.base_chunk_len].tolist()
+
+                    compressor = LZWCompressor(**self.compressor_args)
+                    try:
+                        compressed, _, codebook = compressor.encode(
+                            chunk, padding="do_not_pad", truncation=False
+                        )
+                    except Exception:
+                        offset += self.base_chunk_len
+                        continue
+
+                    cb_dict = codebook.to_dict()
+
+                    # Find how many compressed tokens (+ corresponding base tokens) fit
+                    base_count = 0
+                    comp_len = 0
+                    for i, tok in enumerate(compressed):
+                        tok_base = len(cb_dict[tok]) if tok >= vocab else 1
+                        if base_count + tok_base + (i + 1) > target_total:
+                            break
+                        base_count += tok_base
+                        comp_len = i + 1
+
+                    if comp_len < 10:
+                        offset += self.base_chunk_len
+                        continue
+
+                    # Advance by used base tokens only (data-efficient)
+                    offset += base_count
+
+                    base_tokens = list(chunk[:base_count])
+                    comp_tokens = list(compressed[:comp_len])
+
+                    # Choose direction randomly
+                    if random.random() < 0.5:
+                        # Compression: given base, produce compressed
+                        full = [DECOMPRESS_TOKEN_ID] + base_tokens + [COMPRESS_TOKEN_ID] + comp_tokens
+                        loss_start = base_count + 1
+                    else:
+                        # Decompression: given compressed, produce base
+                        full = [COMPRESS_TOKEN_ID] + comp_tokens + [DECOMPRESS_TOKEN_ID] + base_tokens
+                        loss_start = comp_len + 1
+
+                    loss_end = loss_start + (comp_len if full[0] == DECOMPRESS_TOKEN_ID else base_count)
+
+                    # Pad to exactly seq_len + 1 tokens
+                    pad_len = (self.seq_len + 1) - len(full)
+                    if pad_len > 0:
+                        full += [self.pad_token_id] * pad_len
+
+                    x = torch.LongTensor(full[:-1])
+                    y = torch.LongTensor(full[1:])
+
+                    # Mask: only compute loss on the second part
+                    loss_mask = torch.zeros(self.seq_len, dtype=torch.bool)
+                    loss_mask[loss_start:loss_end] = True
+                    y[~loss_mask] = -100
+
+                    cb = self._codebook_to_tensor(codebook)
+                    x, y, cb = self._remap_hyper_ids(x, y, cb)
+
+                    yield {"input": x, "codebook": cb, "n_base_tokens": base_count}, y
+
+            # Loop
+            self._shard_idx = 0
+            self._offset = 0
+
+    def __iter__(self):
+        worker_info = get_worker_info()
+        if worker_info is not None:
+            shards = self.shard_files[worker_info.id :: worker_info.num_workers]
+        else:
+            shards = self.shard_files
+
+        if self.mode == "compress":
+            yield from self._iter_compress(shards)
+        else:
+            yield from self._iter_lm(shards)
 
     def state_dict(self):
         return {"shard_idx": self._shard_idx, "offset": self._offset}
@@ -195,7 +311,9 @@ def remap_collate_fn(batch, pad_token_id, max_subtokens, max_active_codebook_siz
 
     codebooks = torch.stack(padded_cbs)
 
-    return {"input": input_ids, "codebook": codebooks}, labels
+    n_base_tokens = torch.tensor([inp["n_base_tokens"] for inp in inputs_list], dtype=torch.long)
+
+    return {"input": input_ids, "codebook": codebooks, "n_base_tokens": n_base_tokens}, labels
 
 
 def build_dataloader(
@@ -209,6 +327,7 @@ def build_dataloader(
     world_size: int = 1,
     num_workers: int = 0,
     pad_token_id: int = 128001,
+    mode: str = "lm",
 ) -> DataLoader:
     """Build a Zip2Zip DataLoader with remapping collation."""
     dataset = Zip2ZipDataset(
@@ -218,6 +337,7 @@ def build_dataloader(
         max_codebook_size=max_codebook_size,
         rank=rank,
         world_size=world_size,
+        mode=mode,
     )
 
     collate_fn = partial(
