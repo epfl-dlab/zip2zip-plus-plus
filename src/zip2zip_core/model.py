@@ -46,7 +46,9 @@ class HyperEncoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor, causal: bool = False) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor, causal: bool = False
+    ) -> torch.Tensor:
         # x: (N, S, dim), mask: (N, S) bool
         B, S, D = x.shape
 
@@ -65,12 +67,20 @@ class HyperEncoderLayer(nn.Module):
 
         if causal:
             # Combine with causal mask: (1, 1, S, S)
-            causal_mask = torch.triu(
-                torch.full((S, S), float("-inf"), device=x.device), diagonal=1
-            ).unsqueeze(0).unsqueeze(0)
-            attn_mask = attn_mask + causal_mask  # broadcasts (N,1,1,S) + (1,1,S,S) -> (N,1,S,S)
+            causal_mask = (
+                torch.triu(
+                    torch.full((S, S), float("-inf"), device=x.device), diagonal=1
+                )
+                .unsqueeze(0)
+                .unsqueeze(0)
+            )
+            attn_mask = (
+                attn_mask + causal_mask
+            )  # broadcasts (N,1,1,S) + (1,1,S,S) -> (N,1,S,S)
 
-        attn_out = nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        attn_out = nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask
+        )
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, D)
         x = residual + self.wo(attn_out)
 
@@ -106,7 +116,13 @@ class HyperEncoderLayer(nn.Module):
         v = self.wv(x_norm).view(T, self.n_heads, self.head_dim)
 
         attn_out = varlen_attn(
-            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen,
+            max_seqlen,
             window_size=window_size,
         )
         # attn_out: (total_tokens, n_heads, head_dim)
@@ -159,7 +175,10 @@ class HyperEncoder(nn.Module):
 
         self.pos_embed = nn.Embedding(max_subtokens, dim)
         self.layers = nn.ModuleList(
-            [HyperEncoderLayer(dim, intermediate_size, n_heads) for _ in range(n_layers)]
+            [
+                HyperEncoderLayer(dim, intermediate_size, n_heads)
+                for _ in range(n_layers)
+            ]
         )
         self.norm = nn.LayerNorm(dim)
 
@@ -240,7 +259,9 @@ class HyperEncoder(nn.Module):
             # Mean pooling via scatter_add
             entry_ids = torch.arange(N, device=x.device).repeat_interleave(lengths)
             result = torch.zeros(N, D, device=x_packed.device, dtype=x_packed.dtype)
-            result.scatter_add_(0, entry_ids.unsqueeze(-1).expand_as(x_packed), x_packed)
+            result.scatter_add_(
+                0, entry_ids.unsqueeze(-1).expand_as(x_packed), x_packed
+            )
             result = result / lengths.unsqueeze(-1).clamp(min=1).to(result.dtype)
             return result
 
@@ -309,6 +330,9 @@ class Zip2ZipLlama3Model(Decoder):
         encoder_intermediate_size: int | None = None
         encoder_causal: bool = False
         reconstruction_loss_weight: float = 0.0
+        token_type_loss_weight: float = (
+            0.0  # weight for base/hyper token type prediction head
+        )
         pad_token_id: int = 128001
 
         def update_from_config(self, *, trainer_config, **kwargs) -> None:
@@ -320,6 +344,7 @@ class Zip2ZipLlama3Model(Decoder):
                     f"Sequence length {seq_len} exceeds original maximum {self.rope.max_seq_len}."
                 )
             import dataclasses as _dc
+
             self.rope = _dc.replace(self.rope, max_seq_len=seq_len)
 
         def get_nparams_and_flops(
@@ -340,6 +365,12 @@ class Zip2ZipLlama3Model(Decoder):
         # Tie input and output embeddings
         self.output.weight = self.tok_embeddings.weight
 
+        # Optional token type prediction head (base vs hyper)
+        if config.token_type_loss_weight > 0:
+            self.token_type_head = nn.Linear(config.dim, 1, bias=True)
+        else:
+            self.token_type_head = None
+
         # Hyper-encoder for computing hypertoken embeddings
         encoder_dim = config.encoder_dim or config.dim
         self.hyper_encoder = HyperEncoder(
@@ -354,6 +385,14 @@ class Zip2ZipLlama3Model(Decoder):
 
     def init_weights(self, **kwargs):
         super().init_weights(**kwargs)
+
+        # Initialize token type head
+        if self.token_type_head is not None:
+            for m in self.token_type_head.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
         # Initialize hyper-encoder
         for name, p in self.hyper_encoder.named_parameters():
@@ -437,14 +476,20 @@ class Zip2ZipLlama3Model(Decoder):
                 B, T = tokens.shape
 
                 # Efficient gather using advanced indexing
-                batch_idx = torch.arange(B, device=tokens.device).unsqueeze(1).expand(B, T)
+                batch_idx = (
+                    torch.arange(B, device=tokens.device).unsqueeze(1).expand(B, T)
+                )
                 selected = hyper_input_embeds[batch_idx, hyper_ids]  # (B, T, dim)
 
                 # Use hyper embeddings where tokens are hypertokens
                 h = torch.where(hyper_mask.unsqueeze(-1), selected, h)
         else:
             # No compression - standard forward
-            h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+            h = (
+                self.tok_embeddings(tokens)
+                if self.tok_embeddings is not None
+                else tokens
+            )
 
         # === Transformer layers ===
         for layer in self.layers.values():
@@ -452,15 +497,18 @@ class Zip2ZipLlama3Model(Decoder):
 
         h = self.norm(h) if self.norm is not None else h
 
+        # === Token type prediction (base vs hyper) ===
+        token_type_logits = None
+        if self.token_type_head is not None:
+            token_type_logits = self.token_type_head(h).squeeze(-1)  # (B, T)
+
         # === Output logits ===
         base_logits = self.output(h)  # (B, T, vocab_size)
 
         if codebook is not None:
             # With tied weights, encoded embeddings are already in output space
             # hyper_logits = h @ hyper_embeds^T
-            hyper_logits = torch.bmm(
-                h, hyper_input_embeds.transpose(1, 2)
-            )  # (B, T, K)
+            hyper_logits = torch.bmm(h, hyper_input_embeds.transpose(1, 2))  # (B, T, K)
 
             # Mask padded codebook entries (all pad tokens) to -inf for exact softmax
             pad_id = self.zip2zip_config.pad_token_id
@@ -472,5 +520,8 @@ class Zip2ZipLlama3Model(Decoder):
             logits = torch.cat([base_logits, hyper_logits], dim=-1)
         else:
             logits = base_logits
+
+        if token_type_logits is not None:
+            return logits, token_type_logits
 
         return logits

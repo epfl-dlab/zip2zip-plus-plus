@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64
-#SBATCH --time=12:00:00
+#SBATCH --time=1:00:00
 #SBATCH --environment=/capstor/scratch/cscs/nathanrchn/images/vs:251215/env.toml
 #SBATCH --output=%x_%j.out
 #SBATCH --account=a0101
@@ -43,6 +43,9 @@ RESUME_FROM=${RESUME_FROM:-}
 WANDB=${WANDB:-}
 WANDB_PROJECT=${WANDB_PROJECT:-zip2zip-core}
 WANDB_RUN_NAME=${WANDB_RUN_NAME:-}
+MODE=${MODE:-lm}
+MODEL_CONFIG=${MODEL_CONFIG:-1B}
+TOKEN_TYPE_LOSS_WEIGHT=${TOKEN_TYPE_LOSS_WEIGHT:-0.0}
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -60,7 +63,7 @@ export MASTER_PORT=29500
 export WORLD_SIZE=$((SLURM_NNODES * 4))
 
 echo "=== zip2zip-core training ==="
-echo "NODES=$SLURM_NNODES  WORLD_SIZE=$WORLD_SIZE  MAX_SUBTOKENS=$MAX_SUBTOKENS"
+echo "NODES=$SLURM_NNODES  WORLD_SIZE=$WORLD_SIZE  MAX_SUBTOKENS=$MAX_SUBTOKENS  MODE=$MODE  MODEL=$MODEL_CONFIG"
 echo "OUTPUT_DIR=$OUTPUT_DIR"
 
 RESUME_FLAG=""
@@ -84,6 +87,7 @@ export PYTHONUNBUFFERED=1
 '"$PYTHON"' -m zip2zip_core.train \
     --data_dir '"$DATA_DIR"' \
     --output_dir '"$OUTPUT_DIR"' \
+    --model_config '"$MODEL_CONFIG"' \
     --max_subtokens '"$MAX_SUBTOKENS"' \
     --encoder_dim '"$ENCODER_DIM"' \
     --encoder_intermediate_size '"$ENCODER_INTERMEDIATE_SIZE"' \
@@ -98,6 +102,8 @@ export PYTHONUNBUFFERED=1
     --warmup_steps '"$WARMUP_STEPS"' \
     --save_freq '"$SAVE_FREQ"' \
     --log_freq '"$LOG_FREQ"' \
+    --mode '"$MODE"' \
+    --token_type_loss_weight '"$TOKEN_TYPE_LOSS_WEIGHT"' \
     '"$RESUME_FLAG"' \
     '"$WANDB_FLAG"'
 '

@@ -139,6 +139,10 @@ def main():
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
     parser.add_argument("--wandb_project", type=str, default="zip2zip-core")
     parser.add_argument("--wandb_name", type=str, default=None)
+    parser.add_argument("--mode", type=str, default="lm", choices=["lm", "compress"],
+                        help="Training mode: 'lm' for language modeling, 'compress' for compression/decompression task")
+    parser.add_argument("--token_type_loss_weight", type=float, default=0.0,
+                        help="Weight for token type (base vs hyper) prediction head. 0 = disabled.")
     args = parser.parse_args()
 
     if args.no_compile:
@@ -171,7 +175,11 @@ def main():
 
     # Build model
     config = zip2zip_llama_configs[args.model_config]
-    replace_kwargs = dict(max_codebook_size=args.max_codebook_size, max_subtokens=args.max_subtokens)
+    replace_kwargs = dict(
+        max_codebook_size=args.max_codebook_size,
+        max_subtokens=args.max_subtokens,
+        token_type_loss_weight=args.token_type_loss_weight,
+    )
     if args.encoder_dim is not None:
         replace_kwargs["encoder_dim"] = args.encoder_dim
     if args.encoder_intermediate_size is not None:
@@ -222,6 +230,7 @@ def main():
         rank=rank,
         world_size=world_size,
         num_workers=args.num_workers,
+        mode=args.mode,
     )
 
     # Training loop
@@ -234,8 +243,12 @@ def main():
     data_iter = iter(dataloader)
     step = start_step
     log_loss = 0.0
+    log_base_loss = 0.0
+    log_type_loss = 0.0
+    log_type_acc = 0.0
     log_tokens = 0
     start_time = time.time()
+    use_token_type_head = args.token_type_loss_weight > 0
 
     while step < args.steps:
         step += 1
@@ -247,12 +260,16 @@ def main():
 
         optimizer.zero_grad()
         accum_loss = 0.0
+        accum_base_loss = 0.0
+        accum_type_loss = 0.0
+        accum_type_acc = 0.0
 
         for micro_step in range(args.gradient_accumulation_steps):
             input_dict, labels = next(data_iter)
 
             x = input_dict["input"].to(device)
             cb = input_dict["codebook"].to(device)
+            n_base_tokens = input_dict["n_base_tokens"].to(device)
             labels = labels.to(device)
 
             # Only sync gradients on last micro-step
@@ -261,15 +278,41 @@ def main():
 
             with ctx:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = model(x, codebook=cb)
-                loss = F.cross_entropy(
-                    logits.flatten(0, 1).float(),
-                    labels.flatten(0, 1),
-                    reduction="mean",
+                    output = model(x, codebook=cb)
+                    if use_token_type_head:
+                        logits, token_type_logits = output
+                    else:
+                        logits = output
+                flat_logits = logits.flatten(0, 1).float()
+                flat_labels = labels.flatten(0, 1)
+                per_token_loss = F.cross_entropy(
+                    flat_logits,
+                    flat_labels,
+                    reduction="none",
+                    ignore_index=-100,
                 )
-                loss = loss / args.gradient_accumulation_steps
+                valid_mask = flat_labels != -100
+                loss_sum = per_token_loss.sum()
+                backward_loss = loss_sum / valid_mask.sum()
+                base_token_loss = loss_sum / n_base_tokens.sum()
+                # Token type loss: predict if next token is base (0) or hyper (1)
+                if use_token_type_head:
+                    type_targets = (labels >= config.vocab_size).float().flatten(0, 1)
+                    type_loss = F.binary_cross_entropy_with_logits(
+                        token_type_logits.flatten(0, 1).float()[valid_mask],
+                        type_targets[valid_mask],
+                        reduction="mean",
+                    )
+                    backward_loss = backward_loss + args.token_type_loss_weight * type_loss
+                loss = backward_loss / args.gradient_accumulation_steps
                 loss.backward()
-            accum_loss += loss.item()
+            accum_loss += backward_loss.item() / args.gradient_accumulation_steps
+            accum_base_loss += base_token_loss.item() / args.gradient_accumulation_steps
+            if use_token_type_head:
+                accum_type_loss += type_loss.item() / args.gradient_accumulation_steps
+                with torch.no_grad():
+                    type_preds = (token_type_logits.flatten(0, 1)[valid_mask] > 0).float()
+                    accum_type_acc += (type_preds == type_targets[valid_mask]).float().mean().item() / args.gradient_accumulation_steps
 
         # Gradient clipping
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -277,41 +320,67 @@ def main():
         optimizer.step()
 
         log_loss += accum_loss
+        log_base_loss += accum_base_loss
+        if use_token_type_head:
+            log_type_loss += accum_type_loss
+            log_type_acc += accum_type_acc
         log_tokens += args.local_batch_size * args.seq_len * args.gradient_accumulation_steps
 
         # Logging
         if step % args.log_freq == 0:
             elapsed = time.time() - start_time
             avg_loss = log_loss / args.log_freq
+            avg_base_loss = log_base_loss / args.log_freq
 
             # All-reduce loss for global average
             loss_tensor = torch.tensor(avg_loss, device=device)
+            base_loss_tensor = torch.tensor(avg_base_loss, device=device)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+            dist.all_reduce(base_loss_tensor, op=dist.ReduceOp.AVG)
+
+            if use_token_type_head:
+                avg_type_loss = log_type_loss / args.log_freq
+                avg_type_acc = log_type_acc / args.log_freq
+                type_loss_tensor = torch.tensor(avg_type_loss, device=device)
+                type_acc_tensor = torch.tensor(avg_type_acc, device=device)
+                dist.all_reduce(type_loss_tensor, op=dist.ReduceOp.AVG)
+                dist.all_reduce(type_acc_tensor, op=dist.ReduceOp.AVG)
 
             tokens_per_sec = log_tokens * world_size / elapsed
 
             if rank == 0:
                 total_tokens_seen = step * global_batch_tokens
-                print(
-                    f"step={step:6d} | loss={loss_tensor.item():.4f} | "
+                log_msg = (
+                    f"step={step:6d} | loss={base_loss_tensor.item():.4f} | "
+                    f"backward_loss={loss_tensor.item():.4f} | "
+                )
+                if use_token_type_head:
+                    log_msg += f"type_loss={type_loss_tensor.item():.4f} | type_acc={type_acc_tensor.item():.4f} | "
+                log_msg += (
                     f"lr={lr:.2e} | grad_norm={grad_norm:.4f} | "
                     f"tok/s={tokens_per_sec:.0f} | "
                     f"tokens={total_tokens_seen/1e9:.2f}B"
                 )
+                print(log_msg)
 
                 if args.wandb:
-                    wandb.log(
-                        {
-                            "loss": loss_tensor.item(),
-                            "lr": lr,
-                            "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
-                            "tokens_per_sec": tokens_per_sec,
-                            "total_tokens": total_tokens_seen,
-                        },
-                        step=step,
-                    )
+                    log_dict = {
+                        "loss": base_loss_tensor.item(),
+                        "backward_loss": loss_tensor.item(),
+                        "lr": lr,
+                        "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                        "tokens_per_sec": tokens_per_sec,
+                        "total_tokens": total_tokens_seen,
+                    }
+                    if use_token_type_head:
+                        log_dict["type_loss"] = type_loss_tensor.item()
+                        log_dict["type_acc"] = type_acc_tensor.item()
+                    wandb.log(log_dict, step=step)
 
             log_loss = 0.0
+            log_base_loss = 0.0
+            log_type_loss = 0.0
+            log_type_acc = 0.0
             log_tokens = 0
             start_time = time.time()
 
