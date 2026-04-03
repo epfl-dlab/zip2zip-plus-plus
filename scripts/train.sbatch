@@ -6,7 +6,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64
 #SBATCH --time=1:00:00
-#SBATCH --environment=/capstor/scratch/cscs/nathanrchn/images/vs:251215/env.toml
+#SBATCH --environment=/capstor/store/cscs/swissai/a0101/env.toml
 #SBATCH --output=%x_%j.out
 #SBATCH --account=a0101
 
