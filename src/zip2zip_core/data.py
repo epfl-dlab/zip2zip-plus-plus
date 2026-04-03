@@ -167,7 +167,13 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         self._offset = state_dict["offset"]
 
 
-def remap_collate_fn(batch, pad_token_id, max_subtokens, max_active_codebook_size):
+def remap_collate_fn(
+    batch,
+    pad_token_id,
+    max_subtokens,
+    max_active_codebook_size,
+    initial_vocab_size,
+):
     """Collate variable-size codebooks by padding to a fixed size.
 
     All codebooks are padded to max_active_codebook_size so torch.compile
@@ -177,6 +183,7 @@ def remap_collate_fn(batch, pad_token_id, max_subtokens, max_active_codebook_siz
 
     input_ids = torch.stack([inp["input"] for inp in inputs_list])
     labels = torch.stack(labels_list)
+    n_base_tokens = (labels < initial_vocab_size).sum(dim=1)
 
     K = max_active_codebook_size
 
@@ -195,7 +202,11 @@ def remap_collate_fn(batch, pad_token_id, max_subtokens, max_active_codebook_siz
 
     codebooks = torch.stack(padded_cbs)
 
-    return {"input": input_ids, "codebook": codebooks}, labels
+    return {
+        "input": input_ids,
+        "codebook": codebooks,
+        "n_base_tokens": n_base_tokens,
+    }, labels
 
 
 def build_dataloader(
@@ -205,17 +216,25 @@ def build_dataloader(
     max_codebook_size: int,
     max_active_codebook_size: int,
     local_batch_size: int,
+    mode: str = "lm",
     rank: int = 0,
     world_size: int = 1,
     num_workers: int = 0,
     pad_token_id: int = 128001,
+    initial_vocab_size: int = 128256,
 ) -> DataLoader:
     """Build a Zip2Zip DataLoader with remapping collation."""
+    if mode != "lm":
+        raise NotImplementedError(
+            f"Unsupported dataloader mode: {mode!r}. Only 'lm' is implemented."
+        )
+
     dataset = Zip2ZipDataset(
         data_dir=data_dir,
         seq_len=seq_len,
         max_subtokens=max_subtokens,
         max_codebook_size=max_codebook_size,
+        initial_vocab_size=initial_vocab_size,
         rank=rank,
         world_size=world_size,
     )
@@ -225,6 +244,7 @@ def build_dataloader(
         pad_token_id=pad_token_id,
         max_subtokens=max_subtokens,
         max_active_codebook_size=max_active_codebook_size,
+        initial_vocab_size=initial_vocab_size,
     )
 
     return DataLoader(
