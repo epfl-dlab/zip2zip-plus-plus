@@ -206,9 +206,12 @@ def main():
     # Wrap with DDP
     model = DDP(model, device_ids=[local_rank])
 
+    # fp32 master weights: optimizer states stay in fp32, model stays in bf16
+    master_params = [p.detach().float().requires_grad_(True) for p in model.parameters()]
+
     # Optimizer
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        master_params,
         lr=args.lr,
         betas=(0.9, 0.95),
         weight_decay=args.weight_decay,
@@ -263,6 +266,7 @@ def main():
             pg["lr"] = lr
 
         optimizer.zero_grad()
+        model.zero_grad()
         accum_loss = 0.0
         accum_base_loss = 0.0
         accum_compression = 0.0
@@ -333,10 +337,16 @@ def main():
                         accum_hyper_type_acc += (type_preds[hyper_mask_cls] == 1).float().mean().item() / args.gradient_accumulation_steps
                     accum_hyper_ratio += hyper_mask_cls.float().mean().item() / args.gradient_accumulation_steps
 
-        # Gradient clipping
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        # Copy bf16 grads → fp32 master params, clip, step, copy back
+        for mp, p in zip(master_params, model.parameters()):
+            mp.grad = p.grad.float() if p.grad is not None else None
+        grad_norm = torch.nn.utils.clip_grad_norm_(master_params, args.max_grad_norm)
 
         optimizer.step()
+
+        with torch.no_grad():
+            for mp, p in zip(master_params, model.parameters()):
+                p.copy_(mp.to(p.dtype))
 
         log_loss += accum_loss
         log_base_loss += accum_base_loss
