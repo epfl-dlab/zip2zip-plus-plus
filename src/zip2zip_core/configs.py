@@ -37,6 +37,37 @@ zip2zip_llama_configs = {
             scaling="llama",
         ),
     ),
+    # ~20M params (dim=128, 6 layers, embed ~16M + backbone ~2M + encoder ~0.1M)
+    "20M": Zip2ZipLlama3Model.Config(
+        dim=128,
+        n_layers=6,
+        vocab_size=128256,
+        max_codebook_size=4096,
+        max_subtokens=4,
+        encoder_dim=64,
+        encoder_n_layers=1,
+        encoder_n_heads=2,
+        encoder_intermediate_size=256,
+        pad_token_id=128001,
+        tok_embeddings=Embedding.Config(),
+        layer=Zip2ZipTransformerBlock.Config(
+            feed_forward=FeedForward.Config(
+                hidden_dim=compute_ffn_hidden_dim(128, multiple_of=256)
+            ),
+            attention=GQAttention.Config(
+                n_heads=4,
+                attn_backend="sdpa",
+                rope_backend="complex",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=128 // 4,
+            max_seq_len=8192,
+            theta=500000,
+            backend="complex",
+            scaling="llama",
+        ),
+    ),
     # ~50M params (dim=256, 12 layers, embed ~33M + backbone ~10M + encoder ~0.3M)
     "50M": Zip2ZipLlama3Model.Config(
         dim=256,
@@ -99,6 +130,37 @@ zip2zip_llama_configs = {
             scaling="llama",
         ),
     ),
+    # ~400M params (dim=1024, 24 layers, embed ~131M + backbone ~307M + encoder ~3M)
+    "400M": Zip2ZipLlama3Model.Config(
+        dim=1024,
+        n_layers=24,
+        vocab_size=128256,
+        max_codebook_size=4096,
+        max_subtokens=4,
+        encoder_dim=256,
+        encoder_n_layers=2,
+        encoder_n_heads=4,
+        encoder_intermediate_size=1024,
+        pad_token_id=128001,
+        tok_embeddings=Embedding.Config(),
+        layer=Zip2ZipTransformerBlock.Config(
+            feed_forward=FeedForward.Config(
+                hidden_dim=compute_ffn_hidden_dim(1024, multiple_of=256)
+            ),
+            attention=GQAttention.Config(
+                n_heads=16,
+                attn_backend="sdpa",
+                rope_backend="complex",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=1024 // 16,
+            max_seq_len=8192,
+            theta=500000,
+            backend="complex",
+            scaling="llama",
+        ),
+    ),
     "1B": Zip2ZipLlama3Model.Config(
         dim=2048,
         n_layers=16,
@@ -124,6 +186,38 @@ zip2zip_llama_configs = {
         ),
         rope=RoPE.Config(
             dim=2048 // 32,
+            max_seq_len=8192,
+            theta=500000,
+            backend="complex",
+            scaling="llama",
+        ),
+    ),
+    # ~3B params (dim=3200, 26 layers)
+    "3B": Zip2ZipLlama3Model.Config(
+        dim=3200,
+        n_layers=26,
+        vocab_size=128256,
+        max_codebook_size=4096,
+        max_subtokens=4,
+        encoder_dim=512,
+        encoder_n_layers=2,
+        encoder_n_heads=8,
+        encoder_intermediate_size=2048,
+        pad_token_id=128001,
+        tok_embeddings=Embedding.Config(),
+        layer=Zip2ZipTransformerBlock.Config(
+            feed_forward=FeedForward.Config(
+                hidden_dim=compute_ffn_hidden_dim(3200, multiple_of=256)
+            ),
+            attention=GQAttention.Config(
+                n_heads=32,
+                n_kv_heads=8,
+                attn_backend="sdpa",
+                rope_backend="complex",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=3200 // 32,
             max_seq_len=8192,
             theta=500000,
             backend="complex",
