@@ -10,11 +10,19 @@ Curriculum training:
     Phase 1: --max_subtokens 2 --steps 6000
     Phase 2: --max_subtokens 3 --steps 12000 --resume_from checkpoint_dir
     Phase 3: --max_subtokens 4 --steps 19000 --resume_from checkpoint_dir
+
+Resume from latest checkpoint:
+    --resume_from latest  (auto-finds latest step_* in output_dir)
+
+Resume from HuggingFace:
+    --resume_from_hf user/repo  (downloads checkpoint from HF Hub)
+    --resume_from_hf user/repo --resume_hf_revision step_5000
 """
 
 import argparse
 import contextlib
 import dataclasses
+import glob
 import json
 import math
 import os
@@ -39,7 +47,15 @@ def get_lr(step: int, warmup_steps: int, total_steps: int, max_lr: float, min_lr
     return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
-def save_checkpoint(model, optimizer, step, args, output_dir):
+def _unwrap_model(model):
+    """Unwrap DDP and torch.compile wrappers to get the raw model."""
+    raw = model.module if hasattr(model, "module") else model
+    if hasattr(raw, "_orig_mod"):
+        raw = raw._orig_mod
+    return raw
+
+
+def save_checkpoint(model, optimizer, step, args, output_dir, push_to_hub=None):
     """Save model and optimizer state. Only rank 0 saves."""
     rank = dist.get_rank()
     ckpt_dir = os.path.join(output_dir, f"step_{step}")
@@ -47,40 +63,108 @@ def save_checkpoint(model, optimizer, step, args, output_dir):
     dist.barrier()
     if rank == 0:
         os.makedirs(ckpt_dir, exist_ok=True)
-        # Save the unwrapped model (without DDP wrapper)
-        raw_model = model.module if hasattr(model, "module") else model
-        # For compiled models, unwrap further
-        if hasattr(raw_model, "_orig_mod"):
-            raw_model = raw_model._orig_mod
+        raw_model = _unwrap_model(model)
         torch.save(raw_model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
         torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
         torch.save({"step": step, "args": vars(args)}, os.path.join(ckpt_dir, "meta.pt"))
         print(f"[Rank 0] Saved checkpoint at step {step}")
+
+        if push_to_hub:
+            _push_checkpoint_to_hub(ckpt_dir, push_to_hub, step)
     dist.barrier()
 
 
+def _resolve_latest_checkpoint(output_dir):
+    """Find the latest step_* checkpoint directory in output_dir."""
+    pattern = os.path.join(output_dir, "step_*")
+    ckpt_dirs = glob.glob(pattern)
+    if not ckpt_dirs:
+        raise FileNotFoundError(f"No step_* checkpoints found in {output_dir}")
+    # Sort by step number
+    def _step_num(d):
+        try:
+            return int(os.path.basename(d).split("_")[1])
+        except (IndexError, ValueError):
+            return -1
+    latest = max(ckpt_dirs, key=_step_num)
+    return latest
+
+
+def _download_checkpoint_from_hf(repo_id, revision=None):
+    """Download checkpoint files from a HuggingFace Hub repo.
+
+    Returns the local directory containing model.pt, optimizer.pt (if available), and meta.pt (if available).
+    """
+    from huggingface_hub import hf_hub_download
+
+    local_dir = None
+    for filename in ["model.pt", "optimizer.pt", "meta.pt"]:
+        try:
+            path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                revision=revision,
+            )
+            if local_dir is None:
+                local_dir = os.path.dirname(path)
+        except Exception:
+            if filename == "model.pt":
+                raise
+            # optimizer.pt and meta.pt are optional for HF checkpoints
+            pass
+
+    return local_dir
+
+
+def _push_checkpoint_to_hub(ckpt_dir, repo_id, step):
+    """Push a checkpoint directory to HuggingFace Hub."""
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    api.create_repo(repo_id, exist_ok=True)
+    api.upload_folder(
+        folder_path=ckpt_dir,
+        repo_id=repo_id,
+        path_in_repo=".",
+        revision=f"step_{step}",
+        commit_message=f"Checkpoint at step {step}",
+    )
+    # Also update main branch with latest checkpoint
+    api.upload_folder(
+        folder_path=ckpt_dir,
+        repo_id=repo_id,
+        path_in_repo=".",
+        commit_message=f"Checkpoint at step {step}",
+    )
+    print(f"[Rank 0] Pushed checkpoint to {repo_id} (revision: step_{step})")
+
+
+def _clean_state_dict(model_state):
+    """Strip FSDP wrapper prefixes for compatibility."""
+    cleaned = {}
+    for k, v in model_state.items():
+        cleaned[k.replace("_fsdp_wrapped_module.", "")] = v
+    return cleaned
+
+
 def load_checkpoint(model, optimizer, resume_dir, device):
-    """Load model and optimizer state.
+    """Load model and optimizer state from a local directory.
 
     Handles curriculum transitions where max_subtokens changes between phases
     by zero-padding the hyper_encoder position embedding.
     """
-    meta = torch.load(os.path.join(resume_dir, "meta.pt"), map_location="cpu")
-    step = meta["step"]
+    meta_path = os.path.join(resume_dir, "meta.pt")
+    if os.path.exists(meta_path):
+        meta = torch.load(meta_path, map_location="cpu")
+        step = meta["step"]
+    else:
+        step = 0
+        if dist.get_rank() == 0:
+            print("No meta.pt found — starting from step 0")
 
     model_state = torch.load(os.path.join(resume_dir, "model.pt"), map_location="cpu")
-
-    # Get the raw model (unwrap DDP and compile)
-    raw_model = model.module if hasattr(model, "module") else model
-    if hasattr(raw_model, "_orig_mod"):
-        raw_model = raw_model._orig_mod
-
-    # Strip FSDP wrapper prefixes if present (for loading FSDP checkpoints into DDP)
-    cleaned_state = {}
-    for k, v in model_state.items():
-        new_key = k.replace("_fsdp_wrapped_module.", "")
-        cleaned_state[new_key] = v
-    model_state = cleaned_state
+    raw_model = _unwrap_model(model)
+    model_state = _clean_state_dict(model_state)
 
     # Handle pos_embed size mismatch from curriculum phase transitions
     pos_key = "hyper_encoder.pos_embed.weight"
@@ -98,12 +182,16 @@ def load_checkpoint(model, optimizer, resume_dir, device):
 
     raw_model.load_state_dict(model_state)
 
+    opt_path = os.path.join(resume_dir, "optimizer.pt")
     if curriculum_transition:
         if dist.get_rank() == 0:
             print("Curriculum transition detected — skipping optimizer state load (will re-init)")
-    else:
-        opt_state = torch.load(os.path.join(resume_dir, "optimizer.pt"), map_location="cpu")
+    elif os.path.exists(opt_path):
+        opt_state = torch.load(opt_path, map_location="cpu")
         optimizer.load_state_dict(opt_state)
+    else:
+        if dist.get_rank() == 0:
+            print("No optimizer.pt found — optimizer will start fresh")
 
     if dist.get_rank() == 0:
         print(f"Resumed from step {step}")
@@ -133,7 +221,14 @@ def main():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--log_freq", type=int, default=10)
     parser.add_argument("--save_freq", type=int, default=1000)
-    parser.add_argument("--resume_from", type=str, default=None)
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="Local checkpoint dir, or 'latest' to auto-find latest step_* in output_dir")
+    parser.add_argument("--resume_from_hf", type=str, default=None,
+                        help="HuggingFace repo ID to download checkpoint from (e.g. user/model-name)")
+    parser.add_argument("--resume_hf_revision", type=str, default=None,
+                        help="HF revision/branch to download from (e.g. step_5000). Defaults to main.")
+    parser.add_argument("--push_to_hub", type=str, default=None,
+                        help="HuggingFace repo ID to push checkpoints to (e.g. user/model-name)")
     parser.add_argument("--compile", action="store_true", default=True)
     parser.add_argument("--no_compile", action="store_true")
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
@@ -219,8 +314,24 @@ def main():
 
     # Resume if specified
     start_step = 0
-    if args.resume_from:
-        start_step = load_checkpoint(model, optimizer, args.resume_from, device)
+    if args.resume_from_hf:
+        if rank == 0:
+            print(f"Downloading checkpoint from HuggingFace: {args.resume_from_hf}")
+            resume_dir = _download_checkpoint_from_hf(args.resume_from_hf, args.resume_hf_revision)
+        else:
+            resume_dir = None
+        # Broadcast the path from rank 0 to all ranks
+        resume_dir_list = [resume_dir]
+        dist.broadcast_object_list(resume_dir_list, src=0)
+        resume_dir = resume_dir_list[0]
+        start_step = load_checkpoint(model, optimizer, resume_dir, device)
+    elif args.resume_from:
+        resume_dir = args.resume_from
+        if resume_dir == "latest":
+            resume_dir = _resolve_latest_checkpoint(args.output_dir)
+            if rank == 0:
+                print(f"Auto-resolved latest checkpoint: {resume_dir}")
+        start_step = load_checkpoint(model, optimizer, resume_dir, device)
 
     # Dataset and dataloader
     dataloader = build_dataloader(
@@ -444,10 +555,10 @@ def main():
 
         # Save checkpoint
         if step % args.save_freq == 0:
-            save_checkpoint(model, optimizer, step, args, args.output_dir)
+            save_checkpoint(model, optimizer, step, args, args.output_dir, push_to_hub=args.push_to_hub)
 
     # Final save
-    save_checkpoint(model, optimizer, step, args, args.output_dir)
+    save_checkpoint(model, optimizer, step, args, args.output_dir, push_to_hub=args.push_to_hub)
 
     if rank == 0:
         print("Training complete!")

@@ -40,6 +40,9 @@ WARMUP_STEPS=${WARMUP_STEPS:-500}
 SAVE_FREQ=${SAVE_FREQ:-1000}
 LOG_FREQ=${LOG_FREQ:-10}
 RESUME_FROM=${RESUME_FROM:-}
+RESUME_FROM_HF=${RESUME_FROM_HF:-}
+RESUME_HF_REVISION=${RESUME_HF_REVISION:-}
+PUSH_TO_HUB=${PUSH_TO_HUB:-}
 WANDB=${WANDB:-}
 WANDB_PROJECT=${WANDB_PROJECT:-zip2zip-core}
 WANDB_RUN_NAME=${WANDB_RUN_NAME:-}
@@ -69,6 +72,17 @@ echo "OUTPUT_DIR=$OUTPUT_DIR"
 RESUME_FLAG=""
 if [ -n "$RESUME_FROM" ]; then
     RESUME_FLAG="--resume_from $RESUME_FROM"
+fi
+if [ -n "$RESUME_FROM_HF" ]; then
+    RESUME_FLAG="--resume_from_hf $RESUME_FROM_HF"
+    if [ -n "$RESUME_HF_REVISION" ]; then
+        RESUME_FLAG="$RESUME_FLAG --resume_hf_revision $RESUME_HF_REVISION"
+    fi
+fi
+
+PUSH_FLAG=""
+if [ -n "$PUSH_TO_HUB" ]; then
+    PUSH_FLAG="--push_to_hub $PUSH_TO_HUB"
 fi
 
 WANDB_FLAG=""
@@ -105,5 +119,6 @@ export PYTHONUNBUFFERED=1
     --mode '"$MODE"' \
     --token_type_loss_weight '"$TOKEN_TYPE_LOSS_WEIGHT"' \
     '"$RESUME_FLAG"' \
+    '"$PUSH_FLAG"' \
     '"$WANDB_FLAG"'
 '
