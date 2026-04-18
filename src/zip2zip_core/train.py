@@ -36,6 +36,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from zip2zip_core.configs import zip2zip_llama_configs
 from zip2zip_core.data import build_dataloader
 
+torch.set_float32_matmul_precision('high') 
+
 
 def get_lr(step: int, warmup_steps: int, total_steps: int, max_lr: float, min_lr: float) -> float:
     """Cosine learning rate schedule with warmup."""
