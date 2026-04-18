@@ -2,7 +2,9 @@
 torch
 torchvision
 datasets
-transformers
+
+# transformers 5.0 broke _batch_encode_plus / _decode monkey-patching (TokenizersBackend refactor) 
+transformers<5.0
 wandb
 zip2zip_compression
 torchtitan
