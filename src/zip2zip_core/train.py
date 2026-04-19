@@ -391,6 +391,7 @@ def main():
     log_loss = 0.0
     log_base_loss = 0.0
     log_compression = 0.0
+    log_acc = 0.0
     log_type_loss = 0.0
     log_type_acc = 0.0
     log_base_type_acc = 0.0
@@ -413,6 +414,7 @@ def main():
         accum_loss = 0.0
         accum_base_loss = 0.0
         accum_compression = 0.0
+        accum_acc = 0.0
         accum_type_loss = 0.0
         accum_type_acc = 0.0
         accum_base_type_acc = 0.0
@@ -466,6 +468,8 @@ def main():
             accum_loss += backward_loss.item() / args.gradient_accumulation_steps
             accum_base_loss += base_token_loss.item() / args.gradient_accumulation_steps
             accum_compression += (n_base_tokens.float().sum() / (valid_mask.sum())).item() / args.gradient_accumulation_steps
+            with torch.no_grad():
+                accum_acc += (flat_logits[valid_mask].argmax(-1) == flat_labels[valid_mask]).float().mean().item() / args.gradient_accumulation_steps
             if use_token_type_head:
                 accum_type_loss += type_loss.item() / args.gradient_accumulation_steps
                 with torch.no_grad():
@@ -494,6 +498,7 @@ def main():
         log_loss += accum_loss
         log_base_loss += accum_base_loss
         log_compression += accum_compression
+        log_acc += accum_acc
         if use_token_type_head:
             log_type_loss += accum_type_loss
             log_type_acc += accum_type_acc
@@ -508,14 +513,17 @@ def main():
             avg_loss = log_loss / args.log_freq
             avg_base_loss = log_base_loss / args.log_freq
             avg_compression = log_compression / args.log_freq
+            avg_acc = log_acc / args.log_freq
 
             # All-reduce loss for global average
             loss_tensor = torch.tensor(avg_loss, device=device)
             base_loss_tensor = torch.tensor(avg_base_loss, device=device)
             compression_tensor = torch.tensor(avg_compression, device=device)
+            acc_tensor = torch.tensor(avg_acc, device=device)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
             dist.all_reduce(base_loss_tensor, op=dist.ReduceOp.AVG)
             dist.all_reduce(compression_tensor, op=dist.ReduceOp.AVG)
+            dist.all_reduce(acc_tensor, op=dist.ReduceOp.AVG)
 
             if use_token_type_head:
                 avg_type_loss = log_type_loss / args.log_freq
@@ -540,6 +548,8 @@ def main():
                 total_tokens_seen = step * global_batch_tokens
                 log_msg = (
                     f"step={step:6d} | loss={base_loss_tensor.item():.4f} | "
+                    f"ppl={math.exp(base_loss_tensor.item()):.2f} | "
+                    f"acc={acc_tensor.item():.4f} | "
                     f"backward_loss={loss_tensor.item():.4f} | "
                     f"compression={compression_tensor.item():.2f} | "
                 )
@@ -559,6 +569,8 @@ def main():
                 if args.wandb:
                     log_dict = {
                         "loss": base_loss_tensor.item(),
+                        "ppl": math.exp(base_loss_tensor.item()),
+                        "acc": acc_tensor.item(),
                         "backward_loss": loss_tensor.item(),
                         "compression": compression_tensor.item(),
                         "lr": lr,
@@ -577,6 +589,7 @@ def main():
             log_loss = 0.0
             log_base_loss = 0.0
             log_compression = 0.0
+            log_acc = 0.0
             log_type_loss = 0.0
             log_type_acc = 0.0
             log_base_type_acc = 0.0
