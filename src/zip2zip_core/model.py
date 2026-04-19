@@ -415,87 +415,86 @@ class Zip2ZipLlama3Model(Decoder):
         self._hyper_embeds_buf = None
         self._hyper_embeds_used = None
 
-    def embed_tokens(
-        self,
-        tokens: torch.Tensor,
-        codebook: torch.Tensor | None = None,
-        codebook_updates: torch.Tensor | None = None,
-        codebook_updates_indices: list[list[int]] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Embed tokens, mixing base and hyper token embeddings.
-
-        During inference, pass codebook_updates + codebook_updates_indices (from
-        CodebookManager.get_new_codes()) to scatter only new entries into the
-        pre-allocated buffer instead of re-encoding the full codebook.
+    def _embed_tokens_train(
+        self, tokens: torch.Tensor, codebook: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed tokens during training: encode full codebook, mix base + hyper embeddings.
 
         Args:
             tokens: (B, T) token IDs (mix of base + hyper)
-            codebook: (B, K, max_subtokens) full codebook, or None for standard forward
-            codebook_updates: (B, max_updates, max_subtokens) new entries this step
+            codebook: (B, K, max_subtokens) full codebook
+
+        Returns:
+            h: (B, T, dim) token embeddings
+            hyper_embeds: (B, K, dim) encoded codebook entries
+        """
+        vocab_size = self.zip2zip_config.vocab_size
+
+        hyper_embeds = self._encode_codebook_with_weights(
+            codebook, self.tok_embeddings.weight
+        )  # (B, K, dim)
+
+        base_ids = tokens.clamp(max=vocab_size - 1)
+        h = self.tok_embeddings(base_ids)  # (B, T, dim)
+
+        hyper_mask = tokens >= vocab_size
+        if hyper_mask.any():
+            hyper_ids = (tokens - vocab_size).clamp(min=0)  # (B, T)
+            B, T = tokens.shape
+            batch_idx = torch.arange(B, device=tokens.device).unsqueeze(1).expand(B, T)
+            h = torch.where(
+                hyper_mask.unsqueeze(-1), hyper_embeds[batch_idx, hyper_ids], h
+            )
+
+        return h, hyper_embeds
+
+    def _embed_tokens_inference(
+        self,
+        tokens: torch.Tensor,
+        codebook_updates: torch.Tensor,
+        codebook_updates_indices: list[list[int]],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed tokens during inference: incrementally update embedding buffer.
+
+        Args:
+            tokens: (B, T) token IDs (mix of base + hyper)
+            codebook_updates: (B, max_updates, max_subtokens) new codebook entries
             codebook_updates_indices: per-batch list of buffer indices to write into
 
         Returns:
             h: (B, T, dim) token embeddings
-            hyper_embeds: (B, K, dim) encoded codebook entries, or None
+            hyper_embeds: (B, max_codebook_size, dim) full embedding buffer
         """
-        # TODO, probably not necessary having this branch
-        if codebook is None and codebook_updates is None and codebook_updates_indices is None:
-            h = (
-                self.tok_embeddings(tokens)
-                if self.tok_embeddings is not None
-                else tokens
-            )
-            return h, None
-
-        # TODO, the codebook_updates looks like a full matrix even short: torch.Size([1, 4096, 3])
-
         vocab_size = self.zip2zip_config.vocab_size
+        bs = tokens.size(0)
+        max_cb = self.zip2zip_config.max_codebook_size
 
-        if not self.training:
-            bs = tokens.size(0)
-            max_cb = self.zip2zip_config.max_codebook_size
-            # import pdb; pdb.set_trace()
-
-            # Lazy-allocate the full-size buffer on first inference step
-            if self._hyper_embeds_buf is None:
-                weight = self.tok_embeddings.weight
-                self._hyper_embeds_buf = torch.zeros(
-                    bs, max_cb, self.zip2zip_config.dim,
-                    device=weight.device, dtype=weight.dtype,
-                )
-                self._hyper_embeds_used = torch.zeros(
-                    bs, max_cb, dtype=torch.bool, device=weight.device,
-                )
-            # import pdb; pdb.set_trace()
-
-            assert codebook_updates is not None and codebook_updates_indices is not None, (
-                "codebook_updates and codebook_updates_indices must be provided during "
-                "inference. Call CodebookManager.get_new_codes() each step."
+        # Lazy-allocate the full-size buffer on first inference step
+        if self._hyper_embeds_buf is None:
+            weight = self.tok_embeddings.weight
+            self._hyper_embeds_buf = torch.zeros(
+                bs, max_cb, self.zip2zip_config.dim,
+                device=weight.device, dtype=weight.dtype,
             )
-            # Scatter new entries into their exact buffer positions (per batch item)
-            if any(len(ui) > 0 for ui in codebook_updates_indices):
-                new_embeds = self._encode_codebook_with_weights(
-                    codebook_updates, self.tok_embeddings.weight
-                )  # (B, max_updates, dim)
-                for i, ui in enumerate(codebook_updates_indices):
-                    if ui:
-                        self._hyper_embeds_buf[i, ui] = new_embeds[i, : len(ui)]
-                        self._hyper_embeds_used[i, ui] = True
+            self._hyper_embeds_used = torch.zeros(
+                bs, max_cb, dtype=torch.bool, device=weight.device,
+            )
 
-            # we don't do slcing here to avoid cuda graph size change,
-            # but the model's forward will mask out unused entries via _hyper_embeds_used
-            hyper_embeds = self._hyper_embeds_buf  # (B, max_codebook_size, dim)
-        else:
-            assert codebook is not None, "codebook must be provided during training"
-            hyper_embeds = self._encode_codebook_with_weights(
-                codebook, self.tok_embeddings.weight
-            )  # (B, K, dim)
+        # Scatter new entries into their exact buffer positions (per batch item)
+        if any(len(ui) > 0 for ui in codebook_updates_indices):
+            new_embeds = self._encode_codebook_with_weights(
+                codebook_updates, self.tok_embeddings.weight
+            )  # (B, max_updates, dim)
+            for i, ui in enumerate(codebook_updates_indices):
+                if ui:
+                    self._hyper_embeds_buf[i, ui] = new_embeds[i, : len(ui)]
+                    self._hyper_embeds_used[i, ui] = True
 
-        # Base token embeddings
+        hyper_embeds = self._hyper_embeds_buf  # (B, max_codebook_size, dim)
+
         base_ids = tokens.clamp(max=vocab_size - 1)
         h = self.tok_embeddings(base_ids)  # (B, T, dim)
 
-        # Overwrite hyper token positions
         hyper_mask = tokens >= vocab_size
         if hyper_mask.any():
             hyper_ids = (tokens - vocab_size).clamp(min=0)  # (B, T)
@@ -552,23 +551,33 @@ class Zip2ZipLlama3Model(Decoder):
     ):
         """Forward pass with zip2zip compressed tokens.
 
+        Training mode (codebook is not None):
+            Encodes full codebook, applies pad mask + optional hyper causal mask.
+
+        Inference mode (codebook_updates provided):
+            Incrementally updates embedding buffer, applies used-entry mask.
+            Causal constraint is inherent from incremental building.
+
         Args:
             tokens: (B, T) compressed token IDs (mix of base + hyper)
-            codebook: (B, K, max_subtokens) base token compositions
+            codebook: (B, K, max_subtokens) base token compositions (training)
             attention_masks: optional attention masks
             positions: optional position IDs
-            codebook_updates: (B, max_updates, max_subtokens) new codebook entries this
-                step; pass together with codebook_updates_indices during inference for
-                efficient incremental encoding (from CodebookManager.get_new_codes())
-            codebook_updates_indices: per-batch indices into the buffer to write new
-                entries into
+            codebook_updates: (B, max_updates, max_subtokens) new codebook entries (inference)
+            codebook_updates_indices: per-batch buffer write indices (inference)
+            hyper_causal_mask: if True, mask future codebook entries at each position (training only)
         """
-        vocab_size = self.zip2zip_config.vocab_size
 
         # === Embedding ===
-        h, hyper_embeds = self.embed_tokens(
-            tokens, codebook, codebook_updates, codebook_updates_indices
-        )
+        if codebook is not None:
+            h, hyper_embeds = self._embed_tokens_train(tokens, codebook)
+        elif codebook_updates is not None and codebook_updates_indices is not None:
+            h, hyper_embeds = self._embed_tokens_inference(
+                tokens, codebook_updates, codebook_updates_indices
+            )
+        else:
+            h = self.tok_embeddings(tokens)
+            hyper_embeds = None
 
         # === Transformer layers ===
         for layer in self.layers.values():
@@ -587,23 +596,29 @@ class Zip2ZipLlama3Model(Decoder):
         if hyper_embeds is not None:
             hyper_logits = torch.bmm(h, hyper_embeds.transpose(1, 2))  # (B, T, K)
 
-            # Mask unused codebook entries to -inf for exact softmax
             if codebook is not None:
+                # --- Training: pad mask + optional hyper causal mask ---
                 pad_id = self.zip2zip_config.pad_token_id
                 codebook_used = (codebook != pad_id).any(dim=-1)  # (B, K)
+                hyper_logits = hyper_logits.masked_fill(
+                    ~codebook_used.unsqueeze(1), float("-inf")
+                )
                 # Hyper causal mask: entry k is created at LZW step k,
                 # so at position t only entries with k <= t are available.
                 if hyper_causal_mask:
                     T = h.shape[1]
                     K = hyper_embeds.shape[1]
-                    pos = torch.arange(T, device=h.device).view(1, T, 1)  # (1, T, 1)
-                    entry_idx = torch.arange(K, device=h.device).view(1, 1, K)  # (1, 1, K)
-                    hyper_logits = hyper_logits.masked_fill(entry_idx > pos, float("-inf"))
+                    pos = torch.arange(T, device=h.device).view(1, T, 1)
+                    entry_idx = torch.arange(K, device=h.device).view(1, 1, K)
+                    hyper_logits = hyper_logits.masked_fill(
+                        entry_idx > pos, float("-inf")
+                    )
             else:
+                # --- Inference: used-entry mask (causality is inherent) ---
                 codebook_used = self._hyper_embeds_used[:, : hyper_embeds.shape[1]]
-            hyper_logits = hyper_logits.masked_fill(
-                ~codebook_used.unsqueeze(1), float("-inf")
-            )
+                hyper_logits = hyper_logits.masked_fill(
+                    ~codebook_used.unsqueeze(1), float("-inf")
+                )
 
             logits = torch.cat([base_logits, hyper_logits], dim=-1)
         else:
