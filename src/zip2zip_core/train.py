@@ -243,6 +243,8 @@ def main():
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
     parser.add_argument("--wandb_project", type=str, default="zip2zip-core")
     parser.add_argument("--wandb_name", type=str, default=None)
+    parser.add_argument("--wandb_group", type=str, default=None, help="wandb run group")
+    parser.add_argument("--wandb_tags", type=str, nargs="*", default=None, help="wandb tags")
     parser.add_argument("--mode", type=str, default="lm", choices=["lm", "compress"],
                         help="Training mode: 'lm' for language modeling, 'compress' for compression/decompression task")
     parser.add_argument("--no_remap_codebook", action="store_true",
@@ -267,8 +269,22 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
+    # Deduplicate output_dir: if it already exists, append (1), (2), ... on rank 0,
+    # then broadcast the resolved path to all ranks.
     if rank == 0:
+        base_dir = args.output_dir
+        if os.path.exists(base_dir):
+            n = 1
+            while os.path.exists(f"{base_dir}({n})"):
+                n += 1
+            args.output_dir = f"{base_dir}({n})"
+            print(f"Output dir {base_dir} already exists, using {args.output_dir}")
         os.makedirs(args.output_dir, exist_ok=True)
+    output_dir_list = [args.output_dir if rank == 0 else None]
+    dist.broadcast_object_list(output_dir_list, src=0)
+    args.output_dir = output_dir_list[0]
+
+    if rank == 0:
         print(f"World size: {world_size}")
         print(f"Config: {json.dumps(vars(args), indent=2)}")
 
@@ -278,6 +294,8 @@ def main():
             wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_name,
+                group=args.wandb_group,
+                tags=args.wandb_tags,
                 config=vars(args),
             )
 
