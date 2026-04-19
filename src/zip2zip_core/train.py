@@ -124,11 +124,18 @@ def _push_checkpoint_to_hub(ckpt_dir, repo_id, step):
 
     api = HfApi()
     api.create_repo(repo_id, exist_ok=True)
+
+    revision = f"step_{step}"
+    try:
+        api.create_branch(repo_id, branch=revision)
+    except Exception:
+        pass  # branch already exists
+
     api.upload_folder(
         folder_path=ckpt_dir,
         repo_id=repo_id,
         path_in_repo=".",
-        revision=f"step_{step}",
+        revision=revision,
         commit_message=f"Checkpoint at step {step}",
     )
     # Also update main branch with latest checkpoint
@@ -138,7 +145,7 @@ def _push_checkpoint_to_hub(ckpt_dir, repo_id, step):
         path_in_repo=".",
         commit_message=f"Checkpoint at step {step}",
     )
-    print(f"[Rank 0] Pushed checkpoint to {repo_id} (revision: step_{step})")
+    print(f"[Rank 0] Pushed checkpoint to {repo_id} (revision: {revision})")
 
 
 def _clean_state_dict(model_state):
