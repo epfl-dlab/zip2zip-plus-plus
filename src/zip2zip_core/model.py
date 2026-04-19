@@ -548,6 +548,7 @@ class Zip2ZipLlama3Model(Decoder):
         positions: torch.Tensor | None = None,
         codebook_updates: torch.Tensor | None = None,
         codebook_updates_indices: list[list[int]] | None = None,
+        hyper_causal_mask: bool = False,
     ):
         """Forward pass with zip2zip compressed tokens.
 
@@ -590,6 +591,14 @@ class Zip2ZipLlama3Model(Decoder):
             if codebook is not None:
                 pad_id = self.zip2zip_config.pad_token_id
                 codebook_used = (codebook != pad_id).any(dim=-1)  # (B, K)
+                # Hyper causal mask: entry k is created at LZW step k,
+                # so at position t only entries with k <= t are available.
+                if hyper_causal_mask:
+                    T = h.shape[1]
+                    K = hyper_embeds.shape[1]
+                    pos = torch.arange(T, device=h.device).view(1, T, 1)  # (1, T, 1)
+                    entry_idx = torch.arange(K, device=h.device).view(1, 1, K)  # (1, 1, K)
+                    hyper_logits = hyper_logits.masked_fill(entry_idx > pos, float("-inf"))
             else:
                 codebook_used = self._hyper_embeds_used[:, : hyper_embeds.shape[1]]
             hyper_logits = hyper_logits.masked_fill(

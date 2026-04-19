@@ -42,6 +42,7 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         rank: int = 0,
         world_size: int = 1,
         mode: str = "lm",
+        remap_codebook: bool = True,
     ):
         self.data_dir = data_dir
         self.seq_len = seq_len
@@ -50,6 +51,7 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         self.initial_vocab_size = initial_vocab_size
         self.pad_token_id = pad_token_id
         self.mode = mode
+        self.remap_codebook = remap_codebook
         self.base_chunk_len = seq_len * 2
 
         shard_files = sorted(
@@ -167,7 +169,8 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                     cb = self._codebook_to_tensor(codebook)
 
                     # Remap to compact codebook
-                    x, y, cb = self._remap_hyper_ids(x, y, cb)
+                    if self.remap_codebook:
+                        x, y, cb = self._remap_hyper_ids(x, y, cb)
 
                     yield {"input": x, "codebook": cb, "n_base_tokens": n_base_tokens}, y
 
@@ -255,7 +258,8 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                     y[~loss_mask] = -100
 
                     cb = self._codebook_to_tensor(codebook)
-                    x, y, cb = self._remap_hyper_ids(x, y, cb)
+                    if self.remap_codebook:
+                        x, y, cb = self._remap_hyper_ids(x, y, cb)
 
                     yield {"input": x, "codebook": cb, "n_base_tokens": base_count}, y
 
@@ -328,6 +332,7 @@ def build_dataloader(
     num_workers: int = 0,
     pad_token_id: int = 128001,
     mode: str = "lm",
+    remap_codebook: bool = True,
 ) -> DataLoader:
     """Build a Zip2Zip DataLoader with remapping collation."""
     dataset = Zip2ZipDataset(
@@ -338,6 +343,7 @@ def build_dataloader(
         rank=rank,
         world_size=world_size,
         mode=mode,
+        remap_codebook=remap_codebook,
     )
 
     collate_fn = partial(

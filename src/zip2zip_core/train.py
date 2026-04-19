@@ -238,6 +238,10 @@ def main():
     parser.add_argument("--wandb_name", type=str, default=None)
     parser.add_argument("--mode", type=str, default="lm", choices=["lm", "compress"],
                         help="Training mode: 'lm' for language modeling, 'compress' for compression/decompression task")
+    parser.add_argument("--no_remap_codebook", action="store_true",
+                        help="Disable compact codebook remapping (ablation: use full codebook with original hyper IDs)")
+    parser.add_argument("--hyper_causal_mask", action="store_true",
+                        help="Enable hyper causal mask: at position t, only codebook entries k <= t are available")
     parser.add_argument("--token_type_loss_weight", type=float, default=0.0,
                         help="Weight for token type (base vs hyper) prediction head. 0 = disabled.")
     args = parser.parse_args()
@@ -347,6 +351,7 @@ def main():
         world_size=world_size,
         num_workers=args.num_workers,
         mode=args.mode,
+        remap_codebook=not args.no_remap_codebook,
     )
 
     # Training loop
@@ -403,7 +408,7 @@ def main():
 
             with ctx:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    output = model(x, codebook=cb)
+                    output = model(x, codebook=cb, hyper_causal_mask=args.hyper_causal_mask)
                     if use_token_type_head:
                         logits, token_type_logits = output
                     else:
