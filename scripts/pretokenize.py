@@ -26,7 +26,7 @@ def main():
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.1-8B")
     parser.add_argument("--dataset", type=str, default="HuggingFaceFW/fineweb")
-    parser.add_argument("--dataset_name", type=str, default="sample-10BT")
+    parser.add_argument("--dataset_name", type=str, default=None)
     parser.add_argument("--dataset_split", type=str, default="train")
     parser.add_argument("--column", type=str, default="text")
     parser.add_argument("--tokens_per_shard", type=int, default=100_000_000)
@@ -52,11 +52,13 @@ def main():
     print(f"Using {num_workers} workers, batch_size={args.batch_size}")
 
     print("Loading dataset...")
-    ds = load_dataset(
-        args.dataset,
-        name=args.dataset_name,
-        split=args.dataset_split,
-    )
+    load_kwargs = {
+        "path": args.dataset,
+        "split": args.dataset_split,
+    }
+    if args.dataset_name:
+        load_kwargs["name"] = args.dataset_name
+    ds = load_dataset(**load_kwargs)
 
     # Filter short documents
     ds = ds.filter(
