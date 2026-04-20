@@ -6,6 +6,12 @@ Usage:
         --max_subtokens 2 \
         --steps 19000
 
+Token-budget training:
+    torchrun --nnodes=N --nproc_per_node=4 -m zip2zip_core.train \
+        --data_dir /path/to/tokens \
+        --max_subtokens 4 \
+        --max_tokens 2000000000
+
 Curriculum training:
     Phase 1: --max_subtokens 2 --steps 6000
     Phase 2: --max_subtokens 3 --steps 12000 --resume_from checkpoint_dir
@@ -217,12 +223,15 @@ def main():
     parser.add_argument("--encoder_dim", type=int, default=None)
     parser.add_argument("--encoder_intermediate_size", type=int, default=None)
     parser.add_argument("--encoder_n_heads", type=int, default=None)
+    parser.add_argument("--hyper_encoder_type", type=str, default="flat", choices=["flat", "hierarchical"])
     parser.add_argument("--max_active_codebook_size", type=int, default=4096)
     parser.add_argument("--seq_len", type=int, default=4096)
     parser.add_argument("--local_batch_size", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--steps", type=int, default=19000)
+    parser.add_argument("--max_tokens", type=int, default=None,
+                        help="Stop after processing this many global training tokens. Overrides --steps as stop criterion.")
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--min_lr", type=float, default=3e-5)
@@ -304,6 +313,7 @@ def main():
     replace_kwargs = dict(
         max_codebook_size=args.max_codebook_size,
         max_subtokens=args.max_subtokens,
+        hyper_encoder_type=args.hyper_encoder_type,
         token_type_loss_weight=args.token_type_loss_weight,
     )
     if args.encoder_dim is not None:
@@ -381,8 +391,19 @@ def main():
 
     # Training loop
     global_batch_tokens = args.local_batch_size * args.seq_len * world_size * args.gradient_accumulation_steps
+    schedule_total_steps = args.steps
+    if args.max_tokens is not None:
+        schedule_total_steps = max(1, math.ceil(args.max_tokens / global_batch_tokens))
     if rank == 0:
         print(f"Global batch: {global_batch_tokens:,} tokens/step")
+        if args.max_tokens is not None:
+            print(
+                "Stopping by token budget: "
+                f"max_tokens={args.max_tokens:,} "
+                f"(estimated {schedule_total_steps:,} steps at current global batch)"
+            )
+        else:
+            print(f"Stopping by step budget: steps={args.steps:,}")
         print(f"Starting training from step {start_step + 1}...")
 
     model.train()
@@ -401,11 +422,18 @@ def main():
     start_time = time.time()
     use_token_type_head = args.token_type_loss_weight > 0
 
-    while step < args.steps:
+    while True:
+        if args.max_tokens is not None:
+            tokens_seen_before_step = step * global_batch_tokens
+            if tokens_seen_before_step >= args.max_tokens:
+                break
+        elif step >= args.steps:
+            break
+
         step += 1
 
         # Set learning rate
-        lr = get_lr(step, args.warmup_steps, args.steps, args.lr, args.min_lr)
+        lr = get_lr(step, args.warmup_steps, schedule_total_steps, args.lr, args.min_lr)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
@@ -510,6 +538,7 @@ def main():
         # Logging
         if step % args.log_freq == 0:
             elapsed = time.time() - start_time
+            avg_step_time = elapsed / args.log_freq
             avg_loss = log_loss / args.log_freq
             avg_base_loss = log_base_loss / args.log_freq
             avg_compression = log_compression / args.log_freq
@@ -561,6 +590,7 @@ def main():
                     )
                 log_msg += (
                     f"lr={lr:.2e} | grad_norm={grad_norm:.4f} | "
+                    f"avg_step_time={avg_step_time:.2f}s | "
                     f"tok/s={tokens_per_sec:.0f} | "
                     f"tokens={total_tokens_seen/1e9:.2f}B"
                 )
@@ -575,6 +605,7 @@ def main():
                         "compression": compression_tensor.item(),
                         "lr": lr,
                         "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                        "avg_step_time": avg_step_time,
                         "tokens_per_sec": tokens_per_sec,
                         "total_tokens": total_tokens_seen,
                     }
