@@ -9,3 +9,4 @@ build/
 *.dylib
 target/
 wandb
+*.out
