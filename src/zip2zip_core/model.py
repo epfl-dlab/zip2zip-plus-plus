@@ -266,6 +266,148 @@ class HyperEncoder(nn.Module):
             return result
 
 
+class PairwiseHyperEncoder(nn.Module):
+    """Compose two embeddings into one with a small transformer encoder."""
+
+    def __init__(
+        self,
+        dim: int,
+        n_layers: int = 2,
+        n_heads: int = 8,
+        intermediate_size: int | None = None,
+        causal: bool = False,
+        model_dim: int | None = None,
+    ):
+        super().__init__()
+        if intermediate_size is None:
+            intermediate_size = 4 * dim
+
+        self.causal = causal
+        self.model_dim = model_dim or dim
+        self.dim = dim
+
+        if self.model_dim != dim:
+            self.proj_in = nn.Linear(self.model_dim, dim, bias=False)
+            self.proj_out = nn.Linear(dim, self.model_dim, bias=False)
+        else:
+            self.proj_in = None
+            self.proj_out = None
+
+        self.pos_embed = nn.Embedding(2, dim)
+        self.layers = nn.ModuleList(
+            [
+                HyperEncoderLayer(dim, intermediate_size, n_heads)
+                for _ in range(n_layers)
+            ]
+        )
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, pair_embeddings: torch.Tensor) -> torch.Tensor:
+        """Encode a pair of embeddings into a single composed representation."""
+        _, seq_len, _ = pair_embeddings.shape
+        if seq_len != 2:
+            raise ValueError(
+                f"PairwiseHyperEncoder expects sequence length 2, got {seq_len}"
+            )
+
+        x = pair_embeddings
+        if self.proj_in is not None:
+            x = self.proj_in(x)
+
+        pos = torch.arange(2, device=x.device)
+        x = x + self.pos_embed(pos)
+        mask = torch.ones(x.shape[:2], dtype=torch.bool, device=x.device)
+
+        for layer in self.layers:
+            x = layer(x, mask, causal=self.causal)
+
+        x = self.norm(x)
+        result = x[:, 1] if self.causal else x.mean(dim=1)
+
+        if self.proj_out is not None:
+            result = self.proj_out(result)
+        return result
+
+
+class HierarchicalHyperEncoder(nn.Module):
+    """Compose each valid subtoken sequence left-to-right."""
+
+    def __init__(
+        self,
+        dim: int,
+        max_subtokens: int,
+        n_layers: int = 2,
+        n_heads: int = 8,
+        intermediate_size: int | None = None,
+        causal: bool = False,
+        model_dim: int | None = None,
+    ):
+        super().__init__()
+        self.max_subtokens = max_subtokens
+        self.model_dim = model_dim or dim
+        self.pair_encoder = PairwiseHyperEncoder(
+            dim=dim,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            intermediate_size=intermediate_size,
+            causal=causal,
+            model_dim=model_dim,
+        )
+
+    def forward(
+        self, token_embeddings: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Left-fold valid subtokens into a single composed embedding."""
+        num_entries = token_embeddings.shape[0]
+        lengths = mask.sum(dim=1).long()
+        outputs = torch.zeros(
+            num_entries,
+            self.model_dim,
+            dtype=token_embeddings.dtype,
+            device=token_embeddings.device,
+        )
+
+        single_mask = lengths == 1
+        if single_mask.any():
+            first_valid_idx = mask.long().argmax(dim=1)
+            outputs[single_mask] = token_embeddings[
+                single_mask, first_valid_idx[single_mask]
+            ]
+
+        active_indices = torch.nonzero(lengths >= 2, as_tuple=False).flatten()
+        if active_indices.numel() == 0:
+            return outputs
+
+        # Codebook entries are right-padded, so valid subtokens occupy a prefix.
+        states = self.pair_encoder(token_embeddings[active_indices, :2, :])
+        next_positions = torch.full_like(active_indices, 2)
+
+        while True:
+            still_active = next_positions < lengths[active_indices]
+            if not still_active.any():
+                break
+
+            current_indices = active_indices[still_active]
+            pair_inputs = torch.stack(
+                [
+                    states[still_active],
+                    token_embeddings[
+                        current_indices,
+                        next_positions[still_active],
+                    ],
+                ],
+                dim=1,
+            )
+            updated_states = self.pair_encoder(pair_inputs)
+            states = states.clone()
+            states[still_active] = updated_states
+            next_positions = next_positions.clone()
+            next_positions[still_active] += 1
+
+        outputs[active_indices] = states
+        return outputs
+
+
 class Zip2ZipTransformerBlock(TransformerBlock):
     """Llama3 TransformerBlock for Zip2Zip (same as Llama3TransformerBlock)."""
 
@@ -329,6 +471,7 @@ class Zip2ZipLlama3Model(Decoder):
         encoder_n_heads: int = 8
         encoder_intermediate_size: int | None = None
         encoder_causal: bool = False
+        hyper_encoder_type: str = "flat"
         reconstruction_loss_weight: float = 0.0
         token_type_loss_weight: float = (
             0.0  # weight for base/hyper token type prediction head
@@ -378,7 +521,7 @@ class Zip2ZipLlama3Model(Decoder):
 
         # Hyper-encoder for computing hypertoken embeddings
         encoder_dim = config.encoder_dim or config.dim
-        self.hyper_encoder = HyperEncoder(
+        hyper_encoder_kwargs = dict(
             dim=encoder_dim,
             max_subtokens=config.max_subtokens,
             n_layers=config.encoder_n_layers,
@@ -387,6 +530,14 @@ class Zip2ZipLlama3Model(Decoder):
             causal=config.encoder_causal,
             model_dim=config.dim,
         )
+        if config.hyper_encoder_type == "flat":
+            self.hyper_encoder = HyperEncoder(**hyper_encoder_kwargs)
+        elif config.hyper_encoder_type == "hierarchical":
+            self.hyper_encoder = HierarchicalHyperEncoder(**hyper_encoder_kwargs)
+        else:
+            raise ValueError(
+                f"Unsupported hyper_encoder_type: {config.hyper_encoder_type!r}"
+            )
 
     def init_weights(self, **kwargs):
         super().init_weights(**kwargs)

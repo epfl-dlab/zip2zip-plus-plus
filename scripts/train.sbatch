@@ -28,8 +28,10 @@ OUTPUT_DIR=${OUTPUT_DIR:-/users/nathanrchn/capstor_scratch/zip2zip-outputs}
 MAX_SUBTOKENS=${MAX_SUBTOKENS:-4}
 ENCODER_DIM=${ENCODER_DIM:-512}
 ENCODER_INTERMEDIATE_SIZE=${ENCODER_INTERMEDIATE_SIZE:-2048}
+HYPER_ENCODER_TYPE=${HYPER_ENCODER_TYPE:-flat}
 MAX_ACTIVE_CODEBOOK_SIZE=${MAX_ACTIVE_CODEBOOK_SIZE:-2048}
 STEPS=${STEPS:-19000}
+MAX_TOKENS=${MAX_TOKENS:-}
 SEQ_LEN=${SEQ_LEN:-4096}
 LOCAL_BATCH_SIZE=${LOCAL_BATCH_SIZE:-4}
 GRAD_ACCUM=${GRAD_ACCUM:-2}
@@ -67,6 +69,7 @@ export WORLD_SIZE=$((SLURM_NNODES * 4))
 
 echo "=== zip2zip-core training ==="
 echo "NODES=$SLURM_NNODES  WORLD_SIZE=$WORLD_SIZE  MAX_SUBTOKENS=$MAX_SUBTOKENS  MODE=$MODE  MODEL=$MODEL_CONFIG"
+echo "HYPER_ENCODER_TYPE=$HYPER_ENCODER_TYPE"
 echo "OUTPUT_DIR=$OUTPUT_DIR"
 
 RESUME_FLAG=""
@@ -93,6 +96,11 @@ if [ -n "$WANDB" ]; then
     fi
 fi
 
+MAX_TOKENS_FLAG=""
+if [ -n "$MAX_TOKENS" ]; then
+    MAX_TOKENS_FLAG="--max_tokens $MAX_TOKENS"
+fi
+
 srun --export=ALL bash -c '
 export LOCAL_RANK=$((SLURM_LOCALID))
 export RANK=$((SLURM_NODEID * 4 + SLURM_LOCALID))
@@ -105,8 +113,10 @@ export PYTHONUNBUFFERED=1
     --max_subtokens '"$MAX_SUBTOKENS"' \
     --encoder_dim '"$ENCODER_DIM"' \
     --encoder_intermediate_size '"$ENCODER_INTERMEDIATE_SIZE"' \
+    --hyper_encoder_type '"$HYPER_ENCODER_TYPE"' \
     --max_active_codebook_size '"$MAX_ACTIVE_CODEBOOK_SIZE"' \
     --steps '"$STEPS"' \
+    '"$MAX_TOKENS_FLAG"' \
     --seq_len '"$SEQ_LEN"' \
     --local_batch_size '"$LOCAL_BATCH_SIZE"' \
     --gradient_accumulation_steps '"$GRAD_ACCUM"' \
