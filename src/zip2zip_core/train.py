@@ -198,7 +198,9 @@ def load_checkpoint(model, optimizer, resume_dir, device):
     raw_model.load_state_dict(model_state)
 
     opt_path = os.path.join(resume_dir, "optimizer.pt")
-    if curriculum_transition:
+    if optimizer is None:
+        pass  # eval mode — skip optimizer load
+    elif curriculum_transition:
         if dist.get_rank() == 0:
             print("Curriculum transition detected — skipping optimizer state load (will re-init)")
     elif os.path.exists(opt_path):
@@ -262,6 +264,8 @@ def main():
                         help="Enable hyper causal mask: at position t, only codebook entries k <= t are available")
     parser.add_argument("--token_type_loss_weight", type=float, default=0.0,
                         help="Weight for token type (base vs hyper) prediction head. 0 = disabled.")
+    parser.add_argument("--eval", action="store_true",
+                        help="Eval-only mode: load checkpoint, run --steps batches with no gradient, print stats.")
     args = parser.parse_args()
 
     if args.no_compile:
@@ -342,16 +346,17 @@ def main():
     # Wrap with DDP
     model = DDP(model, device_ids=[local_rank])
 
-    # fp32 master weights: optimizer states stay in fp32, model stays in bf16
-    master_params = [p.detach().float().requires_grad_(True) for p in model.parameters()]
+    if not args.eval:
+        # fp32 master weights: optimizer states stay in fp32, model stays in bf16
+        master_params = [p.detach().float().requires_grad_(True) for p in model.parameters()]
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        master_params,
-        lr=args.lr,
-        betas=(0.9, 0.95),
-        weight_decay=args.weight_decay,
-    )
+        # Optimizer
+        optimizer = torch.optim.AdamW(
+            master_params,
+            lr=args.lr,
+            betas=(0.9, 0.95),
+            weight_decay=args.weight_decay,
+        )
 
     # Resume if specified
     start_step = 0
@@ -365,14 +370,14 @@ def main():
         resume_dir_list = [resume_dir]
         dist.broadcast_object_list(resume_dir_list, src=0)
         resume_dir = resume_dir_list[0]
-        start_step = load_checkpoint(model, optimizer, resume_dir, device)
+        start_step = load_checkpoint(model, optimizer if not args.eval else None, resume_dir, device)
     elif args.resume_from:
         resume_dir = args.resume_from
         if resume_dir == "latest":
             resume_dir = _resolve_latest_checkpoint(args.output_dir)
             if rank == 0:
                 print(f"Auto-resolved latest checkpoint: {resume_dir}")
-        start_step = load_checkpoint(model, optimizer, resume_dir, device)
+        start_step = load_checkpoint(model, optimizer if not args.eval else None, resume_dir, device)
 
     # Dataset and dataloader
     dataloader = build_dataloader(
@@ -388,6 +393,97 @@ def main():
         mode=args.mode,
         remap_codebook=not args.no_remap_codebook,
     )
+
+    use_token_type_head = args.token_type_loss_weight > 0
+
+    # ---------- Eval-only mode ----------
+    if args.eval:
+        model.eval()
+        data_iter = iter(dataloader)
+        total_loss_sum = 0.0
+        total_valid_tokens = 0
+        total_base_tokens = 0
+        total_correct = 0
+        total_base_correct = 0
+        total_base_count = 0
+        total_hyper_correct = 0
+        total_hyper_count = 0
+
+        if rank == 0:
+            print(f"Running eval for {args.steps} steps...")
+
+        with torch.no_grad():
+            for eval_step in range(1, args.steps + 1):
+                input_dict, labels = next(data_iter)
+                x = input_dict["input"].to(device)
+                cb = input_dict["codebook"].to(device)
+                n_base_tokens = input_dict["n_base_tokens"].to(device)
+                labels = labels.to(device)
+
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    output = model(x, codebook=cb, hyper_causal_mask=args.hyper_causal_mask)
+                    if use_token_type_head:
+                        logits, _ = output
+                    else:
+                        logits = output
+
+                flat_logits = logits.flatten(0, 1).float()
+                flat_labels = labels.flatten(0, 1)
+                per_token_loss = F.cross_entropy(
+                    flat_logits, flat_labels, reduction="none", ignore_index=-100,
+                )
+                valid_mask = flat_labels != -100
+                total_loss_sum += per_token_loss.sum().item()
+                total_valid_tokens += valid_mask.sum().item()
+                total_base_tokens += n_base_tokens.sum().item()
+
+                valid_preds = flat_logits[valid_mask].argmax(-1)
+                valid_labels = flat_labels[valid_mask]
+                total_correct += (valid_preds == valid_labels).sum().item()
+
+                base_tok_mask = valid_labels < config.vocab_size
+                hyper_tok_mask = valid_labels >= config.vocab_size
+                total_base_correct += (valid_preds[base_tok_mask] == valid_labels[base_tok_mask]).sum().item()
+                total_base_count += base_tok_mask.sum().item()
+                total_hyper_correct += (valid_preds[hyper_tok_mask] == valid_labels[hyper_tok_mask]).sum().item()
+                total_hyper_count += hyper_tok_mask.sum().item()
+
+                if rank == 0 and eval_step % args.log_freq == 0:
+                    print(f"  eval step {eval_step}/{args.steps}")
+
+        # All-reduce across ranks
+        stats = torch.tensor([
+            total_loss_sum, total_valid_tokens, total_base_tokens,
+            total_correct, total_base_correct, total_base_count,
+            total_hyper_correct, total_hyper_count,
+        ], device=device, dtype=torch.float64)
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+        loss_sum, valid_tok, base_tok, correct, base_correct, base_count, hyper_correct, hyper_count = stats.tolist()
+
+        if rank == 0:
+            avg_loss = loss_sum / valid_tok
+            base_loss = loss_sum / base_tok
+            ppl = math.exp(base_loss)
+            acc = correct / valid_tok
+            base_token_acc = base_correct / base_count if base_count > 0 else 0.0
+            hyper_token_acc = hyper_correct / hyper_count if hyper_count > 0 else 0.0
+            compression = base_tok / valid_tok
+
+            print("=" * 60)
+            print("Eval Results:")
+            print(f"  loss (per base token) = {base_loss:.4f}")
+            print(f"  ppl                   = {ppl:.2f}")
+            print(f"  loss (per valid token) = {avg_loss:.4f}")
+            print(f"  acc                   = {acc:.4f}")
+            print(f"  base_token_acc        = {base_token_acc:.4f}")
+            print(f"  hyper_token_acc       = {hyper_token_acc:.4f}")
+            print(f"  compression           = {compression:.2f}")
+            print(f"  total tokens evaluated = {int(valid_tok):,}")
+            print("=" * 60)
+
+        dist.destroy_process_group()
+        return
 
     # Training loop
     global_batch_tokens = args.local_batch_size * args.seq_len * world_size * args.gradient_accumulation_steps
@@ -422,7 +518,6 @@ def main():
     log_hyper_ratio = 0.0
     log_tokens = 0
     start_time = time.time()
-    use_token_type_head = args.token_type_loss_weight > 0
 
     while True:
         if args.max_tokens is not None:
