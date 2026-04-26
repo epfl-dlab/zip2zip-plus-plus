@@ -59,6 +59,7 @@ def main():
     if args.dataset_name:
         load_kwargs["name"] = args.dataset_name
     ds = load_dataset(**load_kwargs)
+    ds = ds.shuffle(seed=42)
 
     # Filter short documents
     ds = ds.filter(
