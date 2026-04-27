@@ -22,11 +22,12 @@ from transformers import AutoTokenizer
 from zip2zip_core.codebook import CodebookManager
 from zip2zip_core.configs import zip2zip_llama_configs
 from zip2zip_core.model import Zip2ZipLlama3Model
+from zip2zip_core.tokenizer import ColorfulTokenizer, colorise_lzwtokens
 
 
 # ── constants ─────────────────────────────────────────────────────────────────
-DEFAULT_CKPT = "/mnt/scratch/checkpoints/zip2zip_1b_finemath_10bt_ms3/step_1000"
-DEFAULT_TOKENIZER = "meta-llama/Meta-Llama-3-8B"
+DEFAULT_CKPT = "/mnt/scratch/checkpoints/zip2zip_150m_finemath_10bt_ms4/step_6000"
+DEFAULT_TOKENIZER = "bofenghuang/Meta-Llama-3-8B"
 EOS_ID = 128001
 PAD_ID = 128001
 DISABLED_IDS = [128000, 128001, 128002, 128003]
@@ -73,6 +74,7 @@ def generate(
     model: Zip2ZipLlama3Model,
     codebook_manager: CodebookManager,
     hf_tokenizer,
+    colorful_tokenizer: ColorfulTokenizer,
     max_new_tokens: int = 128,
     temperature: float = 1.0,
     device: str = "cuda",
@@ -109,6 +111,13 @@ def generate(
         logits = logits[0]
 
     generated_base_ids: list[int] = []
+
+    def _color_decode_ids(ids: list[int]) -> str:
+        codebooks = codebook_manager.internal_codebook_manager.get_codebooks()
+        codebook_dict = codebooks[0].to_dict() if codebooks else {}
+        special_ids = set(hf_tokenizer.get_added_vocab().values())
+        colored_tokens = colorise_lzwtokens(ids, codebook_dict, "finegrained", special_ids)
+        return colorful_tokenizer.decode_colored_token(colored_tokens)
 
     # ── Decode loop ──
     for step in range(max_new_tokens):
@@ -152,11 +161,20 @@ def generate(
         if isinstance(logits, tuple):
             logits = logits[0]
 
-        if step % 10 == 0:
-            partial = hf_tokenizer.decode(generated_base_ids[-60:])
-            print(f"  step {step:3d} | ctx_len={context.shape[1]} | ...{repr(partial)}")
+        if step % 2 == 0:
+            partial_colored = _color_decode_ids(generated_base_ids[-20:])
+            ids_str = str(generated_base_ids[-10:])
+            top10_vals, top10_ids = torch.topk(last_logits, 10)
+            top10_tokens = [
+                f"{tid}({repr(hf_tokenizer.decode([tid]))})" if tid < vocab_size
+                else f"{tid}(hyper)"
+                for tid in top10_ids.tolist()
+            ]
+            print(f"  step {step:3d} | ctx_len={context.shape[1]} | ids={ids_str} | ...{partial_colored}")
+            print(f"           top10: {', '.join(top10_tokens)}")
 
-    return hf_tokenizer.decode(generated_base_ids, skip_special_tokens=True)
+    colored_output = _color_decode_ids(generated_base_ids)
+    return hf_tokenizer.decode(generated_base_ids, skip_special_tokens=True), colored_output
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -183,6 +201,7 @@ def main():
 
     print(f"Loading tokenizer from {cli.tokenizer}...")
     hf_tok = AutoTokenizer.from_pretrained(cli.tokenizer)
+    colorful_tok = ColorfulTokenizer(hf_tok)
 
     codebook_manager = CodebookManager(
         initial_vocab_size=cfg.vocab_size,
@@ -194,11 +213,12 @@ def main():
     )
 
     print(f"\nPrompt: {repr(cli.prompt)}\n")
-    output = generate(
+    output, colored_output = generate(
         cli.prompt,
         model,
         codebook_manager,
         hf_tok,
+        colorful_tok,
         max_new_tokens=cli.max_new_tokens,
         temperature=cli.temperature,
         device=device,
@@ -206,6 +226,8 @@ def main():
     print(f"\n{'='*60}")
     print(f"PROMPT:    {cli.prompt}")
     print(f"GENERATED: {output}")
+    print(f"\nCOLORED (blue=base, yellow=2-gram, orange=3-gram, red=4-gram):")
+    print(colored_output)
 
 
 if __name__ == "__main__":
