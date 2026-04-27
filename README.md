@@ -80,7 +80,21 @@ Set your API key in `scripts/train.sbatch` or export it before submitting:
 export WANDB_API_KEY=<your-wandb-api-key>
 ```
 
-### 3. Curriculum training
+### 3. Evaluation
+
+Evaluate a checkpoint on held-out data (no gradient, outputs loss/ppl/accuracy):
+
+```bash
+# Basic usage
+bash scripts/eval_lm.sh /path/to/checkpoint
+
+# Specify model config and max_subtokens
+bash scripts/eval_lm.sh /path/to/checkpoint 400M 2
+```
+
+Arguments: `<checkpoint_dir> [model_config=1B] [max_subtokens=4]`
+
+### 4. Curriculum training
 
 Run phases sequentially, resuming from the previous checkpoint:
 

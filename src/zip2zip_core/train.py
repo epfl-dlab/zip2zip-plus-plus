@@ -162,11 +162,14 @@ def _clean_state_dict(model_state):
     return cleaned
 
 
-def load_checkpoint(model, optimizer, resume_dir, device):
+def load_checkpoint(model, optimizer, resume_dir, device, random_weights=False):
     """Load model and optimizer state from a local directory.
 
     Handles curriculum transitions where max_subtokens changes between phases
     by zero-padding the hyper_encoder position embedding.
+
+    If random_weights=True, skip loading model weights (control experiment:
+    same step/LR position, same optimizer state, but randomly initialized model).
     """
     meta_path = os.path.join(resume_dir, "meta.pt")
     if os.path.exists(meta_path):
@@ -177,29 +180,38 @@ def load_checkpoint(model, optimizer, resume_dir, device):
         if dist.get_rank() == 0:
             print("No meta.pt found — starting from step 0")
 
-    model_state = torch.load(os.path.join(resume_dir, "model.pt"), map_location="cpu")
     raw_model = _unwrap_model(model)
-    model_state = _clean_state_dict(model_state)
 
-    # Handle pos_embed size mismatch from curriculum phase transitions
-    pos_key = "hyper_encoder.pos_embed.weight"
-    curriculum_transition = False
-    if pos_key in model_state:
-        current_pos = raw_model.state_dict()[pos_key]
-        saved_pos = model_state[pos_key]
-        if saved_pos.shape[0] < current_pos.shape[0]:
-            padded = torch.zeros_like(current_pos)
-            padded[:saved_pos.shape[0]] = saved_pos
-            model_state[pos_key] = padded
-            curriculum_transition = True
-            if dist.get_rank() == 0:
-                print(f"Padded pos_embed from {saved_pos.shape[0]} to {current_pos.shape[0]} positions")
+    if random_weights:
+        if dist.get_rank() == 0:
+            print(f"[random_weights] Skipping model weight load — keeping random init (step={step})")
+        curriculum_transition = False
+    else:
+        model_state = torch.load(os.path.join(resume_dir, "model.pt"), map_location="cpu")
+        model_state = _clean_state_dict(model_state)
 
-    raw_model.load_state_dict(model_state)
+        # Handle pos_embed size mismatch from curriculum phase transitions
+        pos_key = "hyper_encoder.pos_embed.weight"
+        curriculum_transition = False
+        if pos_key in model_state:
+            current_pos = raw_model.state_dict()[pos_key]
+            saved_pos = model_state[pos_key]
+            if saved_pos.shape[0] < current_pos.shape[0]:
+                padded = torch.zeros_like(current_pos)
+                padded[:saved_pos.shape[0]] = saved_pos
+                model_state[pos_key] = padded
+                curriculum_transition = True
+                if dist.get_rank() == 0:
+                    print(f"Padded pos_embed from {saved_pos.shape[0]} to {current_pos.shape[0]} positions")
+
+        raw_model.load_state_dict(model_state)
 
     opt_path = os.path.join(resume_dir, "optimizer.pt")
     if optimizer is None:
         pass  # eval mode — skip optimizer load
+    elif random_weights:
+        if dist.get_rank() == 0:
+            print("[random_weights] Skipping optimizer state load — fresh optimizer for random init")
     elif curriculum_transition:
         if dist.get_rank() == 0:
             print("Curriculum transition detected — skipping optimizer state load (will re-init)")
@@ -226,12 +238,16 @@ def main():
     parser.add_argument("--encoder_intermediate_size", type=int, default=None)
     parser.add_argument("--encoder_n_heads", type=int, default=None)
     parser.add_argument("--hyper_encoder_type", type=str, default="flat", choices=["flat", "hierarchical"])
+    parser.add_argument("--encoder_n_layers", type=int, default=None)
     parser.add_argument("--max_active_codebook_size", type=int, default=4096)
     parser.add_argument("--seq_len", type=int, default=4096)
     parser.add_argument("--local_batch_size", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--steps", type=int, default=19000)
+    parser.add_argument("--steps", type=int, default=19000,
+                        help="Total steps for LR schedule computation")
+    parser.add_argument("--stop_at", type=int, default=None,
+                        help="Stop training at this step (for curriculum phases). Defaults to --steps.")
     parser.add_argument("--max_tokens", type=int, default=None,
                         help="Stop after processing this many global training tokens. Overrides --steps as stop criterion.")
     parser.add_argument("--warmup_steps", type=int, default=500)
@@ -247,6 +263,13 @@ def main():
                         help="HuggingFace repo ID to download checkpoint from (e.g. user/model-name)")
     parser.add_argument("--resume_hf_revision", type=str, default=None,
                         help="HF revision/branch to download from (e.g. step_5000). Defaults to main.")
+    parser.add_argument("--random_weights", action="store_true",
+                        help="Control experiment: resume step/optimizer from checkpoint but reinit model weights randomly")
+    parser.add_argument("--reset_step", action="store_true",
+                        help="After loading checkpoint weights, reset step to 0 (fresh LR schedule). "
+                             "Useful for finetuning: warm-start weights but new cosine schedule.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Global random seed for torch, cuda, and numpy")
     parser.add_argument("--push_to_hub", type=str, default=None,
                         help="HuggingFace repo ID to push checkpoints to (e.g. user/model-name)")
     parser.add_argument("--compile", action="store_true", default=True)
@@ -256,6 +279,10 @@ def main():
     parser.add_argument("--wandb_name", type=str, default=None)
     parser.add_argument("--wandb_group", type=str, default=None, help="wandb run group")
     parser.add_argument("--wandb_tags", type=str, nargs="*", default=None, help="wandb tags")
+    parser.add_argument("--wandb_id", type=str, default=None,
+                        help="wandb run ID (for resuming into the same run across curriculum phases)")
+    parser.add_argument("--wandb_resume", type=str, default=None, choices=["allow", "must", "never"],
+                        help="wandb resume mode. Use 'must' with --wandb_id to continue a previous run.")
     parser.add_argument("--mode", type=str, default="lm", choices=["lm", "compress"],
                         help="Training mode: 'lm' for language modeling, 'compress' for compression/decompression task")
     parser.add_argument("--no_remap_codebook", action="store_true",
@@ -270,6 +297,8 @@ def main():
 
     if args.no_compile:
         args.compile = False
+    if args.stop_at is None:
+        args.stop_at = args.steps
 
     # Initialize distributed
     dist.init_process_group("nccl")
@@ -282,16 +311,25 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
+    # Set global seed (rank-offset so each process gets different data order)
+    seed = args.seed + rank
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    import numpy as np; np.random.seed(seed)
+    import random as _random; _random.seed(seed)
+
     # Deduplicate output_dir: if it already exists, append (1), (2), ... on rank 0,
     # then broadcast the resolved path to all ranks.
+    # Skip deduplication when resuming — we want to write back to the same directory.
     if rank == 0:
-        base_dir = args.output_dir
-        if os.path.exists(base_dir):
-            n = 1
-            while os.path.exists(f"{base_dir}({n})"):
-                n += 1
-            args.output_dir = f"{base_dir}({n})"
-            print(f"Output dir {base_dir} already exists, using {args.output_dir}")
+        if not args.resume_from and not args.resume_from_hf:
+            base_dir = args.output_dir
+            if os.path.exists(base_dir):
+                n = 1
+                while os.path.exists(f"{base_dir}({n})"):
+                    n += 1
+                args.output_dir = f"{base_dir}({n})"
+                print(f"Output dir {base_dir} already exists, using {args.output_dir}")
         os.makedirs(args.output_dir, exist_ok=True)
     output_dir_list = [args.output_dir if rank == 0 else None]
     dist.broadcast_object_list(output_dir_list, src=0)
@@ -309,6 +347,8 @@ def main():
                 name=args.wandb_name,
                 group=args.wandb_group,
                 tags=args.wandb_tags,
+                id=args.wandb_id,
+                resume=args.wandb_resume,
                 config=vars(args),
             )
 
@@ -326,6 +366,8 @@ def main():
         replace_kwargs["encoder_intermediate_size"] = args.encoder_intermediate_size
     if args.encoder_n_heads is not None:
         replace_kwargs["encoder_n_heads"] = args.encoder_n_heads
+    if args.encoder_n_layers is not None:
+        replace_kwargs["encoder_n_layers"] = args.encoder_n_layers
     config = dataclasses.replace(config, **replace_kwargs)
 
     model = config.build()
@@ -346,6 +388,9 @@ def main():
     # Wrap with DDP
     model = DDP(model, device_ids=[local_rank])
 
+    if not args.eval:
+        # fp32 master weights: optimizer states stay in fp32, model stays in bf16
+        master_params = [p.detach().float().requires_grad_(True) for p in model.parameters()]
     if not args.eval:
         # fp32 master weights: optimizer states stay in fp32, model stays in bf16
         master_params = [p.detach().float().requires_grad_(True) for p in model.parameters()]
@@ -377,7 +422,12 @@ def main():
             resume_dir = _resolve_latest_checkpoint(args.output_dir)
             if rank == 0:
                 print(f"Auto-resolved latest checkpoint: {resume_dir}")
-        start_step = load_checkpoint(model, optimizer if not args.eval else None, resume_dir, device)
+        start_step = load_checkpoint(model, optimizer if not args.eval else None, resume_dir, device, random_weights=args.random_weights)
+
+    if args.reset_step and start_step != 0:
+        if rank == 0:
+            print(f"[reset_step] Resetting start_step from {start_step} to 0 (fresh LR schedule)")
+        start_step = 0
 
     # Dataset and dataloader
     dataloader = build_dataloader(
@@ -408,6 +458,10 @@ def main():
         total_base_count = 0
         total_hyper_correct = 0
         total_hyper_count = 0
+        # Per-merge-size accuracy: index 0 unused, index k = merge size k
+        max_ms = config.max_subtokens
+        merge_correct = [0] * (max_ms + 1)
+        merge_count = [0] * (max_ms + 1)
 
         if rank == 0:
             print(f"Running eval for {args.steps} steps...")
@@ -448,6 +502,22 @@ def main():
                 total_hyper_correct += (valid_preds[hyper_tok_mask] == valid_labels[hyper_tok_mask]).sum().item()
                 total_hyper_count += hyper_tok_mask.sum().item()
 
+                # Per-merge-size accuracy for hyper tokens
+                if hyper_tok_mask.any():
+                    # Compute merge size for each label before flattening
+                    cb_indices = (labels - config.vocab_size).clamp(min=0)  # (B, T)
+                    cb_idx_exp = cb_indices.unsqueeze(-1).expand(-1, -1, cb.shape[-1])  # (B, T, ms)
+                    entries = cb.gather(1, cb_idx_exp)  # (B, T, ms)
+                    ms_per_token = (entries != config.pad_token_id).sum(dim=-1).flatten()  # (B*T,)
+                    valid_ms = ms_per_token[valid_mask]  # only valid positions
+                    hyper_ms = valid_ms[hyper_tok_mask]
+                    hyper_preds_correct = (valid_preds[hyper_tok_mask] == valid_labels[hyper_tok_mask])
+                    for k in range(2, max_ms + 1):
+                        k_mask = hyper_ms == k
+                        if k_mask.any():
+                            merge_correct[k] += hyper_preds_correct[k_mask].sum().item()
+                            merge_count[k] += k_mask.sum().item()
+
                 if rank == 0 and eval_step % args.log_freq == 0:
                     print(f"  eval step {eval_step}/{args.steps}")
 
@@ -458,6 +528,13 @@ def main():
             total_hyper_correct, total_hyper_count,
         ], device=device, dtype=torch.float64)
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+
+        merge_stats = torch.tensor(
+            merge_correct + merge_count, device=device, dtype=torch.float64
+        )
+        dist.all_reduce(merge_stats, op=dist.ReduceOp.SUM)
+        mc = merge_stats[: max_ms + 1].tolist()
+        mn = merge_stats[max_ms + 1 :].tolist()
 
         loss_sum, valid_tok, base_tok, correct, base_correct, base_count, hyper_correct, hyper_count = stats.tolist()
 
@@ -480,7 +557,28 @@ def main():
             print(f"  hyper_token_acc       = {hyper_token_acc:.4f}")
             print(f"  compression           = {compression:.2f}")
             print(f"  total tokens evaluated = {int(valid_tok):,}")
+            for k in range(2, max_ms + 1):
+                if mn[k] > 0:
+                    print(f"  hyper_acc_ms{k}         = {mc[k] / mn[k]:.4f}  (n={int(mn[k]):,})")
             print("=" * 60)
+
+            if args.wandb:
+                import wandb
+
+                eval_dict = {
+                    "eval/loss": base_loss,
+                    "eval/ppl": ppl,
+                    "eval/loss_per_valid_token": avg_loss,
+                    "eval/acc": acc,
+                    "eval/base_token_acc": base_token_acc,
+                    "eval/hyper_token_acc": hyper_token_acc,
+                    "eval/compression": compression,
+                }
+                for k in range(2, max_ms + 1):
+                    if mn[k] > 0:
+                        eval_dict[f"eval/hyper_acc_ms{k}"] = mc[k] / mn[k]
+                wandb.log(eval_dict)
+                wandb.finish()
 
         dist.destroy_process_group()
         return
@@ -509,6 +607,8 @@ def main():
     log_base_loss = 0.0
     log_compression = 0.0
     log_acc = 0.0
+    log_base_token_acc = 0.0
+    log_hyper_token_acc = 0.0
     log_base_token_acc = 0.0
     log_hyper_token_acc = 0.0
     log_type_loss = 0.0

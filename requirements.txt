@@ -1,5 +1,5 @@
---index-url https://download.pytorch.org/whl/cu128
-torch
+# --index-url https://download.pytorch.org/whl/cu128
+torch>=2.10 # for varlen attention 
 torchvision
 datasets
 

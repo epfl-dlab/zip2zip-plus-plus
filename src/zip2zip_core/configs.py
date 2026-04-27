@@ -192,10 +192,10 @@ zip2zip_llama_configs = {
             scaling="llama",
         ),
     ),
-    # ~3B params (dim=3200, 26 layers)
+    # ~3B params (dim=3072, 28 layers, head_dim=128)
     "3B": Zip2ZipLlama3Model.Config(
-        dim=3200,
-        n_layers=26,
+        dim=3072,
+        n_layers=28,
         vocab_size=128256,
         max_codebook_size=4096,
         max_subtokens=4,
@@ -207,17 +207,17 @@ zip2zip_llama_configs = {
         tok_embeddings=Embedding.Config(),
         layer=Zip2ZipTransformerBlock.Config(
             feed_forward=FeedForward.Config(
-                hidden_dim=compute_ffn_hidden_dim(3200, multiple_of=256)
+                hidden_dim=compute_ffn_hidden_dim(3072, multiple_of=256)
             ),
             attention=GQAttention.Config(
-                n_heads=32,
+                n_heads=24,
                 n_kv_heads=8,
                 attn_backend="sdpa",
                 rope_backend="complex",
             ),
         ),
         rope=RoPE.Config(
-            dim=3200 // 32,
+            dim=3072 // 24,
             max_seq_len=8192,
             theta=500000,
             backend="complex",
