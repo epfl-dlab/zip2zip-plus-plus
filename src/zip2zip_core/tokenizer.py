@@ -127,7 +127,7 @@ class Zip2ZipTokenizer(PushToHubMixin):
     def pprint(
         self,
         compressed_ids: Union[List[int], List[List[int]], np.ndarray, torch.Tensor],
-    ) -> List[str]:
+    ) -> None:
         if isinstance(compressed_ids, torch.Tensor):
             compressed_ids = compressed_ids.tolist()
         elif isinstance(compressed_ids, np.ndarray):
@@ -136,12 +136,10 @@ class Zip2ZipTokenizer(PushToHubMixin):
         token_ids_codebook_pairs = self._lzw_decode(compressed_ids)
         special_token_ids = set(self.hf_bpe_tokenizer.get_added_vocab().values())
 
-        out = []
-        for (_, codebook) in token_ids_codebook_pairs:
+        for i, (_, codebook) in enumerate(token_ids_codebook_pairs):
             codebook_map = codebook.to_dict()
-            colored_tokens = colorize_by_ngram(compressed_ids[len(out)], codebook_map, special_token_ids)
-            out.append(render_colored_tokens(colored_tokens, self.hf_bpe_tokenizer))
-        return out
+            colored_tokens = colorize_by_ngram(compressed_ids[i], codebook_map, special_token_ids)
+            print(render_colored_tokens(colored_tokens, self.hf_bpe_tokenizer))
 
 
 def set_pad_token_if_none(
