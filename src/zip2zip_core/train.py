@@ -91,6 +91,106 @@ def _relaxed_prefix_correct(hyper_preds, hyper_labels, batch_idx, cb, vocab_size
     return is_prefix.sum().item()
 
 
+def _relaxed_target_nll(valid_logits, valid_labels, batch_idx, cb, vocab_size, pad_token_id):
+    """Per-token relaxed NLL.
+
+    For base-token labels, this is standard NLL.
+    For hyper-token labels, sum probability mass over all tokens whose expanded
+    base-token sequence is a prefix of the target sequence.
+    """
+    if len(valid_labels) == 0:
+        return torch.empty(0, device=valid_logits.device, dtype=valid_logits.dtype)
+
+    log_probs = F.log_softmax(valid_logits, dim=-1)
+    nll = -log_probs.gather(1, valid_labels.unsqueeze(1)).squeeze(1)
+
+    hyper_mask = valid_labels >= vocab_size
+    if not hyper_mask.any():
+        return nll
+
+    device = valid_logits.device
+    max_ms = cb.shape[-1]
+    hyper_labels = valid_labels[hyper_mask]
+    hyper_batch_idx = batch_idx[hyper_mask]
+    hyper_log_probs = log_probs[hyper_mask]
+
+    target_cb_idx = (hyper_labels - vocab_size).clamp(min=0, max=cb.shape[1] - 1)
+    target_entries = cb[hyper_batch_idx, target_cb_idx]  # (H, max_ms)
+    target_lengths = (target_entries != pad_token_id).sum(dim=-1)
+
+    candidate_ids = torch.arange(valid_logits.shape[-1], device=device)
+    cand_is_base = candidate_ids < vocab_size
+    cand_entries = torch.full(
+        (candidate_ids.numel(), max_ms), pad_token_id, device=device, dtype=cb.dtype
+    )
+    if cand_is_base.any():
+        cand_entries[cand_is_base, 0] = candidate_ids[cand_is_base].to(cb.dtype)
+
+    cand_is_hyper = ~cand_is_base
+    if cand_is_hyper.any():
+        cand_cb_idx = (candidate_ids[cand_is_hyper] - vocab_size).clamp(
+            min=0, max=cb.shape[1] - 1
+        )
+        cand_entries[cand_is_hyper] = cb[hyper_batch_idx[0], cand_cb_idx]
+
+    cand_lengths = (cand_entries != pad_token_id).sum(dim=-1)
+
+    relaxed_nll = []
+    for i in range(hyper_labels.shape[0]):
+        tgt = target_entries[i]
+        tgt_len = target_lengths[i]
+        if tgt_len == 0:
+            relaxed_nll.append(-hyper_log_probs[i, hyper_labels[i]])
+            continue
+
+        batch_cand_entries = cand_entries
+        if cand_is_hyper.any():
+            batch_cand_entries = cand_entries.clone()
+            batch_cand_entries[cand_is_hyper] = cb[hyper_batch_idx[i], cand_cb_idx]
+
+        prefix_ok = cand_lengths <= tgt_len
+        prefix_ok &= cand_lengths > 0
+
+        matches = batch_cand_entries == tgt.unsqueeze(0)
+        valid_prefix = (
+            torch.arange(max_ms, device=device).unsqueeze(0) < cand_lengths.unsqueeze(1)
+        )
+        prefix_ok &= (matches | ~valid_prefix).all(dim=-1)
+
+        relaxed_logprob = torch.logsumexp(hyper_log_probs[i, prefix_ok], dim=0)
+        relaxed_nll.append(-relaxed_logprob)
+
+    nll[hyper_mask] = torch.stack(relaxed_nll)
+    return nll
+
+
+def _count_target_bytes(labels, cb, vocab_size, pad_token_id, tokenizer):
+    """Count UTF-8 bytes represented by valid target labels."""
+    total_bytes = 0
+    B, T = labels.shape
+    for b in range(B):
+        valid_labels = labels[b][labels[b] != -100]
+        if valid_labels.numel() == 0:
+            continue
+
+        base_ids = []
+        for tok in valid_labels.tolist():
+            if tok < vocab_size:
+                base_ids.append(tok)
+            else:
+                cb_idx = min(max(tok - vocab_size, 0), cb.shape[1] - 1)
+                entry = cb[b, cb_idx]
+                base_ids.extend(entry[entry != pad_token_id].tolist())
+
+        text = tokenizer.decode(
+            base_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        total_bytes += len(text.encode("utf-8"))
+    return total_bytes
+
+
 def save_checkpoint(model, optimizer, step, args, output_dir, push_to_hub=None):
     """Save model and optimizer state. Only rank 0 saves."""
     rank = dist.get_rank()
@@ -475,15 +575,25 @@ def main():
     if args.eval:
         model.eval()
         data_iter = iter(dataloader)
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as e:
+            raise ImportError(
+                "Byte-PPL/BPB evaluation requires `transformers`. "
+                "Install it in the current environment, e.g. `uv pip install transformers`."
+            ) from e
+        byte_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
         total_loss_sum = 0.0
         total_valid_tokens = 0
         total_base_tokens = 0
+        total_target_bytes = 0
         total_correct = 0
         total_base_correct = 0
         total_base_count = 0
         total_hyper_correct = 0
         total_hyper_count = 0
         total_relaxed_hyper_correct = 0
+        total_relaxed_loss_sum = 0.0
         # Per-merge-size accuracy: index 0 unused, index k = merge size k
         max_ms = config.max_subtokens
         merge_correct = [0] * (max_ms + 1)
@@ -516,6 +626,18 @@ def main():
                 total_loss_sum += per_token_loss.sum().item()
                 total_valid_tokens += valid_mask.sum().item()
                 total_base_tokens += n_base_tokens.sum().item()
+                total_target_bytes += _count_target_bytes(
+                    labels, cb, config.vocab_size, config.pad_token_id, byte_tokenizer
+                )
+
+                B_eval, T_eval = labels.shape
+                flat_valid_idx = torch.arange(B_eval * T_eval, device=device)[valid_mask]
+                valid_batch_idx = flat_valid_idx // T_eval
+                relaxed_nll = _relaxed_target_nll(
+                    flat_logits[valid_mask], flat_labels[valid_mask], valid_batch_idx,
+                    cb, config.vocab_size, config.pad_token_id,
+                )
+                total_relaxed_loss_sum += relaxed_nll.sum().item()
 
                 valid_preds = flat_logits[valid_mask].argmax(-1)
                 valid_labels = flat_labels[valid_mask]
@@ -530,8 +652,6 @@ def main():
 
                 # Relaxed prefix accuracy for hyper tokens
                 if hyper_tok_mask.any():
-                    B_eval, T_eval = labels.shape
-                    flat_valid_idx = torch.arange(B_eval * T_eval, device=device)[valid_mask]
                     hyper_batch_idx = flat_valid_idx[hyper_tok_mask] // T_eval
                     total_relaxed_hyper_correct += _relaxed_prefix_correct(
                         valid_preds[hyper_tok_mask], valid_labels[hyper_tok_mask],
@@ -559,9 +679,10 @@ def main():
 
         # All-reduce across ranks
         stats = torch.tensor([
-            total_loss_sum, total_valid_tokens, total_base_tokens,
+            total_loss_sum, total_valid_tokens, total_base_tokens, total_target_bytes,
             total_correct, total_base_correct, total_base_count,
             total_hyper_correct, total_hyper_count, total_relaxed_hyper_correct,
+            total_relaxed_loss_sum,
         ], device=device, dtype=torch.float64)
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
@@ -572,12 +693,17 @@ def main():
         mc = merge_stats[: max_ms + 1].tolist()
         mn = merge_stats[max_ms + 1 :].tolist()
 
-        loss_sum, valid_tok, base_tok, correct, base_correct, base_count, hyper_correct, hyper_count, relaxed_hyper_correct = stats.tolist()
+        loss_sum, valid_tok, base_tok, target_bytes, correct, base_correct, base_count, hyper_correct, hyper_count, relaxed_hyper_correct, relaxed_loss_sum = stats.tolist()
 
         if rank == 0:
             avg_loss = loss_sum / valid_tok
             base_loss = loss_sum / base_tok
             ppl = math.exp(base_loss)
+            byte_ppl = math.exp(loss_sum / target_bytes)
+            bpb = loss_sum / (target_bytes * math.log(2))
+            relaxed_loss_valid = relaxed_loss_sum / valid_tok
+            relaxed_loss = relaxed_loss_sum / base_tok
+            relaxed_ppl = math.exp(relaxed_loss)
             acc = correct / valid_tok
             base_token_acc = base_correct / base_count if base_count > 0 else 0.0
             hyper_token_acc = hyper_correct / hyper_count if hyper_count > 0 else 0.0
@@ -589,7 +715,12 @@ def main():
             print("Eval Results:")
             print(f"  loss (per base token) = {base_loss:.4f}")
             print(f"  ppl                   = {ppl:.2f}")
+            print(f"  byte_ppl              = {byte_ppl:.4f}")
+            print(f"  bpb                   = {bpb:.4f}")
             print(f"  loss (per valid token) = {avg_loss:.4f}")
+            print(f"  relaxed_loss (per base token) = {relaxed_loss:.4f}")
+            print(f"  relaxed_ppl           = {relaxed_ppl:.2f}")
+            print(f"  relaxed_loss (per valid token) = {relaxed_loss_valid:.4f}")
             print(f"  acc                   = {acc:.4f}")
             print(f"  base_token_acc        = {base_token_acc:.4f}")
             print(f"  hyper_token_acc       = {hyper_token_acc:.4f}")
@@ -608,7 +739,12 @@ def main():
                 eval_dict = {
                     "eval/loss": base_loss,
                     "eval/ppl": ppl,
+                    "eval/byte_ppl": byte_ppl,
+                    "eval/bpb": bpb,
                     "eval/loss_per_valid_token": avg_loss,
+                    "eval/relaxed_loss": relaxed_loss,
+                    "eval/relaxed_ppl": relaxed_ppl,
+                    "eval/relaxed_loss_per_valid_token": relaxed_loss_valid,
                     "eval/acc": acc,
                     "eval/base_token_acc": base_token_acc,
                     "eval/hyper_token_acc": hyper_token_acc,
