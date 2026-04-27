@@ -28,8 +28,8 @@ def main():
 
     print(f"Original text:\n  {text}\n")
 
-    encoding = tokenizer(text, return_codebook=True)
-    compressed_ids = encoding["input_ids"]
+    encoding = tokenizer.batch_encode_plus([text], return_codebook=True)
+    compressed_ids = encoding["input_ids"][0]
 
     base_len = len(hf_tok.encode(text, add_special_tokens=False))
     comp_len = len(compressed_ids)

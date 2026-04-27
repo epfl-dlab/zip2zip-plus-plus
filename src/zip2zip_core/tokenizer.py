@@ -17,6 +17,18 @@ def get_base_vocab_size(tokenizer) -> int:
 
 
 class Zip2ZipTokenizer(PushToHubMixin):
+    """Wrapper that adds LZW compression layer to any tokenizer.
+
+    Protocol stack:
+
+        Text
+         ↓
+      [Base Tokenizer]  ← Converts text to base token IDs
+         ↓
+      [Zip2Zip Layer]   ← Compresses token IDs using LZW
+         ↓
+    Compressed Token IDs
+    """
     def __init__(
         self,
         hf_bpe_tokenizer: PreTrainedTokenizerBase,
@@ -51,7 +63,16 @@ class Zip2ZipTokenizer(PushToHubMixin):
         return getattr(self.hf_bpe_tokenizer, attr)
 
     def __call__(self, *args, **kwargs) -> BatchEncoding:
-        return self.hf_bpe_tokenizer(*args, **kwargs)
+        raise NotImplementedError(
+            "__call__ is banned to avoid confusion between batch and single encoding. "
+            "Use batch_encode_plus([text], ...) explicitly."
+        )
+
+    def _encode_plus(self, *args, **kwargs) -> BatchEncoding:
+        raise NotImplementedError(
+            "_encode_plus is banned to avoid inconsistency in batch encoding/decoding. "
+            "Use batch_encode_plus([text], ...) instead."
+        )
 
     def _lzw_encode(
         self, *args, **kwargs
@@ -163,7 +184,7 @@ if __name__ == "__main__":
     with open(__file__, "r") as f:
         text = f.read()
 
-    compressed_ids = tokenizer(text)["input_ids"]
+    compressed_ids = tokenizer.batch_encode_plus([text])["input_ids"][0]
     
 
     # It is important to have clean_up_tokenization_spaces=False to ensure that the decoded text matches the original text, as the hf tokenizer has some messiness 
