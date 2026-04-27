@@ -419,9 +419,6 @@ def main():
     if not args.eval:
         # fp32 master weights: optimizer states stay in fp32, model stays in bf16
         master_params = [p.detach().float().requires_grad_(True) for p in model.parameters()]
-    if not args.eval:
-        # fp32 master weights: optimizer states stay in fp32, model stays in bf16
-        master_params = [p.detach().float().requires_grad_(True) for p in model.parameters()]
 
         # Optimizer
         optimizer = torch.optim.AdamW(
@@ -652,8 +649,6 @@ def main():
     log_base_loss = 0.0
     log_compression = 0.0
     log_acc = 0.0
-    log_base_token_acc = 0.0
-    log_hyper_token_acc = 0.0
     log_base_token_acc = 0.0
     log_hyper_token_acc = 0.0
     log_relaxed_acc = 0.0
