@@ -624,7 +624,7 @@ def main():
             tokens_seen_before_step = step * global_batch_tokens
             if tokens_seen_before_step >= args.max_tokens:
                 break
-        elif step >= args.steps:
+        elif step >= args.stop_at:
             break
 
         step += 1
