@@ -2,361 +2,56 @@ from __future__ import annotations
 
 import torch
 import numpy as np
-from typing import Optional, Tuple
-from typing import List, Union, Optional
+from typing import List, Optional, Tuple, Union
 from transformers.utils import PushToHubMixin
 from transformers import PreTrainedTokenizerBase, AutoTokenizer, BatchEncoding
 from zip2zip_compression import Codebook
 from zip2zip_compression import LZWCompressor
-from transformers import PreTrainedTokenizer, PreTrainedTokenizerBase
-import dataclasses
 
-from typing import Dict, List, Set, Union
+from zip2zip_core.viz import colorize_by_ngram, render_colored_tokens
 
 
 def get_base_vocab_size(tokenizer) -> int:
     return len(tokenizer.vocab)
-
-@dataclasses.dataclass
-class ColoredToken:
-    # colored token for printing
-    token_ids: List[int]
-    color: str = "\033[0m"  # default to no color
-    END_COLOR: str = "\033[0m"  # Reset color
-
-    def __str__(self):
-        return f"{self.color}{self.token_ids}{self.END_COLOR}"
-
-
-def colorise_lzwtokens(
-    lzw_token_ids: List[int],
-    codebook: Dict[int, List[int]],
-    color_scheme: str = "finegrained",
-    special_token_ids: Set[int] = None,
-) -> List[ColoredToken]:
-    """
-    Given a sequence of token IDs and a codebook, prints the tokens in a colored format with base tokens in one color and hypertokens in another.
-    Special tokens are printed in black.
-    """
-    basetoken_color = BLUE = "\033[34m"  # blue
-    hypertoken_color = YELLOW = "\033[33m"  # yellow
-    size3_hypertoken_color = ORANGE = "\033[38;5;208m"  # orange
-    size4_hypertoken_color = RED = "\033[31m"  # red
-    size5_hypertoken_color = DARK_RED = "\033[38;5;88m"  # dark red
-    size_n_hypertoken_color = BROWN = "\033[38;5;130m"
-    special_token_color = BLACK = "\033[30m"
-
-    token_color_scheme = {
-        1: basetoken_color,
-        2: hypertoken_color,
-    }  # map from token size to color
-
-    finegrained_token_color_scheme = {
-        1: basetoken_color,
-        2: hypertoken_color,
-        3: size3_hypertoken_color,
-        4: size4_hypertoken_color,
-        5: size5_hypertoken_color,
-    }  # map from token size to color
-
-    more_finegrained_token_color_scheme = {
-        1: {  # blue
-            0: basetoken_color,
-        },
-        2: {0: hypertoken_color, 1: size3_hypertoken_color},  # yellow
-        3: {  # orange, red
-            0: hypertoken_color,
-            1: size3_hypertoken_color,
-            2: size4_hypertoken_color,
-        },  # brown
-        4: {
-            0: hypertoken_color,
-            1: size3_hypertoken_color,
-            2: size4_hypertoken_color,
-            3: size5_hypertoken_color,
-        },
-    }  # map from token size to color
-
-    colored_token_groups = []
-
-    for token_id in lzw_token_ids:
-        if token_id in codebook:
-            base_ids = codebook[token_id]
-        else:
-            base_ids = [token_id]
-        token_size = len(base_ids)
-        if color_scheme == "basic":
-            color = token_color_scheme.get(token_size, hypertoken_color)
-        elif color_scheme == "finegrained":
-            color = finegrained_token_color_scheme.get(
-                token_size, size_n_hypertoken_color
-            )
-        elif color_scheme == "more_finegrained":
-            color = more_finegrained_token_color_scheme[token_size]
-        else:
-            raise ValueError(f"Invalid color scheme: {color_scheme}")
-
-        # check if the token is a special token
-        if token_id in special_token_ids:
-            color = special_token_color
-
-        colored_token_groups.append(ColoredToken(token_ids=base_ids, color=color))
-
-    return colored_token_groups
-
-
-def colorise_lzw_tokens_by_ppl(
-    lzw_token_ids: List[int], norm_ppl: List[float], codebook: Dict[int, List[int]]
-) -> List[ColoredToken]:
-    """
-    Given a sequence of token IDs and a list of ppl values, prints the tokens in a gradient of green
-    """
-    # normalize the ppl to be between 0 and 1
-    norm_ppl = [float(e) / max(norm_ppl) for e in norm_ppl]
-
-    ppl_to_intensity = lambda ppl: int(255 * (1 - ppl))
-
-    # map the ppl to a color
-    color = (
-        lambda ppl: f"\033[38;2;{ppl_to_intensity(ppl)};{ppl_to_intensity(ppl)};255m"
-    )
-
-    colored_token_groups = []
-
-    for i, token_id in enumerate(lzw_token_ids):
-        if token_id in codebook:
-            base_ids = codebook[token_id]
-        else:
-            base_ids = [token_id]
-        colored_token_groups.append(
-            ColoredToken(token_ids=base_ids, color=color(norm_ppl[i]))
-        )
-
-    return colored_token_groups
-
-
-def colorise_lzw_tokens_random(
-    lzw_token_ids: List[int], codebook: Dict[int, List[int]]
-) -> List[ColoredToken]:
-    """
-    Given a sequence of token IDs and a codebook, prints the tokens in a random color
-    """
-    import random
-
-    color = lambda _: f"\033[38;5;{random.randint(0, 255)}m"
-    colored_token_groups = []
-    for token_id in lzw_token_ids:
-        if token_id in codebook:
-            base_ids = codebook[token_id]
-        else:
-            base_ids = [token_id]
-        colored_token_groups.append(ColoredToken(token_ids=base_ids, color=color()))
-    return colored_token_groups
-
-
-def legacy_contrast_colorprint_tokens(
-    token_ids: List[int],
-    codebook: Dict[int, List[int]],
-    tokenizer: PreTrainedTokenizer,
-    color_scheme: str = "finegrained",  # "finegrained", "more_finegrained"
-) -> None:
-    """
-    Given a sequence of token IDs and a codebook, prints the tokens in a colored format with base tokens in one color and hypertokens in another.
-    Special tokens are printed in black.
-    """
-    basetoken_color = BLUE = "\033[34m"  # blue
-    hypertoken_color = YELLOW = "\033[33m"  # yellow
-    size3_hypertoken_color = ORANGE = "\033[38;5;208m"  # orange
-    size4_hypertoken_color = RED = "\033[31m"  # red
-    size5_hypertoken_color = DARK_RED = "\033[38;5;88m"  # dark red
-    size_n_hypertoken_color = BROWN = "\033[38;5;130m"
-    special_token_color = BLACK = "\033[30m"
-    RESET = "\033[0m"
-
-    token_color_scheme = {
-        1: basetoken_color,
-        2: hypertoken_color,
-    }  # map from token size to color
-
-    finegrained_token_color_scheme = {
-        1: basetoken_color,
-        2: hypertoken_color,
-        3: size3_hypertoken_color,
-        4: size4_hypertoken_color,
-        5: size5_hypertoken_color,
-    }  # map from token size to color
-
-    more_finegrained_token_color_scheme = {
-        1: {  # blue
-            0: basetoken_color,
-        },
-        2: {0: hypertoken_color, 1: size3_hypertoken_color},  # yellow
-        3: {  # orange, red
-            0: hypertoken_color,
-            1: size3_hypertoken_color,
-            2: size4_hypertoken_color,
-        },  # brown
-        4: {
-            0: hypertoken_color,
-            1: size3_hypertoken_color,
-            2: size4_hypertoken_color,
-            3: size5_hypertoken_color,
-        },
-    }  # map from token size to color
-
-    colored_string = ""
-
-    def decode(tokenizer, tokens: List[int]) -> str:
-        raw_tokens = tokenizer.convert_ids_to_tokens(tokens)
-
-        # we want to keep the begnning space of the first token; the space of the following tokens
-        # is handled by the sp.model
-        if raw_tokens[0].startswith(chr(9601)):
-            string = " " + tokenizer.decode(tokens)
-        else:
-            string = tokenizer.decode(tokens)
-        return string
-
-    for token_id in token_ids:
-        if token_id in codebook:
-            # if fine_grained_colors:
-            base_ids = codebook[token_id]
-            # color = hypertoken_color
-        else:
-            base_ids = [token_id]
-            # color = basetoken_color
-        # use the color of the hypertoken of a given size
-        token_size = len(base_ids)
-
-        if color_scheme == "basic":
-            color = token_color_scheme.get(token_size, hypertoken_color)
-            colored_string += f"{color}{decode(tokenizer, base_ids)}{RESET}"
-        elif color_scheme == "finegrained":
-            color = finegrained_token_color_scheme.get(
-                token_size, size_n_hypertoken_color
-            )
-            colored_string += f"{color}{decode(tokenizer, base_ids)}{RESET}"
-        elif color_scheme == "more_finegrained":
-            sub_color_scheme = more_finegrained_token_color_scheme[token_size]
-            for i, base_id in enumerate(base_ids):
-                color = sub_color_scheme[i]
-                colored_string += f"{color}{decode(tokenizer, [base_id])}{RESET}"
-        else:
-            raise ValueError(f"Invalid color scheme: {color_scheme}")
-
-    if "<|end|>" in colored_string:
-        # make the conversion more readable
-        colored_string = colored_string.replace("<|end|>", "<|end|>\n")
-
-    # make the special tokens in black
-    colored_string = colored_string.replace(
-        "<|user|>", f"{special_token_color}<|user|>{RESET}"
-    )
-    colored_string = colored_string.replace(
-        "<|assistant|>", f"{special_token_color}<|assistant|>{RESET}"
-    )
-    colored_string = colored_string.replace(
-        "<|end|>", f"{special_token_color}<|end|>{RESET}"
-    )
-
-    print(colored_string)
-
-
-class ColorfulTokenizer:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
-        self.tokenizer = tokenizer
-
-    def __getattr__(self, attr):
-        return getattr(self.tokenizer, attr)
-
-    def __call__(self, *args, **kwargs):
-        return self.tokenizer(*args, **kwargs)
-
-    def decode_preserving_leading_space(self, tokens: List[int]) -> str:
-        raw_tokens = self.tokenizer.convert_ids_to_tokens(tokens)
-        if any(token is None for token in raw_tokens):
-            raise ValueError(f"Encountered tokens non-decodable: {tokens}")
-
-        # we want to keep the begnning space of the first token; the space of the following tokens
-        # is handled by the sp.model
-        if raw_tokens[0].startswith(chr(9601)):
-            string = " " + self.tokenizer.decode(tokens)
-        else:
-            string = self.tokenizer.decode(tokens)
-        return string
-
-    def decode_colored_token(
-        self, colored_tokens: Union[ColoredToken, List[ColoredToken]]
-    ) -> str:
-        if isinstance(colored_tokens, ColoredToken):
-            colored_tokens = [colored_tokens]
-        out = ""
-        for colored_token in colored_tokens:
-            out += f"{colored_token.color}{self.decode_preserving_leading_space(colored_token.token_ids)}{colored_token.END_COLOR}"
-        return out
-
-    @staticmethod
-    def random_colorise_tokens(tokens: List[int]) -> List[ColoredToken]:
-        """
-        Given a sequence of token IDs, prints the tokens in a random color
-        """
-        import random
-
-        color = lambda e: f"\033[38;5;{random.randint(0, 255)}m"
-        return [
-            ColoredToken(token_ids=[token_id], color=color(i))
-            for i, token_id in enumerate(tokens)
-        ]
-
-    def random_color_decode(self, token_ids: List[int]) -> str:
-        """
-        Given a sequence of token IDs, prints the tokens in a random color
-        """
-        colored_token_groups = self.random_colorise_tokens(token_ids)
-        return self.decode_colored_token(colored_token_groups)
-
-
-
 
 
 
 class Zip2ZipTokenizer(PushToHubMixin):
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        hf_bpe_tokenizer: PreTrainedTokenizerBase,
         max_codebook_size: int = 4096,
         max_subtokens: int = 4,
         disabled_ids: Optional[List[int]] = None,
     ) -> None:
 
-        set_pad_token_if_none(tokenizer)
+        set_pad_token_if_none(hf_bpe_tokenizer)
 
-        self.initial_vocab_size = get_base_vocab_size(tokenizer)
+        self.initial_vocab_size = get_base_vocab_size(hf_bpe_tokenizer)
         self.max_codebook_size = max_codebook_size
         self.max_subtokens = max_subtokens
         self.disabled_ids = disabled_ids
 
-        self.old_batch_encode_plus = tokenizer._batch_encode_plus
-        tokenizer._batch_encode_plus = self._batch_encode_plus
+        self.old_batch_encode_plus = hf_bpe_tokenizer._batch_encode_plus
+        hf_bpe_tokenizer._batch_encode_plus = self._batch_encode_plus
 
-        self.old_decode = tokenizer._decode
-        tokenizer._decode = self._decode
+        self.old_decode = hf_bpe_tokenizer._decode
+        hf_bpe_tokenizer._decode = self._decode
 
-        # self.tokenizer = tokenizer
-        self.tokenizer = ColorfulTokenizer(tokenizer)
+        self.hf_bpe_tokenizer = hf_bpe_tokenizer
         self.compressor = LZWCompressor(
             initial_vocab_size=self.initial_vocab_size,
             max_codebook_size=self.max_codebook_size,
             max_subtokens=self.max_subtokens,
-            pad_token_id=self.tokenizer.pad_token_id,
+            pad_token_id=self.hf_bpe_tokenizer.pad_token_id,
             disabled_ids=self.disabled_ids,
         )
 
     def __getattr__(self, attr):
-        return getattr(self.tokenizer, attr)
+        return getattr(self.hf_bpe_tokenizer, attr)
 
     def __call__(self, *args, **kwargs) -> BatchEncoding:
-        return self.tokenizer(*args, **kwargs)
+        return self.hf_bpe_tokenizer(*args, **kwargs)
 
     def _lzw_encode(
         self, *args, **kwargs
@@ -429,35 +124,23 @@ class Zip2ZipTokenizer(PushToHubMixin):
 
 
 
-    def color_decode(
+    def pprint(
         self,
-        sequences: Union[List[int], List[List[int]], np.ndarray, torch.Tensor],
-        codebooks: Optional[Union[Codebook, List[Codebook]]] = None,
-        color_scheme: str = "finegrained",
+        compressed_ids: Union[List[int], List[List[int]], np.ndarray, torch.Tensor],
     ) -> List[str]:
-        # convert tensor to list
-        if isinstance(sequences, torch.Tensor):
-            sequences = sequences.tolist()
-        elif isinstance(sequences, np.ndarray):
-            sequences = sequences.tolist()
+        if isinstance(compressed_ids, torch.Tensor):
+            compressed_ids = compressed_ids.tolist()
+        elif isinstance(compressed_ids, np.ndarray):
+            compressed_ids = compressed_ids.tolist()
 
-        if codebooks is None:
-            token_ids_codebook_pairs = self._lzw_decode(sequences)
-            codebooks = [codebook for _, codebook in token_ids_codebook_pairs]
-
-        if isinstance(codebooks, Codebook):
-            codebooks = [codebooks]
-
-        codebook_maps = [codebook.to_dict() for codebook in codebooks]
+        token_ids_codebook_pairs = self._lzw_decode(compressed_ids)
+        special_token_ids = set(self.hf_bpe_tokenizer.get_added_vocab().values())
 
         out = []
-
-        for seq, codebook_map in zip(sequences, codebook_maps):
-            special_token_ids = set(self.tokenizer.get_added_vocab().values())
-            colored_tokens = colorise_lzwtokens(
-                seq, codebook_map, color_scheme, special_token_ids
-            )
-            out.append(self.tokenizer.decode_colored_token(colored_tokens))
+        for (_, codebook) in token_ids_codebook_pairs:
+            codebook_map = codebook.to_dict()
+            colored_tokens = colorize_by_ngram(compressed_ids[len(out)], codebook_map, special_token_ids)
+            out.append(render_colored_tokens(colored_tokens, self.hf_bpe_tokenizer))
         return out
 
 
@@ -476,9 +159,8 @@ if __name__ == "__main__":
     tokenizer = Zip2ZipTokenizer(
         max_codebook_size=4096,
         max_subtokens=4,
-        tokenizer=tokenizer
+        hf_bpe_tokenizer=tokenizer
     )
-    tokenizer.tokenizer = ColorfulTokenizer(tokenizer.tokenizer)
     # Read this script's own source code
     with open(__file__, "r") as f:
         text = f.read()
