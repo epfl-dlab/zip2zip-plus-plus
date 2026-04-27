@@ -12,10 +12,10 @@ causal_mask = np.tril(np.ones((T, K)))
 
 cmap = ListedColormap(["#d9534f", "#5cb85c"])
 
-fig, axes = plt.subplots(1, 2, figsize=(7.5, 4.2),
+fig, axes = plt.subplots(1, 2, figsize=(7.5, 4.4),
                          gridspec_kw={"wspace": 0.18})
 
-titles = ["Without hyper_causal_mask", "With hyper_causal_mask"]
+titles = ["Without LZW causal mask", "With LZW causal mask"]
 masks  = [full_mask, causal_mask]
 
 for i, (ax, mask, title) in enumerate(zip(axes, masks, titles)):
@@ -30,16 +30,16 @@ for i, (ax, mask, title) in enumerate(zip(axes, masks, titles)):
 
     ax.set_xticks(np.arange(K))
     ax.set_yticks(np.arange(T))
-    ax.set_xticklabels([f"$k\\!=\\!{j}$" for j in range(K)], fontsize=7,
+    ax.set_xticklabels([f"$k\\!=\\!{j}$" for j in range(K)], fontsize=12,
                        rotation=45, ha="right")
-    ax.set_xlabel("Codebook entry index $k$", fontsize=9)
-    ax.set_title(title, fontsize=10, fontweight="bold", pad=8)
+    ax.set_xlabel("Codebook entry index $k$", fontsize=12)
+    ax.set_title(title, fontsize=14, fontweight="bold", pad=12)
 
     if i == 0:
-        ax.set_yticklabels([f"$t\\!=\\!{j}$" for j in range(T)], fontsize=7)
-        ax.set_ylabel("Sequence position $t$", fontsize=9)
+        ax.set_yticklabels([f"$t\\!=\\!{j}$" for j in range(T)], fontsize=12)
+        ax.set_ylabel("Sequence position $t$", fontsize=12)
     else:
-        ax.set_yticklabels([f"$t\\!=\\!{j}$" for j in range(T)], fontsize=7)
+        ax.set_yticklabels([f"$t\\!=\\!{j}$" for j in range(T)], fontsize=12)
         ax.set_ylabel("")
 
 # Diagonal boundary on right panel
@@ -50,15 +50,14 @@ axes[1].plot(d, d, color="white", linewidth=2.0, linestyle="--", alpha=0.85)
 fig.legend(
     handles=[mpatches.Patch(color="#5cb85c", label="Visible (logit computed)"),
              mpatches.Patch(color="#d9534f", label="Masked ($-\\infty$)")],
-    loc="lower center", ncol=2, fontsize=9,
-    bbox_to_anchor=(0.5, -0.02), frameon=True, edgecolor="#cccccc",
+    loc="lower center", ncol=2, fontsize=16, prop={"weight": "bold"},
+    bbox_to_anchor=(0.5, -0.08), frameon=True, edgecolor="#cccccc",
 )
 
-fig.suptitle("Hyper-token logit mask during training",
-             fontsize=11, fontweight="bold", y=1.01)
+
 plt.tight_layout(rect=[0, 0.08, 1, 1])
 
 out = "/mnt/scratch/zip2zip-core/scripts/hyper_causal_mask.pdf"
-plt.savefig(out, bbox_inches="tight", dpi=200)
-plt.savefig(out.replace(".pdf", ".png"), bbox_inches="tight", dpi=200)
+plt.savefig(out, bbox_inches="tight", pad_inches=0.2, dpi=200)
+plt.savefig(out.replace(".pdf", ".png"), bbox_inches="tight", pad_inches=0.2, dpi=600)
 print(f"Saved {out}")
