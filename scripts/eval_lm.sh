@@ -10,17 +10,19 @@ EVAL_STEPS=${EVAL_STEPS:-100}
 CHECKPOINT=${1:?Usage: bash scripts/eval_lm.sh <checkpoint_dir>}
 MODEL_CONFIG=${MODEL_CONFIG:-1B}
 MAX_SUBTOKENS=${MAX_SUBTOKENS:-4}
+LOCAL_BATCH_SIZE=${LOCAL_BATCH_SIZE:-8}
 
 echo "========================================"
 echo "Evaluating checkpoint: ${CHECKPOINT}"
 echo "  model_config=${MODEL_CONFIG}, max_subtokens=${MAX_SUBTOKENS}"
 echo "========================================"
-torchrun --nproc_per_node=1 -m zip2zip_core.train \
+torchrun --nproc_per_node=1 --master_port=${MASTER_PORT:-29500} -m zip2zip_core.train \
     --data_dir "$DATA_DIR" \
     --output_dir /tmp/eval_dummy \
     --model_config "$MODEL_CONFIG" \
     --max_subtokens "$MAX_SUBTOKENS" \
     --max_active_codebook_size 4096 \
+    --local_batch_size "$LOCAL_BATCH_SIZE" \
     --steps "$EVAL_STEPS" \
     --resume_from "$CHECKPOINT" \
     --eval \

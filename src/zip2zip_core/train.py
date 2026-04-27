@@ -63,6 +63,34 @@ def _unwrap_model(model):
     return raw
 
 
+def _relaxed_prefix_correct(hyper_preds, hyper_labels, batch_idx, cb, vocab_size, pad_token_id):
+    """Count predictions whose base tokens are a prefix of the target's base tokens.
+
+    E.g. target=[127,78,278] → predicting [127,78] or just 127 counts as correct.
+    """
+    if len(hyper_preds) == 0:
+        return 0
+    max_ms = cb.shape[-1]
+    device = cb.device
+
+    target_cb_idx = (hyper_labels - vocab_size).clamp(min=0, max=cb.shape[1] - 1)
+    target_entries = cb[batch_idx, target_cb_idx]
+
+    pred_is_base = hyper_preds < vocab_size
+    pred_entries = torch.full((len(hyper_preds), max_ms), pad_token_id, device=device, dtype=cb.dtype)
+    if pred_is_base.any():
+        pred_entries[pred_is_base, 0] = hyper_preds[pred_is_base]
+    pred_is_hyper = ~pred_is_base
+    if pred_is_hyper.any():
+        pred_cb_idx = (hyper_preds[pred_is_hyper] - vocab_size).clamp(min=0, max=cb.shape[1] - 1)
+        pred_entries[pred_is_hyper] = cb[batch_idx[pred_is_hyper], pred_cb_idx]
+
+    pred_has_content = pred_entries != pad_token_id
+    matches = (pred_entries == target_entries) | ~pred_has_content
+    is_prefix = matches.all(dim=-1) & pred_has_content.any(dim=-1)
+    return is_prefix.sum().item()
+
+
 def save_checkpoint(model, optimizer, step, args, output_dir, push_to_hub=None):
     """Save model and optimizer state. Only rank 0 saves."""
     rank = dist.get_rank()
@@ -458,6 +486,7 @@ def main():
         total_base_count = 0
         total_hyper_correct = 0
         total_hyper_count = 0
+        total_relaxed_hyper_correct = 0
         # Per-merge-size accuracy: index 0 unused, index k = merge size k
         max_ms = config.max_subtokens
         merge_correct = [0] * (max_ms + 1)
@@ -502,6 +531,16 @@ def main():
                 total_hyper_correct += (valid_preds[hyper_tok_mask] == valid_labels[hyper_tok_mask]).sum().item()
                 total_hyper_count += hyper_tok_mask.sum().item()
 
+                # Relaxed prefix accuracy for hyper tokens
+                if hyper_tok_mask.any():
+                    B_eval, T_eval = labels.shape
+                    flat_valid_idx = torch.arange(B_eval * T_eval, device=device)[valid_mask]
+                    hyper_batch_idx = flat_valid_idx[hyper_tok_mask] // T_eval
+                    total_relaxed_hyper_correct += _relaxed_prefix_correct(
+                        valid_preds[hyper_tok_mask], valid_labels[hyper_tok_mask],
+                        hyper_batch_idx, cb, config.vocab_size, config.pad_token_id,
+                    )
+
                 # Per-merge-size accuracy for hyper tokens
                 if hyper_tok_mask.any():
                     # Compute merge size for each label before flattening
@@ -525,7 +564,7 @@ def main():
         stats = torch.tensor([
             total_loss_sum, total_valid_tokens, total_base_tokens,
             total_correct, total_base_correct, total_base_count,
-            total_hyper_correct, total_hyper_count,
+            total_hyper_correct, total_hyper_count, total_relaxed_hyper_correct,
         ], device=device, dtype=torch.float64)
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
@@ -536,7 +575,7 @@ def main():
         mc = merge_stats[: max_ms + 1].tolist()
         mn = merge_stats[max_ms + 1 :].tolist()
 
-        loss_sum, valid_tok, base_tok, correct, base_correct, base_count, hyper_correct, hyper_count = stats.tolist()
+        loss_sum, valid_tok, base_tok, correct, base_correct, base_count, hyper_correct, hyper_count, relaxed_hyper_correct = stats.tolist()
 
         if rank == 0:
             avg_loss = loss_sum / valid_tok
@@ -545,6 +584,8 @@ def main():
             acc = correct / valid_tok
             base_token_acc = base_correct / base_count if base_count > 0 else 0.0
             hyper_token_acc = hyper_correct / hyper_count if hyper_count > 0 else 0.0
+            relaxed_hyper_acc = relaxed_hyper_correct / hyper_count if hyper_count > 0 else 0.0
+            relaxed_acc = (base_correct + relaxed_hyper_correct) / valid_tok
             compression = base_tok / valid_tok
 
             print("=" * 60)
@@ -555,6 +596,8 @@ def main():
             print(f"  acc                   = {acc:.4f}")
             print(f"  base_token_acc        = {base_token_acc:.4f}")
             print(f"  hyper_token_acc       = {hyper_token_acc:.4f}")
+            print(f"  relaxed_hyper_acc     = {relaxed_hyper_acc:.4f}")
+            print(f"  relaxed_acc           = {relaxed_acc:.4f}")
             print(f"  compression           = {compression:.2f}")
             print(f"  total tokens evaluated = {int(valid_tok):,}")
             for k in range(2, max_ms + 1):
@@ -572,6 +615,8 @@ def main():
                     "eval/acc": acc,
                     "eval/base_token_acc": base_token_acc,
                     "eval/hyper_token_acc": hyper_token_acc,
+                    "eval/relaxed_hyper_acc": relaxed_hyper_acc,
+                    "eval/relaxed_acc": relaxed_acc,
                     "eval/compression": compression,
                 }
                 for k in range(2, max_ms + 1):
@@ -611,6 +656,7 @@ def main():
     log_hyper_token_acc = 0.0
     log_base_token_acc = 0.0
     log_hyper_token_acc = 0.0
+    log_relaxed_acc = 0.0
     log_type_loss = 0.0
     log_type_acc = 0.0
     log_base_type_acc = 0.0
@@ -642,6 +688,7 @@ def main():
         accum_acc = 0.0
         accum_base_token_acc = 0.0
         accum_hyper_token_acc = 0.0
+        accum_relaxed_acc = 0.0
         accum_type_loss = 0.0
         accum_type_acc = 0.0
         accum_base_type_acc = 0.0
@@ -705,6 +752,15 @@ def main():
                     accum_base_token_acc += (valid_preds[base_tok_mask] == valid_labels[base_tok_mask]).float().mean().item() / args.gradient_accumulation_steps
                 if hyper_tok_mask.any():
                     accum_hyper_token_acc += (valid_preds[hyper_tok_mask] == valid_labels[hyper_tok_mask]).float().mean().item() / args.gradient_accumulation_steps
+                    # Relaxed prefix accuracy
+                    B_t, T_t = labels.shape
+                    flat_valid_idx = torch.arange(B_t * T_t, device=device)[valid_mask]
+                    hyper_batch_idx = flat_valid_idx[hyper_tok_mask] // T_t
+                    relaxed_n = _relaxed_prefix_correct(
+                        valid_preds[hyper_tok_mask], valid_labels[hyper_tok_mask],
+                        hyper_batch_idx, cb, config.vocab_size, config.pad_token_id,
+                    )
+                    accum_relaxed_acc += (relaxed_n / hyper_tok_mask.sum().item()) / args.gradient_accumulation_steps
             if use_token_type_head:
                 accum_type_loss += type_loss.item() / args.gradient_accumulation_steps
                 with torch.no_grad():
@@ -736,6 +792,7 @@ def main():
         log_acc += accum_acc
         log_base_token_acc += accum_base_token_acc
         log_hyper_token_acc += accum_hyper_token_acc
+        log_relaxed_acc += accum_relaxed_acc
         if use_token_type_head:
             log_type_loss += accum_type_loss
             log_type_acc += accum_type_acc
@@ -754,6 +811,7 @@ def main():
             avg_acc = log_acc / args.log_freq
             avg_base_token_acc = log_base_token_acc / args.log_freq
             avg_hyper_token_acc = log_hyper_token_acc / args.log_freq
+            avg_relaxed_acc = log_relaxed_acc / args.log_freq
 
             # All-reduce loss for global average
             loss_tensor = torch.tensor(avg_loss, device=device)
@@ -762,12 +820,14 @@ def main():
             acc_tensor = torch.tensor(avg_acc, device=device)
             base_token_acc_tensor = torch.tensor(avg_base_token_acc, device=device)
             hyper_token_acc_tensor = torch.tensor(avg_hyper_token_acc, device=device)
+            relaxed_acc_tensor = torch.tensor(avg_relaxed_acc, device=device)
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
             dist.all_reduce(base_loss_tensor, op=dist.ReduceOp.AVG)
             dist.all_reduce(compression_tensor, op=dist.ReduceOp.AVG)
             dist.all_reduce(acc_tensor, op=dist.ReduceOp.AVG)
             dist.all_reduce(base_token_acc_tensor, op=dist.ReduceOp.AVG)
             dist.all_reduce(hyper_token_acc_tensor, op=dist.ReduceOp.AVG)
+            dist.all_reduce(relaxed_acc_tensor, op=dist.ReduceOp.AVG)
 
             if use_token_type_head:
                 avg_type_loss = log_type_loss / args.log_freq
@@ -796,6 +856,7 @@ def main():
                     f"acc={acc_tensor.item():.4f} | "
                     f"base_token_acc={base_token_acc_tensor.item():.4f} | "
                     f"hyper_token_acc={hyper_token_acc_tensor.item():.4f} | "
+                    f"relaxed_acc={relaxed_acc_tensor.item():.4f} | "
                     f"backward_loss={loss_tensor.item():.4f} | "
                     f"compression={compression_tensor.item():.2f} | "
                 )
@@ -820,6 +881,7 @@ def main():
                         "acc": acc_tensor.item(),
                         "base_token_acc": base_token_acc_tensor.item(),
                         "hyper_token_acc": hyper_token_acc_tensor.item(),
+                        "relaxed_acc": relaxed_acc_tensor.item(),
                         "backward_loss": loss_tensor.item(),
                         "compression": compression_tensor.item(),
                         "lr": lr,
@@ -842,6 +904,7 @@ def main():
             log_acc = 0.0
             log_base_token_acc = 0.0
             log_hyper_token_acc = 0.0
+            log_relaxed_acc = 0.0
             log_type_loss = 0.0
             log_type_acc = 0.0
             log_base_type_acc = 0.0
