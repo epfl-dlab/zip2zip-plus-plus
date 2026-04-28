@@ -76,16 +76,8 @@ class Zip2ZipTokenizer(PushToHubMixin):
 
     def _lzw_encode(
         self, *args, **kwargs
-    ) -> List[Tuple[List[int], torch.Tensor, Codebook]]:
-        encodings, attention_masks, codebooks = self.compressor.batch_encode(
-            *args, **kwargs
-        )
-        return [
-            (encoding, attention_mask, codebook)
-            for encoding, attention_mask, codebook in zip(
-                encodings, attention_masks, codebooks
-            )
-        ]
+    ) -> Tuple[List[List[int]], List[torch.Tensor], List[Codebook]]:
+        return self.compressor.batch_encode(*args, **kwargs)
 
     def _lzw_decode(self, *args, **kwargs) -> List[Tuple[List[int], Codebook]]:
         return self.compressor.batch_decode(*args, **kwargs)
@@ -103,7 +95,7 @@ class Zip2ZipTokenizer(PushToHubMixin):
             encoding["input_ids"],
             encoding["attention_mask"],
             codebooks,
-        ) = self.compressor.batch_encode(
+        ) = self._lzw_encode(
             encoding["input_ids"],
             padding=padding,
             truncation=truncation != "do_not_truncate",
