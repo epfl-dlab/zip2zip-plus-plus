@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import torch
 import numpy as np
 from typing import List, Optional, Tuple, Union
@@ -9,6 +10,51 @@ from zip2zip_compression import Codebook
 from zip2zip_compression import LZWCompressor
 
 from zip2zip_core.viz import colorize_by_ngram, render_colored_tokens
+from zip2zip_core.utils import levenshtein_distance
+
+
+@dataclasses.dataclass
+class LZWMismatch:
+    position: int
+    actual: int
+    expected: int
+
+
+@dataclasses.dataclass
+class LZWVerificationResult:
+    is_perfect: bool
+    num_base_tokens: int
+    num_tokens: int
+    num_canonical_tokens: int
+    compression_ratio: float
+    canonical_compression_ratio: float
+    compression_efficiency: float
+    edit_distance: int
+    normalized_edit_distance: float
+    mismatches: List[LZWMismatch]
+    compressed_ids: List[int]
+    canonical_ids: List[int]
+
+    def __str__(self) -> str:
+        lines = [
+            f"is_perfect:        {self.is_perfect}",
+            f"base tokens:       {self.num_base_tokens}",
+            f"compressed tokens: {self.num_tokens} (canonical: {self.num_canonical_tokens})",
+            f"compression ratio: {self.compression_ratio:.2f}x (canonical: {self.canonical_compression_ratio:.2f}x, efficiency: {self.compression_efficiency:.3f})",
+            f"edit_distance:     {self.edit_distance} (normalized: {self.normalized_edit_distance:.3f})",
+            f"mismatches:        {len(self.mismatches)}",
+        ]
+        return "\n".join(lines)
+
+    def pprint(self, tokenizer) -> None:
+        print(str(self))
+        codebook_actual = tokenizer.compressor.decode(self.compressed_ids)[1].to_dict()
+        codebook_canonical = tokenizer.compressor.decode(self.canonical_ids)[1].to_dict()
+        special_ids = set(tokenizer.hf_bpe_tokenizer.get_added_vocab().values())
+        actual_colored = colorize_by_ngram(self.compressed_ids, codebook_actual, special_ids)
+        canonical_colored = colorize_by_ngram(self.canonical_ids, codebook_canonical, special_ids)
+        print(f"\nactual:    {render_colored_tokens(actual_colored, tokenizer.hf_bpe_tokenizer)}")
+        print(f"canonical: {render_colored_tokens(canonical_colored, tokenizer.hf_bpe_tokenizer)}")
 
 
 def get_base_vocab_size(tokenizer) -> int:
@@ -153,6 +199,31 @@ class Zip2ZipTokenizer(PushToHubMixin):
             codebook_map = codebook.to_dict()
             colored_tokens = colorize_by_ngram(compressed_ids[i], codebook_map, special_token_ids)
             print(render_colored_tokens(colored_tokens, self.hf_bpe_tokenizer))
+
+    def verify_lzw(self, compressed_ids: List[int]) -> LZWVerificationResult:
+        base_ids, _ = self.compressor.decode(compressed_ids)
+        canonical_ids, _, _ = self.compressor.encode(base_ids)
+        ed = levenshtein_distance(compressed_ids, canonical_ids)
+        max_len = max(len(compressed_ids), len(canonical_ids))
+        mismatches = [
+            LZWMismatch(position=i, actual=compressed_ids[i], expected=canonical_ids[i])
+            for i in range(min(len(compressed_ids), len(canonical_ids)))
+            if compressed_ids[i] != canonical_ids[i]
+        ]
+        return LZWVerificationResult(
+            is_perfect=(compressed_ids == canonical_ids),
+            num_base_tokens=len(base_ids),
+            num_tokens=len(compressed_ids),
+            num_canonical_tokens=len(canonical_ids),
+            compression_ratio=len(base_ids) / len(compressed_ids),
+            canonical_compression_ratio=len(base_ids) / len(canonical_ids),
+            compression_efficiency=len(canonical_ids) / len(compressed_ids),
+            edit_distance=ed,
+            normalized_edit_distance=ed / max_len if max_len > 0 else 0.0,
+            mismatches=mismatches,
+            compressed_ids=compressed_ids,
+            canonical_ids=canonical_ids,
+        )
 
 
 def set_pad_token_if_none(

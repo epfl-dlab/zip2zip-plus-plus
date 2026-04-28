@@ -2,7 +2,7 @@ import pytest
 from pathlib import Path
 from transformers import AutoTokenizer
 
-from zip2zip_core.tokenizer import Zip2ZipTokenizer
+from zip2zip_core.tokenizer import Zip2ZipTokenizer, LZWVerificationResult
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOKENIZER_PATH = str(REPO_ROOT / "assets" / "hf_tokenizer" / "Llama-3.1-8B")
@@ -113,3 +113,27 @@ class TestPprint:
         enc = tokenizer.batch_encode_plus([REPEATED_TEXT])
         result = tokenizer.pprint(enc["input_ids"])
         assert result is None
+
+
+class TestVerifyLzw:
+    def test_perfect_sequence(self, tokenizer):
+        enc = tokenizer.batch_encode_plus([REPEATED_TEXT])
+        result = tokenizer.verify_lzw(enc["input_ids"][0])
+        assert isinstance(result, LZWVerificationResult)
+        assert result.is_perfect is True
+        assert result.mismatches == []
+        assert result.num_tokens == result.num_canonical_tokens
+
+    def test_faulty_sequence(self, tokenizer):
+        enc = tokenizer.batch_encode_plus([REPEATED_TEXT], return_codebook=True)
+        compressed_ids = list(enc["input_ids"][0])
+        cb = enc["codebooks"][0].to_dict()
+        # find a hypertoken and expand it back to base tokens (simulate a missed merge)
+        for i, tid in enumerate(compressed_ids):
+            if tid in cb:
+                base_tokens = cb[tid]
+                faulty_ids = compressed_ids[:i] + base_tokens + compressed_ids[i + 1:]
+                break
+        result = tokenizer.verify_lzw(faulty_ids)
+        assert result.is_perfect is False
+        assert len(result.mismatches) > 0
