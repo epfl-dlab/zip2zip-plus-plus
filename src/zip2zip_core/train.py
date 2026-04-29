@@ -704,6 +704,8 @@ def main():
             relaxed_loss_valid = relaxed_loss_sum / valid_tok
             relaxed_loss = relaxed_loss_sum / base_tok
             relaxed_ppl = math.exp(relaxed_loss)
+            relaxed_byte_ppl = math.exp(relaxed_loss_sum / target_bytes)
+            relaxed_bpb = relaxed_loss_sum / (target_bytes * math.log(2))
             acc = correct / valid_tok
             base_token_acc = base_correct / base_count if base_count > 0 else 0.0
             hyper_token_acc = hyper_correct / hyper_count if hyper_count > 0 else 0.0
@@ -720,6 +722,8 @@ def main():
             print(f"  loss (per valid token) = {avg_loss:.4f}")
             print(f"  relaxed_loss (per base token) = {relaxed_loss:.4f}")
             print(f"  relaxed_ppl           = {relaxed_ppl:.2f}")
+            print(f"  relaxed_byte_ppl      = {relaxed_byte_ppl:.4f}")
+            print(f"  relaxed_bpb           = {relaxed_bpb:.4f}")
             print(f"  relaxed_loss (per valid token) = {relaxed_loss_valid:.4f}")
             print(f"  acc                   = {acc:.4f}")
             print(f"  base_token_acc        = {base_token_acc:.4f}")
@@ -744,6 +748,8 @@ def main():
                     "eval/loss_per_valid_token": avg_loss,
                     "eval/relaxed_loss": relaxed_loss,
                     "eval/relaxed_ppl": relaxed_ppl,
+                    "eval/relaxed_byte_ppl": relaxed_byte_ppl,
+                    "eval/relaxed_bpb": relaxed_bpb,
                     "eval/relaxed_loss_per_valid_token": relaxed_loss_valid,
                     "eval/acc": acc,
                     "eval/base_token_acc": base_token_acc,
