@@ -22,7 +22,7 @@ from transformers import AutoTokenizer
 from zip2zip_core.codebook import CodebookManager
 from zip2zip_core.configs import zip2zip_llama_configs
 from zip2zip_core.model import Zip2ZipLlama3Model
-from zip2zip_core.tokenizer import ColorfulTokenizer, colorise_lzwtokens
+from zip2zip_core.viz import colorize_by_ngram, render_colored_tokens
 
 
 # ── constants ─────────────────────────────────────────────────────────────────
@@ -51,20 +51,6 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
     return model, args
 
 
-# def _update_codebook_dict(
-#     codebook_dict: dict[int, list[int]],
-#     updates: torch.Tensor,
-#     updates_indices: list[list[int]],
-#     vocab_size: int,
-#     pad_id: int,
-# ) -> None:
-#     """Register new codebook entries for hyper-token → base-token expansion."""
-#     for i, ui in enumerate(updates_indices):
-#         for j, idx in enumerate(ui):
-#             codebook_dict[vocab_size + idx] = [
-#                 t for t in updates[i, j].tolist() if t != pad_id
-#             ]
-
 
 # ── generation loop ───────────────────────────────────────────────────────────
 
@@ -74,7 +60,6 @@ def generate(
     model: Zip2ZipLlama3Model,
     codebook_manager: CodebookManager,
     hf_tokenizer,
-    colorful_tokenizer: ColorfulTokenizer,
     max_new_tokens: int = 128,
     temperature: float = 1.0,
     device: str = "cuda",
@@ -116,8 +101,8 @@ def generate(
         codebooks = codebook_manager.internal_codebook_manager.get_codebooks()
         codebook_dict = codebooks[0].to_dict() if codebooks else {}
         special_ids = set(hf_tokenizer.get_added_vocab().values())
-        colored_tokens = colorise_lzwtokens(ids, codebook_dict, "finegrained", special_ids)
-        return colorful_tokenizer.decode_colored_token(colored_tokens)
+        colored_tokens = colorize_by_ngram(ids, codebook_dict, special_ids)
+        return render_colored_tokens(colored_tokens, hf_tokenizer)
 
     # ── Decode loop ──
     for step in range(max_new_tokens):
@@ -131,21 +116,10 @@ def generate(
         if next_id == EOS_ID:
             break
 
-        # # Expand compressed token → base tokens
-        # if next_id >= vocab_size:
-        #     new_base = codebook_dict.get(next_id)
-        #     if new_base is None:
-        #         print(f"WARNING: generated unknown hyper-token {next_id}, skipping")
-        #         break
-        # else:
-        #     new_base = [next_id]
-        # generated_base_ids.extend(new_base)
-
         # Advance LZW state with the new base tokens
         new_base_tensor = torch.tensor([[next_id]], dtype=torch.long, device=device)
         codebook_manager.update_codebooks(new_base_tensor)
         updates, updates_indices = codebook_manager.get_new_codes()
-        # _update_codebook_dict(codebook_dict, updates, updates_indices, vocab_size, pad_id)
 
         # Append the *compressed* token (not base expansion) to context
         context = torch.cat(
@@ -201,7 +175,6 @@ def main():
 
     print(f"Loading tokenizer from {cli.tokenizer}...")
     hf_tok = AutoTokenizer.from_pretrained(cli.tokenizer)
-    colorful_tok = ColorfulTokenizer(hf_tok)
 
     codebook_manager = CodebookManager(
         initial_vocab_size=cfg.vocab_size,
@@ -218,7 +191,6 @@ def main():
         model,
         codebook_manager,
         hf_tok,
-        colorful_tok,
         max_new_tokens=cli.max_new_tokens,
         temperature=cli.temperature,
         device=device,

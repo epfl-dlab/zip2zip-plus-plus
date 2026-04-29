@@ -61,6 +61,29 @@ def get_base_vocab_size(tokenizer) -> int:
     return len(tokenizer.vocab)
 
 
+def get_special_token_ids(tokenizer: PreTrainedTokenizerBase) -> set[int]:
+    return set(tokenizer.get_added_vocab().values())
+
+
+def get_digit_token_ids(tokenizer: PreTrainedTokenizerBase) -> set[int]:
+    import re
+    ids = set()
+    for tid in range(len(tokenizer.get_vocab())):
+        if re.search(r'[0-9]', tokenizer.decode([tid])):
+            ids.add(tid)
+    return ids
+
+
+def get_default_disabled_ids(
+    tokenizer: PreTrainedTokenizerBase,
+    disable_digits: bool = False,
+) -> list[int]:
+    ids = get_special_token_ids(tokenizer)
+    if disable_digits:
+        ids |= get_digit_token_ids(tokenizer)
+    return sorted(ids)
+
+
 
 class Zip2ZipTokenizer(PushToHubMixin):
     """Wrapper that adds LZW compression layer to any tokenizer.
@@ -81,6 +104,7 @@ class Zip2ZipTokenizer(PushToHubMixin):
         max_codebook_size: int = 4096,
         max_subtokens: int = 4,
         disabled_ids: Optional[List[int]] = None,
+        disable_digits: bool = False,
     ) -> None:
 
         set_pad_token_if_none(hf_bpe_tokenizer)
@@ -88,6 +112,8 @@ class Zip2ZipTokenizer(PushToHubMixin):
         self.initial_vocab_size = get_base_vocab_size(hf_bpe_tokenizer)
         self.max_codebook_size = max_codebook_size
         self.max_subtokens = max_subtokens
+        if disabled_ids is None:
+            disabled_ids = get_default_disabled_ids(hf_bpe_tokenizer, disable_digits=disable_digits)
         self.disabled_ids = disabled_ids
 
         self.old_batch_encode_plus = hf_bpe_tokenizer._batch_encode_plus
