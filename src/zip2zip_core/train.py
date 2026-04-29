@@ -390,7 +390,7 @@ def main():
     parser.add_argument("--resume_from_hf", type=str, default=None,
                         help="HuggingFace repo ID to download checkpoint from (e.g. user/model-name)")
     parser.add_argument("--resume_hf_revision", type=str, default=None,
-                        help="HF revision/branch to download from (e.g. step_5000). Defaults to main.")
+                        help="HF revision/branch to download from (e.g. step0). Defaults to main.")
     parser.add_argument("--random_weights", action="store_true",
                         help="Control experiment: resume step/optimizer from checkpoint but reinit model weights randomly")
     parser.add_argument("--reset_step", action="store_true",
@@ -421,6 +421,10 @@ def main():
                         help="Weight for token type (base vs hyper) prediction head. 0 = disabled.")
     parser.add_argument("--eval", action="store_true",
                         help="Eval-only mode: load checkpoint, run --steps batches with no gradient, print stats.")
+    parser.add_argument("--profile", action="store_true",
+                        help="Run torch.profiler for the first 5 training steps (3 warmup + 2 active) and save a Chrome trace.")
+    parser.add_argument("--profile_steps", type=int, default=5,
+                        help="Number of active profiling steps (after 3 warmup steps)")
     args = parser.parse_args()
 
     if args.no_compile:
@@ -513,8 +517,9 @@ def main():
             print("Compiling model with torch.compile...")
         model = torch.compile(model)
 
-    # Wrap with DDP
-    model = DDP(model, device_ids=[local_rank])
+    # find_unused_parameters: when max_subtokens=1 the codebook is all-pad,
+    # so the hyper encoder is skipped and its params don't receive gradients.
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
     if not args.eval:
         # fp32 master weights: optimizer states stay in fp32, model stays in bf16
@@ -796,6 +801,22 @@ def main():
     log_tokens = 0
     start_time = time.time()
 
+    # Profiler setup
+    if args.profile:
+        profile_trace_dir = os.path.join(args.output_dir, "profiler_traces")
+        if rank == 0:
+            os.makedirs(profile_trace_dir, exist_ok=True)
+            print(f"Profiling enabled: 3 warmup + {args.profile_steps} active steps → {profile_trace_dir}")
+        profiler = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=0, warmup=3, active=args.profile_steps, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(profile_trace_dir),
+            record_shapes=True,
+        )
+        profiler.start()
+    else:
+        profiler = None
+
     while True:
         if args.max_tokens is not None:
             tokens_seen_before_step = step * global_batch_tokens
@@ -1048,8 +1069,32 @@ def main():
         if step % args.save_freq == 0:
             save_checkpoint(model, optimizer, step, args, args.output_dir, push_to_hub=args.push_to_hub)
 
+        # Profiler step
+        if profiler is not None:
+            profiler.step()
+            if step - start_step >= 3 + args.profile_steps:
+                if rank == 0:
+                    print("Profiling complete — stopping early.")
+                break
+
     # Final save
-    save_checkpoint(model, optimizer, step, args, args.output_dir, push_to_hub=args.push_to_hub)
+    if profiler is not None:
+        profiler.stop()
+        if rank == 0:
+            labels = {"hyper_encoder", "Main LM", "hyper_logits"}
+            sub_prefixes = ("layer_", "hyper_encoder.", "he.")
+            events = [e for e in profiler.key_averages()
+                      if e.key in labels or e.key.startswith(sub_prefixes)]
+            events.sort(key=lambda e: e.device_time_total, reverse=True)
+            total_cuda = sum(e.device_time_total for e in events if e.key in labels)
+            print(f"\n{'Component':<20} {'CUDA total':>12} {'% of fwd':>10}")
+            print("-" * 44)
+            for e in events:
+                pct = e.device_time_total / total_cuda * 100 if total_cuda > 0 else 0
+                prefix = "  " if e.key.startswith(sub_prefixes) else ""
+                print(f"{prefix}{e.key:<18} {e.device_time_total / 1e3:>10.1f}ms {pct:>9.1f}%")
+    else:
+        save_checkpoint(model, optimizer, step, args, args.output_dir, push_to_hub=args.push_to_hub)
 
     if rank == 0:
         print("Training complete!")

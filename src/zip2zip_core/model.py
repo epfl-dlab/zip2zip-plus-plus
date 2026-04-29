@@ -111,27 +111,31 @@ class HyperEncoderLayer(nn.Module):
         residual = x_packed
         x_norm = self.norm1(x_packed)
 
-        q = self.wq(x_norm).view(T, self.n_heads, self.head_dim)
-        k = self.wk(x_norm).view(T, self.n_heads, self.head_dim)
-        v = self.wv(x_norm).view(T, self.n_heads, self.head_dim)
+        with torch.profiler.record_function("he.forward_varlen.qkv_proj"):
+            q = self.wq(x_norm).view(T, self.n_heads, self.head_dim)
+            k = self.wk(x_norm).view(T, self.n_heads, self.head_dim)
+            v = self.wv(x_norm).view(T, self.n_heads, self.head_dim)
 
-        attn_out = varlen_attn(
-            q,
-            k,
-            v,
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
-            window_size=window_size,
-        )
+        with torch.profiler.record_function("he.forward_varlen.varlen_attn"):
+            attn_out = varlen_attn(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                cu_seqlens,
+                max_seqlen,
+                max_seqlen,
+                window_size=window_size,
+            )
+
         # attn_out: (total_tokens, n_heads, head_dim)
         attn_out = attn_out.reshape(T, D)
         x = residual + self.wo(attn_out)
 
         residual = x
         x_norm = self.norm2(x)
-        x = residual + self.w2(nn.functional.gelu(self.w1(x_norm)))
+        with torch.profiler.record_function("he.forward_varlen.ffn"):
+            x = residual + self.w2(nn.functional.gelu(self.w1(x_norm)))
 
         return x
 
@@ -194,76 +198,76 @@ class HyperEncoder(nn.Module):
         """
         N, S, _ = token_embeddings.shape
 
-        # Project down to encoder dim if needed
-        if self.proj_in is not None:
-            token_embeddings = self.proj_in(token_embeddings)
+        with torch.profiler.record_function("he.proj_in"):
+            # Project down to encoder dim if needed
+            if self.proj_in is not None:
+                token_embeddings = self.proj_in(token_embeddings)
 
-        D = self.dim
-        pos = torch.arange(S, device=token_embeddings.device)
-        x = token_embeddings + self.pos_embed(pos)
+            D = self.dim
+            pos = torch.arange(S, device=token_embeddings.device)
+            x = token_embeddings + self.pos_embed(pos)
 
         if varlen_attn is not None:
             result = self._forward_varlen(x, mask, N, S, D)
-            if self.proj_out is not None:
-                result = self.proj_out(result)
+            with torch.profiler.record_function("he.proj_out"):
+                if self.proj_out is not None:
+                    result = self.proj_out(result)
             return result
 
-        for layer in self.layers:
-            x = layer(x, mask, causal=self.causal)
+        with torch.profiler.record_function("he.layers"):
+            for layer in self.layers:
+                x = layer(x, mask, causal=self.causal)
 
-        x = self.norm(x)
+        with torch.profiler.record_function("he.pool"):
+            x = self.norm(x)
 
-        if self.causal:
-            lengths = mask.sum(dim=-1).clamp(min=1)
-            last_idx = (lengths - 1).long()
-            result = x[torch.arange(x.shape[0], device=x.device), last_idx]
-        else:
-            masked_x = x * mask.unsqueeze(-1)
-            count = mask.sum(dim=-1, keepdim=True).clamp(min=1)
-            result = masked_x.sum(dim=1) / count
+            if self.causal:
+                lengths = mask.sum(dim=-1).clamp(min=1)
+                last_idx = (lengths - 1).long()
+                result = x[torch.arange(x.shape[0], device=x.device), last_idx]
+            else:
+                masked_x = x * mask.unsqueeze(-1)
+                count = mask.sum(dim=-1, keepdim=True).clamp(min=1)
+                result = masked_x.sum(dim=1) / count
 
-        if self.proj_out is not None:
-            result = self.proj_out(result)
+        with torch.profiler.record_function("he.proj_out"):
+            if self.proj_out is not None:
+                result = self.proj_out(result)
         return result
 
     def _forward_varlen(
         self, x: torch.Tensor, mask: torch.Tensor, N: int, S: int, D: int
     ) -> torch.Tensor:
         """Varlen forward path: pack valid tokens, run layers, pool results."""
-        # Compute per-entry lengths and cumulative offsets
-        lengths = mask.sum(dim=-1)  # (N,)
-        cu_seqlens = torch.zeros(N + 1, dtype=torch.int32, device=x.device)
-        torch.cumsum(lengths.to(torch.int32), dim=0, out=cu_seqlens[1:])
-        # Use max_subtokens as upper bound to avoid device-to-host sync
-        max_seqlen = S
+        with torch.profiler.record_function("he.forward_varlen.pack"):
+            lengths = mask.sum(dim=-1)  # (N,)
+            cu_seqlens = torch.zeros(N + 1, dtype=torch.int32, device=x.device)
+            torch.cumsum(lengths.to(torch.int32), dim=0, out=cu_seqlens[1:])
+            max_seqlen = S
+            x_packed = x[mask]
 
-        # Pack valid tokens: (N, S, D) -> (total_valid_tokens, D)
-        x_packed = x[mask]
-
-        # window_size for varlen_attn: (-1, 0) = causal, (-1, -1) = bidirectional
         window_size = (-1, 0) if self.causal else (-1, -1)
 
-        # Run transformer layers on packed tokens
-        for layer in self.layers:
-            x_packed = layer.forward_varlen(
-                x_packed, cu_seqlens, max_seqlen, window_size=window_size
-            )
+        with torch.profiler.record_function("he.forward_varlen.layers"):
+            for layer in self.layers:
+                x_packed = layer.forward_varlen(
+                    x_packed, cu_seqlens, max_seqlen, window_size=window_size
+                )
 
-        x_packed = self.norm(x_packed)
+        with torch.profiler.record_function("he.forward_varlen.pool"):
+            x_packed = self.norm(x_packed)
 
-        if self.causal:
-            # Last token pooling: take the last valid token of each sequence
-            last_indices = cu_seqlens[1:].long() - 1
-            return x_packed[last_indices]
-        else:
-            # Mean pooling via scatter_add
-            entry_ids = torch.arange(N, device=x.device).repeat_interleave(lengths)
-            result = torch.zeros(N, D, device=x_packed.device, dtype=x_packed.dtype)
-            result.scatter_add_(
-                0, entry_ids.unsqueeze(-1).expand_as(x_packed), x_packed
-            )
-            result = result / lengths.unsqueeze(-1).clamp(min=1).to(result.dtype)
-            return result
+            if self.causal:
+                last_indices = cu_seqlens[1:].long() - 1
+                return x_packed[last_indices]
+            else:
+                entry_ids = torch.arange(N, device=x.device).repeat_interleave(lengths)
+                result = torch.zeros(N, D, device=x_packed.device, dtype=x_packed.dtype)
+                result.scatter_add_(
+                    0, entry_ids.unsqueeze(-1).expand_as(x_packed), x_packed
+                )
+                result = result / lengths.unsqueeze(-1).clamp(min=1).to(result.dtype)
+                return result
 
 
 class PairwiseHyperEncoder(nn.Module):
@@ -686,7 +690,8 @@ class Zip2ZipLlama3Model(Decoder):
         mask_flat = mask.view(B * H, S)
 
         # Encode
-        encoded = self.hyper_encoder(cb_embeds_flat, mask_flat)  # (B*H, dim)
+        with torch.profiler.record_function("hyper_encoder.core"):
+            encoded = self.hyper_encoder(cb_embeds_flat, mask_flat)  # (B*H, dim)
 
         return encoded.view(B, H, -1)
 
@@ -720,19 +725,22 @@ class Zip2ZipLlama3Model(Decoder):
         """
 
         # === Embedding ===
-        if codebook is not None:
-            h, hyper_embeds = self._embed_tokens_train(tokens, codebook)
-        elif codebook_updates is not None and codebook_updates_indices is not None:
-            h, hyper_embeds = self._embed_tokens_inference(
-                tokens, codebook_updates, codebook_updates_indices
-            )
-        else:
-            h = self.tok_embeddings(tokens)
-            hyper_embeds = None
+        with torch.profiler.record_function("hyper_encoder"):
+            if codebook is not None and (codebook != self.zip2zip_config.pad_token_id).any():
+                h, hyper_embeds = self._embed_tokens_train(tokens, codebook)
+            elif codebook_updates is not None and codebook_updates_indices is not None:
+                h, hyper_embeds = self._embed_tokens_inference(
+                    tokens, codebook_updates, codebook_updates_indices
+                )
+            else:
+                h = self.tok_embeddings(tokens)
+                hyper_embeds = None
 
         # === Transformer layers ===
-        for layer in self.layers.values():
-            h = layer(h, self.freqs_cis, attention_masks, positions)
+        with torch.profiler.record_function("Main LM"):
+            for layer_id, layer in enumerate(self.layers.values()):
+                with torch.profiler.record_function(f"layer_{layer_id}"):
+                    h = layer(h, self.freqs_cis, attention_masks, positions)
 
         h = self.norm(h) if self.norm is not None else h
 
@@ -744,36 +752,37 @@ class Zip2ZipLlama3Model(Decoder):
         # === Output logits ===
         base_logits = self.output(h)  # (B, T, vocab_size)
 
-        if hyper_embeds is not None:
-            hyper_logits = torch.bmm(h, hyper_embeds.transpose(1, 2))  # (B, T, K)
+        with torch.profiler.record_function("hyper_logits"):
+            if hyper_embeds is not None:
+                hyper_logits = torch.bmm(h, hyper_embeds.transpose(1, 2))  # (B, T, K)
 
-            if codebook is not None:
-                # --- Training: pad mask + optional hyper causal mask ---
-                pad_id = self.zip2zip_config.pad_token_id
-                codebook_used = (codebook != pad_id).any(dim=-1)  # (B, K)
-                hyper_logits = hyper_logits.masked_fill(
-                    ~codebook_used.unsqueeze(1), float("-inf")
-                )
-                # Hyper causal mask: entry k is created at LZW step k,
-                # so at position t only entries with k <= t are available.
-                if hyper_causal_mask:
-                    T = h.shape[1]
-                    K = hyper_embeds.shape[1]
-                    pos = torch.arange(T, device=h.device).view(1, T, 1)
-                    entry_idx = torch.arange(K, device=h.device).view(1, 1, K)
+                if codebook is not None:
+                    # --- Training: pad mask + optional hyper causal mask ---
+                    pad_id = self.zip2zip_config.pad_token_id
+                    codebook_used = (codebook != pad_id).any(dim=-1)  # (B, K)
                     hyper_logits = hyper_logits.masked_fill(
-                        entry_idx > pos, float("-inf")
+                        ~codebook_used.unsqueeze(1), float("-inf")
                     )
-            else:
-                # --- Inference: used-entry mask (causality is inherent) ---
-                codebook_used = self._hyper_embeds_used[:, : hyper_embeds.shape[1]]
-                hyper_logits = hyper_logits.masked_fill(
-                    ~codebook_used.unsqueeze(1), float("-inf")
-                )
+                    # Hyper causal mask: entry k is created at LZW step k,
+                    # so at position t only entries with k <= t are available.
+                    if hyper_causal_mask:
+                        T = h.shape[1]
+                        K = hyper_embeds.shape[1]
+                        pos = torch.arange(T, device=h.device).view(1, T, 1)
+                        entry_idx = torch.arange(K, device=h.device).view(1, 1, K)
+                        hyper_logits = hyper_logits.masked_fill(
+                            entry_idx > pos, float("-inf")
+                        )
+                else:
+                    # --- Inference: used-entry mask (causality is inherent) ---
+                    codebook_used = self._hyper_embeds_used[:, : hyper_embeds.shape[1]]
+                    hyper_logits = hyper_logits.masked_fill(
+                        ~codebook_used.unsqueeze(1), float("-inf")
+                    )
 
-            logits = torch.cat([base_logits, hyper_logits], dim=-1)
-        else:
-            logits = base_logits
+                logits = torch.cat([base_logits, hyper_logits], dim=-1)
+            else:
+                logits = base_logits
 
         if token_type_logits is not None:
             return logits, token_type_logits
