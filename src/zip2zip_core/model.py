@@ -214,7 +214,7 @@ class HyperEncoder(nn.Module):
                     result = self.proj_out(result)
             return result
 
-        with torch.profiler.record_function("he.layers"):
+        with torch.profiler.record_function("he.novarlen_layers"):
             for layer in self.layers:
                 x = layer(x, mask, causal=self.causal)
 
@@ -749,8 +749,9 @@ class Zip2ZipLlama3Model(Decoder):
         if self.token_type_head is not None:
             token_type_logits = self.token_type_head(h).squeeze(-1)  # (B, T)
 
-        # === Output logits ===
-        base_logits = self.output(h)  # (B, T, vocab_size)
+        with torch.profiler.record_function("lm_head"):
+            # === Output logits ===
+            base_logits = self.output(h)  # (B, T, vocab_size)
 
         with torch.profiler.record_function("hyper_logits"):
             if hyper_embeds is not None:

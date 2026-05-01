@@ -224,4 +224,36 @@ zip2zip_llama_configs = {
             scaling="llama",
         ),
     ),
+    # ~8B params — Llama 3.1 8B architecture
+    "8B": Zip2ZipLlama3Model.Config(
+        dim=4096,
+        n_layers=24,
+        vocab_size=128256,
+        max_codebook_size=4096,
+        max_subtokens=4,
+        encoder_dim=512,
+        encoder_n_layers=2,
+        encoder_n_heads=8,
+        encoder_intermediate_size=2048,
+        pad_token_id=128001,
+        tok_embeddings=Embedding.Config(),
+        layer=Zip2ZipTransformerBlock.Config(
+            feed_forward=FeedForward.Config(
+                hidden_dim=14336,
+            ),
+            attention=GQAttention.Config(
+                n_heads=32,
+                n_kv_heads=8,
+                attn_backend="sdpa",
+                rope_backend="complex",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=4096 // 32,
+            max_seq_len=131072,
+            theta=500000,
+            backend="complex",
+            scaling="llama",
+        ),
+    ),
 }

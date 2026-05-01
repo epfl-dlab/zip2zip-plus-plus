@@ -1088,18 +1088,46 @@ def main():
     if profiler is not None:
         profiler.stop()
         if rank == 0:
-            labels = {"hyper_encoder", "Main LM", "hyper_logits"}
-            sub_prefixes = ("layer_", "hyper_encoder.", "he.")
-            events = [e for e in profiler.key_averages()
-                      if e.key in labels or e.key.startswith(sub_prefixes)]
-            events.sort(key=lambda e: e.device_time_total, reverse=True)
-            total_cuda = sum(e.device_time_total for e in events if e.key in labels)
-            print(f"\n{'Component':<20} {'CUDA total':>12} {'% of fwd':>10}")
-            print("-" * 44)
-            for e in events:
-                pct = e.device_time_total / total_cuda * 100 if total_cuda > 0 else 0
-                prefix = "  " if e.key.startswith(sub_prefixes) else ""
-                print(f"{prefix}{e.key:<18} {e.device_time_total / 1e3:>10.1f}ms {pct:>9.1f}%")
+            labels = {"hyper_encoder", "Main LM", "hyper_logits", "lm_head", "cross_entropy"}
+            sub_prefixes = ("layer_", "hyper_encoder.", "he.", "logit_cat")
+
+            # Merge duplicate events (CPU vs CUDA rows share the same key)
+            merged = {}
+            for e in profiler.key_averages():
+                if e.key in labels or e.key.startswith(sub_prefixes):
+                    if e.key not in merged:
+                        merged[e.key] = 0
+                    merged[e.key] += e.device_time_total
+
+            top_level = {k: v for k, v in merged.items() if k in labels}
+            children = {k: v for k, v in merged.items() if k not in labels}
+            total_cuda = sum(top_level.values())
+
+            # Parent → child prefix mapping
+            parent_children = {
+                "Main LM": "layer_",
+                "hyper_encoder": ("hyper_encoder.", "he."),
+                "cross_entropy": "logit_cat",
+            }
+
+            print(f"\n{'Component':<40} {'CUDA total':>12} {'% of fwd':>10}")
+            print("-" * 64)
+            for name in ["hyper_encoder", "Main LM", "lm_head", "hyper_logits", "cross_entropy"]:
+                if name not in top_level:
+                    continue
+                v = top_level[name]
+                pct = v / total_cuda * 100 if total_cuda > 0 else 0
+                print(f"{name:<40} {v / 1e3:>10.1f}ms {pct:>9.1f}%")
+                # Print children
+                prefixes = parent_children.get(name, None)
+                if prefixes:
+                    kids = sorted(
+                        [(k, v) for k, v in children.items() if k.startswith(prefixes)],
+                        key=lambda kv: kv[1], reverse=True,
+                    )
+                    for ck, cv in kids:
+                        cpct = cv / total_cuda * 100 if total_cuda > 0 else 0
+                        print(f"  {ck:<38} {cv / 1e3:>10.1f}ms {cpct:>9.1f}%")
     else:
         save_checkpoint(model, optimizer, step, args, args.output_dir, push_to_hub=args.push_to_hub)
 
