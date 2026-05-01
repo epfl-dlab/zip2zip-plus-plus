@@ -1,0 +1,23 @@
+# Rolling-perplexity over deduplicated/uncleaned C4 ("dC4").
+# Uses allenai/c4 with the "en.noblocklist" config (deduplicated, no blocklist
+# filter — the variant typically referred to as dC4 in pretraining ablations).
+# Override `dataset_name` if you mean a different variant, e.g. "en.noclean",
+# or point dataset_path at allenai/dolma's c4 subset.
+task: zip2zip_dc4
+dataset_path: allenai/c4
+test_split: validation
+# Pin one validation shard from the noblocklist (deduped) variant; same
+# rationale as zip2zip_mc4 — avoid pulling the train split.
+dataset_kwargs:
+  data_files:
+    validation: en.noblocklist/c4-validation.00000-of-00008.json.gz
+output_type: loglikelihood_rolling
+doc_to_text: ""
+doc_to_target: "{{text}}"
+should_decontaminate: false
+metric_list:
+  - metric: word_perplexity
+  - metric: byte_perplexity
+  - metric: bits_per_byte
+metadata:
+  version: 1.0

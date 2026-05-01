@@ -1,0 +1,21 @@
+# Rolling-perplexity over the Pile validation set.
+# Uses mit-han-lab/pile-val-backup — the original EleutherAI Pile validation
+# split (~270MB) re-uploaded by mit-han-lab; this is the standard "Pile PPL"
+# eval set referenced in most pretraining papers. monology/pile-uncopyrighted
+# only ships a `train` split, which is why we don't use it here.
+task: zip2zip_pile
+dataset_path: mit-han-lab/pile-val-backup
+test_split: validation
+# ~270MB val set; download is fine. (Streaming + ConfigurableTask is broken
+# in lm-eval 0.4.11: it peeks the first doc during init and gets back an
+# IterableColumn instead of a row dict.)
+output_type: loglikelihood_rolling
+doc_to_text: ""
+doc_to_target: "{{text}}"
+should_decontaminate: false
+metric_list:
+  - metric: word_perplexity
+  - metric: byte_perplexity
+  - metric: bits_per_byte
+metadata:
+  version: 1.0

@@ -14,6 +14,7 @@ from zip2zip_compression import LZWCompressor
 # Special tokens for compression/decompression task (unused Llama3 special token slots)
 COMPRESS_TOKEN_ID = 128002
 DECOMPRESS_TOKEN_ID = 128003
+LLAMA31_8B_SPECIAL_TOKEN_IDS = tuple(range(128000, 128256))
 
 
 class Zip2ZipDataset(IterableDataset, Stateful):
@@ -55,13 +56,24 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         self.base_chunk_len = seq_len * 2
 
         shard_files = sorted(
-            [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".npy")]
+            [
+                os.path.join(data_dir, f)
+                for f in os.listdir(data_dir)
+                if f.endswith(".npy") and not f.startswith("mask_")
+            ]
         )
         if not shard_files:
             raise ValueError(f"No .npy files in {data_dir}")
 
+        mask_files = [self._mask_path_for_shard(path) for path in shard_files]
+        has_masks = [os.path.exists(path) for path in mask_files]
+        if any(has_masks) and not all(has_masks):
+            missing = [path for path, exists in zip(mask_files, has_masks) if not exists]
+            raise ValueError(f"Found partial loss masks in {data_dir}; missing {missing[:3]}")
+
         # Distribute shards
         self.shard_files = shard_files[rank::world_size]
+        self.mask_files = mask_files[rank::world_size] if all(has_masks) else None
         self._shard_idx = 0
         self._offset = 0
 
@@ -70,8 +82,37 @@ class Zip2ZipDataset(IterableDataset, Stateful):
             max_codebook_size=max_codebook_size,
             max_subtokens=max_subtokens,
             pad_token_id=pad_token_id,
-            disabled_ids=[bos_token_id, eos_token_id, COMPRESS_TOKEN_ID, DECOMPRESS_TOKEN_ID],
+            disabled_ids=list(LLAMA31_8B_SPECIAL_TOKEN_IDS),
         )
+
+    @staticmethod
+    def _mask_path_for_shard(shard_path: str) -> str:
+        dirname = os.path.dirname(shard_path)
+        basename = os.path.basename(shard_path)
+        if basename.startswith("shard_"):
+            return os.path.join(dirname, basename.replace("shard_", "mask_", 1))
+        return os.path.join(dirname, f"mask_{basename}")
+
+    @staticmethod
+    def _load_token_shard(shard_path: str):
+        try:
+            return np.load(shard_path, mmap_mode="r")
+        except ValueError as exc:
+            # Dolma writes flat binary arrays with a .npy suffix, not np.save files.
+            if "pickle" not in str(exc).lower():
+                raise
+            dtype = np.dtype(np.uint32)
+            size = os.path.getsize(shard_path)
+            if size % dtype.itemsize != 0:
+                raise ValueError(
+                    f"{shard_path} is neither a NumPy .npy file nor a raw uint32 shard"
+                ) from exc
+            return np.memmap(
+                shard_path,
+                dtype=dtype,
+                mode="r",
+                shape=(size // dtype.itemsize,),
+            )
 
     def _codebook_to_tensor(self, codebook) -> torch.LongTensor:
         cb_dict = codebook.to_dict()
@@ -131,17 +172,36 @@ class Zip2ZipDataset(IterableDataset, Stateful):
 
         return x_new, y_new, compact_cb
 
-    def _iter_lm(self, shards):
+    def _compressed_loss_mask(self, compressed, base_mask, codebook):
+        cb_dict = codebook.to_dict()
+        offset = 0
+        compressed_mask = []
+        for tok in compressed:
+            span_len = len(cb_dict[tok]) if tok >= self.initial_vocab_size else 1
+            span = base_mask[offset : offset + span_len]
+            compressed_mask.append(bool(np.all(span)))
+            offset += span_len
+        return torch.BoolTensor(compressed_mask)
+
+    def _iter_lm(self, shards, mask_shards=None):
         """Original language modeling mode: next-token prediction on compressed sequences."""
         while True:
             for shard_idx in range(self._shard_idx, len(shards)):
                 self._shard_idx = shard_idx
-                shard = np.load(shards[shard_idx])
+                shard = self._load_token_shard(shards[shard_idx])
+                mask_shard = np.load(mask_shards[shard_idx]) if mask_shards is not None else None
+                if mask_shard is not None and len(mask_shard) != len(shard):
+                    raise ValueError(f"Mask length mismatch for {shards[shard_idx]}")
                 offset = self._offset
                 self._offset = 0
 
                 while offset + self.base_chunk_len <= len(shard):
                     chunk = shard[offset : offset + self.base_chunk_len].tolist()
+                    chunk_mask = (
+                        mask_shard[offset : offset + self.base_chunk_len]
+                        if mask_shard is not None
+                        else None
+                    )
                     offset += self.base_chunk_len
 
                     compressor = LZWCompressor(**self.compressor_args)
@@ -166,6 +226,11 @@ class Zip2ZipDataset(IterableDataset, Stateful):
 
                     x = torch.LongTensor(compressed[:-1])
                     y = torch.LongTensor(compressed[1:])
+                    if chunk_mask is not None:
+                        loss_mask = self._compressed_loss_mask(compressed, chunk_mask, codebook)[1:]
+                        if not loss_mask.any():
+                            continue
+                        y[~loss_mask] = -100
                     cb = self._codebook_to_tensor(codebook)
 
                     # Remap to compact codebook
@@ -194,7 +259,7 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         while True:
             for shard_idx in range(self._shard_idx, len(shards)):
                 self._shard_idx = shard_idx
-                shard = np.load(shards[shard_idx])
+                shard = self._load_token_shard(shards[shard_idx])
                 offset = self._offset
                 self._offset = 0
 
@@ -277,7 +342,7 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         if self.mode == "compress":
             yield from self._iter_compress(shards)
         else:
-            yield from self._iter_lm(shards)
+            yield from self._iter_lm(shards, self.mask_files)
 
     def state_dict(self):
         return {"shard_idx": self._shard_idx, "offset": self._offset}

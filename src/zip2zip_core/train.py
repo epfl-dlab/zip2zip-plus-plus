@@ -491,6 +491,7 @@ def main():
         max_subtokens=args.max_subtokens,
         hyper_encoder_type=args.hyper_encoder_type,
         token_type_loss_weight=args.token_type_loss_weight,
+        rope=dataclasses.replace(config.rope, max_seq_len=args.seq_len),
     )
     if args.encoder_dim is not None:
         replace_kwargs["encoder_dim"] = args.encoder_dim

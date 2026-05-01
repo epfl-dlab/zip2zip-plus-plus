@@ -1,8 +1,9 @@
 # --index-url https://download.pytorch.org/whl/cu128
-torch>=2.10 # for varlen attention 
+torch>=2.10 # for varlen attention
 torchvision
 datasets
 
-# transformers 5.0 broke _batch_encode_plus / _decode monkey-patching (TokenizersBackend refactor) 
+# transformers 5.0 broke _batch_encode_plus / _decode monkey-patching (TokenizersBackend refactor)
 transformers<5.0
 wandb
+lm-eval>=0.4.4

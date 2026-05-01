@@ -1,0 +1,24 @@
+# Rolling-perplexity over multilingual C4 (mC4).
+# Uses allenai/c4 with the "multilingual" config; HF requires a language
+# subset, so we default to English ("en"). To evaluate on a different
+# language change `dataset_name`, e.g. "fr", "de", "es", or to pull from the
+# legacy "mc4" dataset, edit dataset_path accordingly.
+task: zip2zip_mc4
+dataset_path: allenai/c4
+test_split: validation
+# Pin one validation shard explicitly (≈45k docs / ≈400MB) so HF only fetches
+# what we need — never the 800GB train split. Streaming would also work in
+# principle but breaks ConfigurableTask init in lm-eval 0.4.11.
+dataset_kwargs:
+  data_files:
+    validation: en/c4-validation.00000-of-00008.json.gz
+output_type: loglikelihood_rolling
+doc_to_text: ""
+doc_to_target: "{{text}}"
+should_decontaminate: false
+metric_list:
+  - metric: word_perplexity
+  - metric: byte_perplexity
+  - metric: bits_per_byte
+metadata:
+  version: 1.0

@@ -44,6 +44,7 @@ LOG_FREQ=${LOG_FREQ:-10}
 RESUME_FROM=${RESUME_FROM:-}
 RESUME_FROM_HF=${RESUME_FROM_HF:-}
 RESUME_HF_REVISION=${RESUME_HF_REVISION:-}
+RESET_STEP=${RESET_STEP:-}
 PUSH_TO_HUB=${PUSH_TO_HUB:-}
 WANDB=${WANDB:-}
 WANDB_PROJECT=${WANDB_PROJECT:-zip2zip-core}
@@ -81,6 +82,11 @@ if [ -n "$RESUME_FROM_HF" ]; then
     if [ -n "$RESUME_HF_REVISION" ]; then
         RESUME_FLAG="$RESUME_FLAG --resume_hf_revision $RESUME_HF_REVISION"
     fi
+fi
+
+RESET_STEP_FLAG=""
+if [ -n "$RESET_STEP" ]; then
+    RESET_STEP_FLAG="--reset_step"
 fi
 
 PUSH_FLAG=""
@@ -129,6 +135,7 @@ export PYTHONUNBUFFERED=1
     --mode '"$MODE"' \
     --token_type_loss_weight '"$TOKEN_TYPE_LOSS_WEIGHT"' \
     '"$RESUME_FLAG"' \
+    '"$RESET_STEP_FLAG"' \
     '"$PUSH_FLAG"' \
     '"$WANDB_FLAG"'
 '
