@@ -25,12 +25,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.1-8B")
-    parser.add_argument("--dataset", type=str, default="HuggingFaceFW/fineweb")
+    parser.add_argument("--dataset", type=str, default="epfl-dlab/zip2zip-plus-mixture-20b")
     parser.add_argument("--dataset_name", type=str, default=None)
     parser.add_argument("--dataset_split", type=str, default="train")
     parser.add_argument("--column", type=str, default="text")
-    parser.add_argument("--tokens_per_shard", type=int, default=100_000_000)
-    parser.add_argument("--target_tokens", type=float, default=10.5e9)
+    parser.add_argument("--tokens_per_shard", type=int, default=1000_000_000)
+    parser.add_argument("--target_tokens", type=float, default=20e9)
     parser.add_argument("--min_doc_length", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=10_000)
     parser.add_argument("--num_workers", type=int, default=0, help="Number of workers (0 = all CPUs)")
@@ -38,7 +38,7 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    num_workers = args.num_workers if args.num_workers > 0 else cpu_count()
+    num_workers = args.num_workers if args.num_workers > 0 else cpu_count()//2
 
     print(f"Loading tokenizer from {args.model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
