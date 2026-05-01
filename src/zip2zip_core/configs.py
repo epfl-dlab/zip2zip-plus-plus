@@ -192,6 +192,38 @@ zip2zip_llama_configs = {
             scaling="llama",
         ),
     ),
+    # ~1B params — matches official Llama 3.2 1B architecture
+    "1B_llama3.2": Zip2ZipLlama3Model.Config(
+        dim=2048,
+        n_layers=16,
+        vocab_size=128256,
+        max_codebook_size=4096,
+        max_subtokens=4,
+        encoder_dim=512,
+        encoder_n_layers=2,
+        encoder_n_heads=8,
+        encoder_intermediate_size=2048,
+        pad_token_id=128001,
+        tok_embeddings=Embedding.Config(),
+        layer=Zip2ZipTransformerBlock.Config(
+            feed_forward=FeedForward.Config(
+                hidden_dim=8192,
+            ),
+            attention=GQAttention.Config(
+                n_heads=32,
+                n_kv_heads=8,
+                attn_backend="sdpa",
+                rope_backend="complex",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=2048 // 32,
+            max_seq_len=131072,
+            theta=500000,
+            backend="complex",
+            scaling="llama",
+        ),
+    ),
     # ~3B params (dim=3072, 28 layers, head_dim=128)
     "3B": Zip2ZipLlama3Model.Config(
         dim=3072,
@@ -225,9 +257,11 @@ zip2zip_llama_configs = {
         ),
     ),
     # ~8B params — Llama 3.1 8B architecture
+    # ⚠️ Official Llama 3.1 8B uses tie_word_embeddings=False, but our model ties them.
+    # Must add untied embedding support before loading official 8B weights.
     "8B": Zip2ZipLlama3Model.Config(
         dim=4096,
-        n_layers=24,
+        n_layers=32,
         vocab_size=128256,
         max_codebook_size=4096,
         max_subtokens=4,
@@ -250,7 +284,7 @@ zip2zip_llama_configs = {
         ),
         rope=RoPE.Config(
             dim=4096 // 32,
-            max_seq_len=131072,
+            max_seq_len=8192,
             theta=500000,
             backend="complex",
             scaling="llama",

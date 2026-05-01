@@ -371,12 +371,12 @@ class HierarchicalHyperEncoder(nn.Module):
             device=token_embeddings.device,
         )
 
-        single_mask = lengths == 1
-        if single_mask.any():
-            first_valid_idx = mask.long().argmax(dim=1)
-            outputs[single_mask] = token_embeddings[
-                single_mask, first_valid_idx[single_mask]
-            ]
+        # single_mask = lengths == 1
+        # if single_mask.any():
+        #     first_valid_idx = mask.long().argmax(dim=1)
+        #     outputs[single_mask] = token_embeddings[
+        #         single_mask, first_valid_idx[single_mask]
+        #     ]
 
         active_indices = torch.nonzero(lengths >= 2, as_tuple=False).flatten()
         if active_indices.numel() == 0:
@@ -407,6 +407,92 @@ class HierarchicalHyperEncoder(nn.Module):
             states[still_active] = updated_states
             next_positions = next_positions.clone()
             next_positions[still_active] += 1
+
+        outputs[active_indices] = states
+        return outputs
+
+
+class FastHierarchicalHyperEncoder(nn.Module):
+    """Fast left-to-right composition using gated MLP instead of attention.
+
+    Same left-fold semantics as HierarchicalHyperEncoder but replaces the
+    PairwiseHyperEncoder (transformer layers on seq_len=2) with a single
+    gated MLP: gate * proj(a) + (1-gate) * proj(b).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        max_subtokens: int,
+        n_layers: int = 2,
+        n_heads: int = 8,
+        intermediate_size: int | None = None,
+        causal: bool = False,
+        model_dim: int | None = None,
+    ):
+        super().__init__()
+        self.max_subtokens = max_subtokens
+        self.model_dim = model_dim or dim
+        D = self.model_dim
+
+        self.gate = nn.Linear(2 * D, D)
+        self.proj_a = nn.Linear(D, D, bias=False)
+        self.proj_b = nn.Linear(D, D, bias=False)
+
+        # Init: gate bias to 0 → sigmoid(0) = 0.5 → even mix of a and b
+        # proj_a/proj_b near identity → compose ≈ mean(a, b) at init
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+        nn.init.eye_(self.proj_a.weight)
+        nn.init.eye_(self.proj_b.weight)
+
+    def init_weights(self):
+        """Re-apply identity-like init (called after model-level xavier init)."""
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+        nn.init.eye_(self.proj_a.weight)
+        nn.init.eye_(self.proj_b.weight)
+
+    def _compose(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Gated composition: (N, D) x (N, D) -> (N, D)."""
+        g = self.gate(torch.cat([a, b], dim=-1)).sigmoid()
+        return (g * self.proj_a(a) + (1 - g) * self.proj_b(b)).to(a.dtype)
+
+    def forward(
+        self, token_embeddings: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Left-fold valid subtokens into a single composed embedding."""
+        num_entries = token_embeddings.shape[0]
+        lengths = mask.sum(dim=1).long()
+        outputs = torch.zeros(
+            num_entries,
+            self.model_dim,
+            dtype=token_embeddings.dtype,
+            device=token_embeddings.device,
+        )
+
+        active_mask = lengths >= 2
+        if not active_mask.any():
+            return outputs
+
+        active_indices = torch.nonzero(active_mask, as_tuple=False).flatten()
+        states = self._compose(
+            token_embeddings[active_indices, 0],
+            token_embeddings[active_indices, 1],
+        )
+
+        for pos in range(2, self.max_subtokens):
+            still_active = pos < lengths[active_indices]
+            if not still_active.any():
+                break
+            idx = active_indices[still_active]
+            new_states = states.clone()
+            new_states[still_active] = self._compose(
+                states[still_active],
+                token_embeddings[idx, pos],
+            )
+            states = new_states
+            
 
         outputs[active_indices] = states
         return outputs
@@ -538,6 +624,8 @@ class Zip2ZipLlama3Model(Decoder):
             self.hyper_encoder = HyperEncoder(**hyper_encoder_kwargs)
         elif config.hyper_encoder_type == "hierarchical":
             self.hyper_encoder = HierarchicalHyperEncoder(**hyper_encoder_kwargs)
+        elif config.hyper_encoder_type == "fast_hierarchical":
+            self.hyper_encoder = FastHierarchicalHyperEncoder(**hyper_encoder_kwargs)
         else:
             raise ValueError(
                 f"Unsupported hyper_encoder_type: {config.hyper_encoder_type!r}"
@@ -555,15 +643,24 @@ class Zip2ZipLlama3Model(Decoder):
                         nn.init.zeros_(m.bias)
 
         # Initialize hyper-encoder
-        for name, p in self.hyper_encoder.named_parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-            elif "bias" in name:
-                nn.init.zeros_(p)
+        if hasattr(self.hyper_encoder, 'init_weights'):
+            self.hyper_encoder.init_weights()
+        else:
+            for name, p in self.hyper_encoder.named_parameters():
+                if p.dim() > 1:
+                    nn.init.xavier_uniform_(p)
+                elif "bias" in name:
+                    nn.init.zeros_(p)
 
-        for module in self.hyper_encoder.modules():
-            if isinstance(module, (nn.LayerNorm,)):
-                module.reset_parameters()
+            for module in self.hyper_encoder.modules():
+                if isinstance(module, (nn.LayerNorm,)):
+                    module.reset_parameters()
+
+        # Zero-init encoder output so initial hyper embedding ≈ first base token
+        if getattr(self, 'encoder_residual', True):
+            for name, module in self.hyper_encoder.named_modules():
+                if name.endswith('proj_out') and isinstance(module, nn.Linear):
+                    nn.init.zeros_(module.weight)
 
     def reset_inference_cache(self) -> None:
         """Reset hyper embedding buffer. Call between sequences during inference."""
@@ -689,9 +786,14 @@ class Zip2ZipLlama3Model(Decoder):
         cb_embeds_flat = cb_embeds.view(B * H, S, -1)
         mask_flat = mask.view(B * H, S)
 
-        # Encode
+        # Encode: residual from first token + learned delta
         with torch.profiler.record_function("hyper_encoder.core"):
-            encoded = self.hyper_encoder(cb_embeds_flat, mask_flat)  # (B*H, dim)
+            encoder_out = self.hyper_encoder(cb_embeds_flat, mask_flat)
+            if getattr(self, 'encoder_residual', True):
+                first_token_embed = cb_embeds_flat[:, 0, :]  # (B*H, dim)
+                encoded = first_token_embed + encoder_out
+            else:
+                encoded = encoder_out
 
         return encoded.view(B, H, -1)
 

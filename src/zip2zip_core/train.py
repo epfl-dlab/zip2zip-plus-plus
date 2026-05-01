@@ -355,6 +355,53 @@ def load_checkpoint(model, optimizer, resume_dir, device, random_weights=False):
     return step
 
 
+def load_hf_pretrained(model, hf_model_name, device):
+    """Load decoder weights from a HuggingFace pretrained Llama model.
+
+    Hyper-encoder and other zip2zip-specific parameters are left at their
+    current (randomly initialized) values.
+    """
+    from safetensors.torch import load_file
+    from huggingface_hub import snapshot_download
+
+    raw_model = _unwrap_model(model)
+    config = raw_model.zip2zip_config
+
+    # Download model files
+    if dist.get_rank() == 0:
+        cache_dir = snapshot_download(hf_model_name, allow_patterns=["*.safetensors", "*.json"])
+    else:
+        cache_dir = None
+    cache_dir_list = [cache_dir]
+    dist.broadcast_object_list(cache_dir_list, src=0)
+    cache_dir = cache_dir_list[0]
+
+    # Load all safetensor shards
+    import glob as _glob
+    shard_files = sorted(_glob.glob(os.path.join(cache_dir, "*.safetensors")))
+    hf_sd = {}
+    for f in shard_files:
+        hf_sd.update(load_file(f, device="cpu"))
+
+    # Convert HF keys to torchtitan keys using Llama3StateDictAdapter
+    from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
+    adapter = Llama3StateDictAdapter(config, None)
+    tt_sd = adapter.from_hf(hf_sd)
+
+    # Load with strict=False: hyper_encoder keys won't be in the checkpoint
+    missing, unexpected = raw_model.load_state_dict(tt_sd, strict=False)
+
+    if dist.get_rank() == 0:
+        hyper_missing = [k for k in missing if k.startswith("hyper_encoder") or k.startswith("token_type_head") or k.startswith("hyper_output")]
+        other_missing = [k for k in missing if k not in hyper_missing]
+        print(f"[init_from_hf] Loaded decoder weights from {hf_model_name}")
+        print(f"  Hyper-encoder params (randomly initialized): {len(hyper_missing)}")
+        if other_missing:
+            print(f"  ⚠️ Other missing keys: {other_missing}")
+        if unexpected:
+            print(f"  ⚠️ Unexpected keys: {unexpected}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True)
@@ -365,7 +412,7 @@ def main():
     parser.add_argument("--encoder_dim", type=int, default=None)
     parser.add_argument("--encoder_intermediate_size", type=int, default=None)
     parser.add_argument("--encoder_n_heads", type=int, default=None)
-    parser.add_argument("--hyper_encoder_type", type=str, default="flat", choices=["flat", "hierarchical"])
+    parser.add_argument("--hyper_encoder_type", type=str, default="flat", choices=["flat", "hierarchical", "fast_hierarchical"])
     parser.add_argument("--encoder_n_layers", type=int, default=None)
     parser.add_argument("--max_active_codebook_size", type=int, default=4096)
     parser.add_argument("--seq_len", type=int, default=4096)
@@ -396,6 +443,9 @@ def main():
     parser.add_argument("--reset_step", action="store_true",
                         help="After loading checkpoint weights, reset step to 0 (fresh LR schedule). "
                              "Useful for finetuning: warm-start weights but new cosine schedule.")
+    parser.add_argument("--init_from_hf", type=str, default=None,
+                        help="HuggingFace model name to initialize decoder weights from (e.g. meta-llama/Llama-3.2-1B). "
+                             "Hyper-encoder stays randomly initialized.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Global random seed for torch, cuda, and numpy")
     parser.add_argument("--push_to_hub", type=str, default=None,
@@ -427,6 +477,8 @@ def main():
                         help="Number of active profiling steps (after 3 warmup steps)")
     parser.add_argument("--disable_varlen", action="store_true",
                         help="Disable varlen attention in hyper-encoder (use padded path instead)")
+    parser.add_argument("--no_encoder_residual", action="store_true",
+                        help="Disable residual connection in hyper-encoder (ablation experiment)")
     args = parser.parse_args()
 
     if args.no_compile:
@@ -508,9 +560,15 @@ def main():
     model = config.build()
     if args.disable_varlen:
         model.hyper_encoder.disable_varlen = True
+    if args.no_encoder_residual:
+        model.encoder_residual = False
     with torch.no_grad():
         model.init_weights()
     model = model.to(device=device, dtype=torch.bfloat16)
+
+    # Load pretrained HF decoder weights if specified
+    if args.init_from_hf:
+        load_hf_pretrained(model, args.init_from_hf, device)
 
     param_count = sum(p.numel() for p in model.parameters())
     if rank == 0:
