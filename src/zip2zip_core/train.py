@@ -425,6 +425,8 @@ def main():
                         help="Run torch.profiler for the first 5 training steps (3 warmup + 2 active) and save a Chrome trace.")
     parser.add_argument("--profile_steps", type=int, default=5,
                         help="Number of active profiling steps (after 3 warmup steps)")
+    parser.add_argument("--disable_varlen", action="store_true",
+                        help="Disable varlen attention in hyper-encoder (use padded path instead)")
     args = parser.parse_args()
 
     if args.no_compile:
@@ -504,6 +506,8 @@ def main():
     config = dataclasses.replace(config, **replace_kwargs)
 
     model = config.build()
+    if args.disable_varlen:
+        model.hyper_encoder.disable_varlen = True
     with torch.no_grad():
         model.init_weights()
     model = model.to(device=device, dtype=torch.bfloat16)
@@ -855,6 +859,7 @@ def main():
         accum_hyper_ratio = 0.0
 
         for micro_step in range(args.gradient_accumulation_steps):
+          with torch.profiler.record_function("fwd+bwd"):
             input_dict, labels = next(data_iter)
 
             x = input_dict["input"].to(device)
@@ -867,6 +872,7 @@ def main():
             ctx = contextlib.nullcontext() if is_last else model.no_sync()
 
             with ctx:
+              with torch.profiler.record_function("fwd"):
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     output = model(x, codebook=cb, hyper_causal_mask=args.hyper_causal_mask)
                     if use_token_type_head:
@@ -875,12 +881,13 @@ def main():
                         logits = output
                 flat_logits = logits.flatten(0, 1).float()
                 flat_labels = labels.flatten(0, 1)
-                per_token_loss = F.cross_entropy(
-                    flat_logits,
-                    flat_labels,
-                    reduction="none",
-                    ignore_index=-100,
-                )
+                with torch.profiler.record_function("cross_entropy"):
+                    per_token_loss = F.cross_entropy(
+                        flat_logits,
+                        flat_labels,
+                        reduction="none",
+                        ignore_index=-100,
+                    )
                 valid_mask = flat_labels != -100
                 loss_sum = per_token_loss.sum()
                 backward_loss = loss_sum / valid_mask.sum()
@@ -897,6 +904,7 @@ def main():
                     )
                     backward_loss = backward_loss + args.token_type_loss_weight * type_loss
                 loss = backward_loss / args.gradient_accumulation_steps
+              with torch.profiler.record_function("bwd"):
                 loss.backward()
             accum_loss += backward_loss.item() / args.gradient_accumulation_steps
             accum_base_loss += base_token_loss.item() / args.gradient_accumulation_steps
@@ -1088,7 +1096,7 @@ def main():
     if profiler is not None:
         profiler.stop()
         if rank == 0:
-            labels = {"hyper_encoder", "Main LM", "hyper_logits", "lm_head", "cross_entropy"}
+            labels = {"fwd+bwd", "fwd", "bwd", "hyper_encoder", "Main LM", "hyper_lm_head", "lm_head", "cross_entropy"}
             sub_prefixes = ("layer_", "hyper_encoder.", "he.", "logit_cat")
 
             # Merge duplicate events (CPU vs CUDA rows share the same key)
@@ -1097,37 +1105,70 @@ def main():
                 if e.key in labels or e.key.startswith(sub_prefixes):
                     if e.key not in merged:
                         merged[e.key] = 0
-                    merged[e.key] += e.device_time_total
+                    merged[e.key] = max(merged[e.key], e.device_time_total)
+
+            # Divide by active steps to get per-step time
+            n_steps = args.profile_steps
+            for k in merged:
+                merged[k] /= n_steps
+            fwd_bwd = merged.get("fwd+bwd", 0)
+            fwd = merged.get("fwd", 0)
+            bwd_estimated = fwd_bwd - fwd
+            merged["bwd"] = bwd_estimated
 
             top_level = {k: v for k, v in merged.items() if k in labels}
             children = {k: v for k, v in merged.items() if k not in labels}
-            total_cuda = sum(top_level.values())
 
-            # Parent → child prefix mapping
+            fwd_time = top_level.get("fwd", 1)
+
+            # Parent → child mapping
+            fwd_children = ["hyper_encoder", "Main LM", "lm_head", "hyper_lm_head", "cross_entropy"]
             parent_children = {
                 "Main LM": "layer_",
                 "hyper_encoder": ("hyper_encoder.", "he."),
-                "cross_entropy": "logit_cat",
+                "hyper_lm_head": "logit_cat",
             }
 
+            def print_entry(name, value, indent=0, ref=None):
+                ref = ref or fwd_time
+                pct = value / ref * 100 if ref > 0 else 0
+                prefix = "  " * indent
+                print(f"{prefix}{name:<{40 - indent * 2}} {value / 1e3:>10.1f}ms {pct:>9.1f}%")
+
+            # Table 1: Overview
             print(f"\n{'Component':<40} {'CUDA total':>12} {'% of fwd':>10}")
             print("-" * 64)
-            for name in ["hyper_encoder", "Main LM", "lm_head", "hyper_logits", "cross_entropy"]:
-                if name not in top_level:
+            for name in ["fwd+bwd", "fwd", "bwd (est.)"]:
+                lookup = "bwd" if name == "bwd (est.)" else name
+                if lookup not in top_level:
                     continue
-                v = top_level[name]
-                pct = v / total_cuda * 100 if total_cuda > 0 else 0
-                print(f"{name:<40} {v / 1e3:>10.1f}ms {pct:>9.1f}%")
-                # Print children
-                prefixes = parent_children.get(name, None)
-                if prefixes:
+                print_entry(name, top_level[lookup])
+                if lookup == "fwd":
+                    for child_name in fwd_children:
+                        if child_name not in top_level:
+                            continue
+                        print_entry(child_name, top_level[child_name], indent=1)
+
+            # Table 2: Detailed breakdown
+            all_items = {**top_level, **children}
+            print(f"\n{'Detailed breakdown':<40} {'CUDA total':>12} {'% of parent':>10}")
+            print("-" * 64)
+            for child_name in fwd_children:
+                if child_name not in top_level:
+                    continue
+                parent_val = top_level[child_name]
+                print_entry(child_name, parent_val, ref=fwd_time)
+                gc_prefixes = parent_children.get(child_name, None)
+                if gc_prefixes:
+                    if isinstance(gc_prefixes, str):
+                        gc_prefixes = (gc_prefixes,)
                     kids = sorted(
-                        [(k, v) for k, v in children.items() if k.startswith(prefixes)],
+                        [(k, v) for k, v in all_items.items()
+                         if any(k.startswith(p) or k == p for p in gc_prefixes) and k != child_name],
                         key=lambda kv: kv[1], reverse=True,
                     )
                     for ck, cv in kids:
-                        cpct = cv / total_cuda * 100 if total_cuda > 0 else 0
-                        print(f"  {ck:<38} {cv / 1e3:>10.1f}ms {cpct:>9.1f}%")
+                        print_entry(ck, cv, indent=1, ref=parent_val)
     else:
         save_checkpoint(model, optimizer, step, args, args.output_dir, push_to_hub=args.push_to_hub)
 

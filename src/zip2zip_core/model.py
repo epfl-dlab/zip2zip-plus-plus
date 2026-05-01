@@ -207,7 +207,7 @@ class HyperEncoder(nn.Module):
             pos = torch.arange(S, device=token_embeddings.device)
             x = token_embeddings + self.pos_embed(pos)
 
-        if varlen_attn is not None:
+        if varlen_attn is not None and not getattr(self, 'disable_varlen', False):
             result = self._forward_varlen(x, mask, N, S, D)
             with torch.profiler.record_function("he.proj_out"):
                 if self.proj_out is not None:
@@ -753,7 +753,7 @@ class Zip2ZipLlama3Model(Decoder):
             # === Output logits ===
             base_logits = self.output(h)  # (B, T, vocab_size)
 
-        with torch.profiler.record_function("hyper_logits"):
+        with torch.profiler.record_function("hyper_lm_head"):
             if hyper_embeds is not None:
                 hyper_logits = torch.bmm(h, hyper_embeds.transpose(1, 2))  # (B, T, K)
 
@@ -781,7 +781,8 @@ class Zip2ZipLlama3Model(Decoder):
                         ~codebook_used.unsqueeze(1), float("-inf")
                     )
 
-                logits = torch.cat([base_logits, hyper_logits], dim=-1)
+                with torch.profiler.record_function("logit_cat"):
+                    logits = torch.cat([base_logits, hyper_logits], dim=-1)
             else:
                 logits = base_logits
 
