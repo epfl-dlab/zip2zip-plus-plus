@@ -191,13 +191,20 @@ def _count_target_bytes(labels, cb, vocab_size, pad_token_id, tokenizer):
     return total_bytes
 
 
+_hf_upload_thread = None
+
 def save_checkpoint(model, optimizer, step, args, output_dir, hf_repo=None):
     """Save model and optimizer state. Only rank 0 saves."""
+    global _hf_upload_thread
     rank = dist.get_rank()
     ckpt_dir = os.path.join(output_dir, f"step_{step}")
 
     dist.barrier()
     if rank == 0:
+        if _hf_upload_thread is not None and _hf_upload_thread.is_alive():
+            print(f"[Rank 0] Waiting for previous HF upload to finish ...")
+            _hf_upload_thread.join()
+
         os.makedirs(ckpt_dir, exist_ok=True)
         raw_model = _unwrap_model(model)
         torch.save(raw_model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
@@ -206,7 +213,14 @@ def save_checkpoint(model, optimizer, step, args, output_dir, hf_repo=None):
         print(f"[Rank 0] Saved checkpoint at step {step}")
 
         if hf_repo:
-            _push_checkpoint_to_hub(ckpt_dir, hf_repo, step)
+            import threading
+            _hf_upload_thread = threading.Thread(
+                target=_push_checkpoint_to_hub,
+                args=(ckpt_dir, hf_repo, step),
+                daemon=True,
+            )
+            _hf_upload_thread.start()
+            print(f"[Rank 0] HF upload started in background for step {step}")
     dist.barrier()
 
 
@@ -1156,7 +1170,7 @@ def main():
 
         # Save checkpoint
         if step % args.save_freq == 0:
-            save_checkpoint(model, optimizer, step, args, args.output_dir, hf_repo=args.hf_repo)
+            save_checkpoint(model, optimizer, step, args, args.output_dir)
 
         # Profiler step
         if profiler is not None:
