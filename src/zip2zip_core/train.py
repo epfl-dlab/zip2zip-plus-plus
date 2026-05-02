@@ -191,7 +191,7 @@ def _count_target_bytes(labels, cb, vocab_size, pad_token_id, tokenizer):
     return total_bytes
 
 
-def save_checkpoint(model, optimizer, step, args, output_dir, push_to_hub=None):
+def save_checkpoint(model, optimizer, step, args, output_dir, hf_repo=None):
     """Save model and optimizer state. Only rank 0 saves."""
     rank = dist.get_rank()
     ckpt_dir = os.path.join(output_dir, f"step_{step}")
@@ -205,8 +205,8 @@ def save_checkpoint(model, optimizer, step, args, output_dir, push_to_hub=None):
         torch.save({"step": step, "args": vars(args)}, os.path.join(ckpt_dir, "meta.pt"))
         print(f"[Rank 0] Saved checkpoint at step {step}")
 
-        if push_to_hub:
-            _push_checkpoint_to_hub(ckpt_dir, push_to_hub, step)
+        if hf_repo:
+            _push_checkpoint_to_hub(ckpt_dir, hf_repo, step)
     dist.barrier()
 
 
@@ -448,12 +448,16 @@ def main():
                              "Hyper-encoder stays randomly initialized.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Global random seed for torch, cuda, and numpy")
-    parser.add_argument("--push_to_hub", type=str, default=None,
-                        help="HuggingFace repo ID to push checkpoints to (e.g. user/model-name)")
+    parser.add_argument("--hf_repo", type=str, default=None,
+                        help="HuggingFace repo ID to push checkpoints to. "
+                             "Defaults to {HF_ORG}/{run_name} when --wandb is enabled.")
+    parser.add_argument("--no_hf_repo", action="store_true",
+                        help="Disable automatic push to HuggingFace Hub")
     parser.add_argument("--compile", action="store_true", default=True)
     parser.add_argument("--no_compile", action="store_true")
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
-    parser.add_argument("--wandb_project", type=str, default="zip2zip-core")
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_name", type=str, default=None)
     parser.add_argument("--wandb_group", type=str, default=None, help="wandb run group")
     parser.add_argument("--wandb_tags", type=str, nargs="*", default=None, help="wandb tags")
@@ -527,9 +531,16 @@ def main():
 
         if args.wandb:
             import wandb
+            from zip2zip_core.project import WANDB_ENTITY, WANDB_PROJECT, HF_ORG
+
+            if args.wandb_name and not args.wandb_id:
+                import uuid
+                uid = uuid.uuid4().hex[:4]
+                args.wandb_name = f"{args.wandb_name}_{uid}"
 
             wandb.init(
-                project=args.wandb_project,
+                entity=args.wandb_entity or WANDB_ENTITY,
+                project=args.wandb_project or WANDB_PROJECT,
                 name=args.wandb_name,
                 group=args.wandb_group,
                 tags=args.wandb_tags,
@@ -537,6 +548,11 @@ def main():
                 resume=args.wandb_resume,
                 config=vars(args),
             )
+
+            run_name = wandb.run.name
+            if not args.no_hf_repo and args.hf_repo is None:
+                args.hf_repo = f"{HF_ORG}/{run_name}"
+                print(f"[hf_repo] Auto-set to {args.hf_repo}")
 
     # Build model
     config = zip2zip_llama_configs[args.model_config]
@@ -1140,7 +1156,7 @@ def main():
 
         # Save checkpoint
         if step % args.save_freq == 0:
-            save_checkpoint(model, optimizer, step, args, args.output_dir, push_to_hub=args.push_to_hub)
+            save_checkpoint(model, optimizer, step, args, args.output_dir, hf_repo=args.hf_repo)
 
         # Profiler step
         if profiler is not None:
@@ -1228,7 +1244,7 @@ def main():
                     for ck, cv in kids:
                         print_entry(ck, cv, indent=1, ref=parent_val)
     else:
-        save_checkpoint(model, optimizer, step, args, args.output_dir, push_to_hub=args.push_to_hub)
+        save_checkpoint(model, optimizer, step, args, args.output_dir, hf_repo=args.hf_repo)
 
     if rank == 0:
         print("Training complete!")
