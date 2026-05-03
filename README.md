@@ -1,130 +1,53 @@
 # zip2zip-core
 
-Pretraining zip2zip language models with inference-time adaptive tokenization via LZW compression (hypertokens).
+Pretraining zip2zip language models (codename: **Llaza**) with inference-time adaptive tokenization via LZW compression (hypertokens).
 
-## Installation
 
-### Prerequisites
-
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/)
-- Rust toolchain (for building `zip2zip-compression`)
-
-### Setup
-
-Clone with submodules:
+## Quick Start
 
 ```bash
 git clone --recurse-submodules https://github.com/epfl-dlab/zip2zip-core.git
 cd zip2zip-core
-```
-
-Install everything (creates venv, builds zip2zip-compression from Rust, installs torchtitan from submodule):
-
-```bash
 uv sync
 ```
 
-For data preprocessing (tokenization), include the optional dependencies:
-
 ```bash
-uv sync --extra data
-```
+# Pre-tokenize
+uv run python scripts/pretokenize.py --output_dir /path/to/tokens
 
-## Usage
-
-### 1. Pre-tokenize data
-
-```bash
-uv run python scripts/pretokenize.py \
-    --output_dir /path/to/tokens \
-    --dataset HuggingFaceFW/fineweb \
-    --dataset_name sample-10BT
-```
-
-### 2. Train
-
-Local (single node):
-
-```bash
+# Train (single node, 4 GPUs)
 uv run torchrun --nproc_per_node=4 -m zip2zip_core.train \
     --data_dir /path/to/tokens \
     --output_dir /path/to/checkpoints \
-    --max_subtokens 2 \
-    --steps 6000
+    --max_subtokens 2 --wandb --wandb_name my-run
+
+# Evaluate
+python scripts/eval_harness.py --ckpt_dir /path/to/step_6000 --resume_wandb_id none
+
+# Push to HF Hub (auto-exports to zip2zip format)
+python scripts/push_checkpoint.py --ckpt_dir /path/to/step_6000 --repo_id epfl-dlab/Llaza-3.2-1B-v0.1
 ```
 
-SLURM (multi-node on CSCS Alps):
+## Llaza and zip2zip
 
-```bash
-sbatch scripts/train.sbatch
-```
+We have two codebases:
 
-Override training parameters via environment variables:
+- **[zip2zip-core](https://github.com/epfl-dlab/zip2zip-core)** (this repo) — pretraining and finetuning framework (torchtitan-based, distributed training, curriculum learning)
+- **[zip2zip](https://github.com/epfl-dlab/zip2zip)** — inference library (`pip install zip2zip`), HuggingFace-compatible API, lm-evaluation-harness integration
 
-```bash
-MAX_SUBTOKENS=3 STEPS=12000 RESUME_FROM=/path/to/step_6000 \
-    sbatch scripts/train.sbatch
-```
+Models trained here are exported to zip2zip format via `scripts/zip2zip_hf/export_to_zip2zip.py` (or automatically when using `scripts/push_checkpoint.py`).
 
-Enable [Weights & Biases](https://wandb.ai) logging:
+## Documentation
 
-```bash
-WANDB=1 WANDB_PROJECT=zip2zip-core WANDB_RUN_NAME=my-run \
-    sbatch scripts/train.sbatch
-```
-
-Set your API key in `scripts/train.sbatch` or export it before submitting:
-
-```bash
-export WANDB_API_KEY=<your-wandb-api-key>
-```
-
-### 3. Evaluation
-
-Evaluate a checkpoint on held-out data (no gradient, outputs loss/ppl/accuracy):
-
-```bash
-# Basic usage
-bash scripts/eval_lm.sh /path/to/checkpoint
-
-# Specify model config and max_subtokens
-bash scripts/eval_lm.sh /path/to/checkpoint 400M 2
-```
-
-Arguments: `<checkpoint_dir> [model_config=1B] [max_subtokens=4]`
-
-### 4. Curriculum training
-
-Run phases sequentially, resuming from the previous checkpoint:
-
-```bash
-# Phase 1: max_subtokens=2
-MAX_SUBTOKENS=2 STEPS=6000 sbatch scripts/train.sbatch
-
-# Phase 2: max_subtokens=3
-MAX_SUBTOKENS=3 STEPS=12000 RESUME_FROM=$SCRATCH/zip2zip-outputs/zip2zip-1b/step_6000 \
-    sbatch scripts/train.sbatch
-
-# Phase 3: max_subtokens=4
-MAX_SUBTOKENS=4 STEPS=19000 RESUME_FROM=$SCRATCH/zip2zip-outputs/zip2zip-1b/step_12000 \
-    sbatch scripts/train.sbatch
-```
-
-## Project structure
-
-```
-zip2zip-core/
-├── ext/
-│   ├── torchtitan/              # Git submodule (PyTorch training framework)
-│   └── zip2zip-compression/     # Git submodule (Rust LZW compression library)
-├── src/zip2zip_core/
-│   ├── model.py                 # Zip2ZipLlama3Model, HyperEncoder
-│   ├── configs.py               # Model configurations (debugmodel, 1B)
-│   ├── data.py                  # Dataset, collation, dataloader
-│   ├── parallelize.py           # FSDP parallelization strategy
-│   └── train.py                 # DDP training loop
-└── scripts/
-    ├── train.sbatch             # SLURM job script
-    └── pretokenize.py           # Data preprocessing
-```
+- [Installation](docs/installation.md) — prerequisites, setup, extras
+- [Data Pipeline](docs/data.md) — pre-tokenization, LZW compression, codebook remapping, training modes
+- [Pretraining](docs/pretraining.md) — single-node, multi-node SLURM, curriculum training, W&B logging
+- [Finetuning](docs/finetuning.md) — finetuning from pretrained Llama weights, `--init_from_hf`
+- [Evaluation](docs/evaluation.md) — lm-evaluation-harness, W&B integration
+- [Inference](docs/inference.md) — HF-based inference via `zip2zip`, torchtitan-based inference (in dev)
+- [Profiling](docs/profiling.md) — profiling training with `torch.profiler`
+- [Export & Interop](docs/export.md) — exporting to zip2zip HF format, state dict mapping, loading
+- [Workspace](docs/workspace.md) — W&B project, HuggingFace Hub, checkpoint management
+- [Project Structure](docs/structure.md) — codebase layout and module descriptions
+- [Model Inventory](docs/inventory.md) — trained models, checkpoints, datasets
+- [Roadmap](docs/roadmap.md) — planned features and next steps
