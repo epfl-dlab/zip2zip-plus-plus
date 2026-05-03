@@ -47,6 +47,7 @@ Models trained here are exported to zip2zip format via `scripts/zip2zip_hf/expor
 - [Inference](docs/inference.md) — HF-based inference via `zip2zip`, torchtitan-based inference (in dev)
 - [Profiling](docs/profiling.md) — profiling training with `torch.profiler`
 - [Export & Interop](docs/export.md) — exporting to zip2zip HF format, state dict mapping, loading
+- [Workflow](docs/workflow.md) — end-to-end: train → eval → publish to HF Hub
 - [Workspace](docs/workspace.md) — W&B project, HuggingFace Hub, checkpoint management
 - [Project Structure](docs/structure.md) — codebase layout and module descriptions
 - [Model Inventory](docs/inventory.md) — trained models, checkpoints, datasets
