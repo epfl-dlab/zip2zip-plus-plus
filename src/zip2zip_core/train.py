@@ -266,43 +266,12 @@ def _download_checkpoint_from_hf(repo_id, revision=None):
     return local_dir
 
 
+
+
 def _push_checkpoint_to_hub(ckpt_dir, repo_id, step):
     """Push a checkpoint directory to HuggingFace Hub."""
-    from huggingface_hub import HfApi
-
-    api = HfApi()
-    api.create_repo(repo_id, exist_ok=True)
-
-    revision = f"step_{step}"
-    try:
-        api.create_branch(repo_id, branch=revision)
-    except Exception:
-        pass  # branch already exists
-
-    api.upload_folder(
-        folder_path=ckpt_dir,
-        repo_id=repo_id,
-        path_in_repo=".",
-        revision=revision,
-        commit_message=f"Checkpoint at step {step}",
-    )
-    # Also update main branch with latest checkpoint
-    api.upload_folder(
-        folder_path=ckpt_dir,
-        repo_id=repo_id,
-        path_in_repo=".",
-        commit_message=f"Checkpoint at step {step}",
-    )
-    print(f"[Rank 0] Pushed checkpoint to {repo_id} (revision: {revision})")
-
-    try:
-        import wandb
-        if wandb.run is not None:
-            hf_url = f"https://huggingface.co/{repo_id}/tree/{revision}"
-            wandb.run.summary["hf_repo"] = repo_id
-            wandb.run.summary["hf_url"] = hf_url
-    except Exception:
-        pass
+    from zip2zip_core.hub import push_checkpoint
+    push_checkpoint(ckpt_dir, repo_id, step)
 
 
 def _clean_state_dict(model_state):

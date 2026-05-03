@@ -1,14 +1,7 @@
-"""Export a zip2zip-core checkpoint to ext/zip2zip format.
-
-Reads model.pt from a zip2zip-core checkpoint directory and writes:
-
-    <output_dir>/
-        zip2zip_config.json     # Zip2ZipConfig (ResLatentAttnConfig encoder)
-        model.safetensors       # HF Llama decoder weights
-        encoders.safetensors    # encoder weights (input_encoder.*)
+"""Export a zip2zip-core checkpoint to ext/zip2zip format (CLI wrapper).
 
 Usage:
-    python scripts/export_to_zip2zip.py \\
+    python scripts/zip2zip_hf/export_to_zip2zip.py \\
         --ckpt_dir /path/to/step_6000 \\
         --output_dir /path/to/export \\
         --base_model meta-llama/Llama-3.1-8B \\
@@ -18,115 +11,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 
-import torch
-
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(_ROOT, "src"))
 sys.path.insert(0, os.path.join(_ROOT, "ext", "torchtitan"))
 
+from zip2zip_core.export import export
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _infer_llama_heads(sd: dict) -> tuple[int, int]:
-    """Infer (n_heads, n_kv_heads) from wq/wk weight shapes."""
-    wq = sd["layers.0.attention.wq.weight"]  # (n_heads * head_dim, dim)
-    wk = sd["layers.0.attention.wk.weight"]  # (n_kv_heads * head_dim, dim)
-    dim = wq.shape[1]
-    # Try head_dim = 64 first (standard for ≤8B), then 128 (large models)
-    for head_dim in (64, 128):
-        if wq.shape[0] % head_dim == 0 and wk.shape[0] % head_dim == 0:
-            return wq.shape[0] // head_dim, wk.shape[0] // head_dim
-    raise ValueError(
-        f"Cannot infer n_heads from wq shape {wq.shape} — pass --model_config"
-    )
-
-
-def _infer_encoder_config(sd: dict) -> dict:
-    """Infer ResLatentAttnConfig fields from hyper_encoder.* weight shapes."""
-    prefix = "hyper_encoder."
-    he = {k[len(prefix):]: v for k, v in sd.items() if k.startswith(prefix)}
-
-    hidden_size = he["pos_embed.weight"].shape[1]
-    max_subtokens = he["pos_embed.weight"].shape[0]
-
-    model_hidden_size = None
-    if "proj_in.weight" in he:
-        model_hidden_size = he["proj_in.weight"].shape[1]
-
-    num_hidden_layers = sum(
-        1 for k in he if k.startswith("layers.") and k.endswith(".wq.weight")
-    )
-    intermediate_size = he["layers.0.w1.weight"].shape[0]
-
-    return dict(
-        hidden_size=hidden_size,
-        model_hidden_size=model_hidden_size,
-        num_hidden_layers=num_hidden_layers,
-        intermediate_size=intermediate_size,
-        max_subtokens=max_subtokens,
-    )
-
-
-def _split_state_dict(sd: dict) -> tuple[dict, dict]:
-    """Split into (decoder_sd, encoder_sd)."""
-    decoder, encoder = {}, {}
-    skip_prefixes = ("token_type_head.", "hyper_output.")
-    for k, v in sd.items():
-        if k.startswith("hyper_encoder."):
-            encoder[k[len("hyper_encoder."):]] = v
-        elif any(k.startswith(p) for p in skip_prefixes):
-            pass  # not used by ext/zip2zip
-        else:
-            decoder[k] = v
-    return decoder, encoder
-
-
-def _make_llama_config(model_config_name: str | None, sd: dict):
-    """Build a Llama3Model.Config for the state dict adapter."""
-    if model_config_name is not None:
-        from zip2zip_core.configs import zip2zip_llama_configs
-        return zip2zip_llama_configs[model_config_name]
-
-    # Auto-detect from state dict
-    from torchtitan.models.llama3.model import Llama3Model, TransformerBlock
-    from torchtitan.models.llama3 import llama3_configs
-
-    n_heads, n_kv_heads = _infer_llama_heads(sd)
-    dim = sd["tok_embeddings.weight"].shape[1]
-    n_layers = sum(1 for k in sd if k.startswith("layers.") and k.endswith(".attention.wq.weight"))
-    vocab_size = sd["tok_embeddings.weight"].shape[0]
-
-    # Find the closest stock config and patch it
-    for name, cfg in llama3_configs.items():
-        if cfg.dim == dim and cfg.n_layers == n_layers:
-            return cfg
-
-    # Fall back: build minimal config just for the adapter
-    cfg = llama3_configs["llama3-8b"]   # use as template
-    cfg = cfg.__class__(
-        dim=dim,
-        n_layers=n_layers,
-        n_heads=n_heads,
-        n_kv_heads=n_kv_heads,
-        vocab_size=vocab_size,
-        ffn_dim_multiplier=cfg.ffn_dim_multiplier,
-        multiple_of=cfg.multiple_of,
-        rope_theta=cfg.rope_theta,
-        norm_eps=cfg.norm_eps,
-        max_seq_len=cfg.max_seq_len,
-    )
-    return cfg
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -148,97 +41,17 @@ def main():
     p.add_argument("--causal", action="store_true", default=False)
     args = p.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # ---- Load checkpoint -----------------------------------------------
-    model_pt = os.path.join(args.ckpt_dir, "model.pt")
-    print(f"Loading {model_pt} ...")
-    sd = torch.load(model_pt, map_location="cpu", weights_only=True)
-
-    decoder_sd, encoder_sd = _split_state_dict(sd)
-    enc_info = _infer_encoder_config(sd)
-
-    vocab_size = sd["tok_embeddings.weight"].shape[0]
-    print(f"  vocab_size={vocab_size}, encoder hidden={enc_info['hidden_size']}, "
-          f"model_dim={enc_info['model_hidden_size']}, "
-          f"max_subtokens={enc_info['max_subtokens']}, "
-          f"n_layers={enc_info['num_hidden_layers']}")
-
-    # ---- Convert decoder weights to HF format --------------------------
-    print("Converting decoder weights to HF format ...")
-    llama_cfg = _make_llama_config(args.model_config, decoder_sd)
-    from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
-    adapter = Llama3StateDictAdapter(llama_cfg, None)
-    hf_decoder_sd = adapter.to_hf(decoder_sd)
-
-    # ---- Save model.safetensors ----------------------------------------
-    try:
-        from safetensors.torch import save_file
-    except ImportError:
-        raise ImportError("pip install safetensors")
-
-    model_out = os.path.join(args.output_dir, "model.safetensors")
-    print(f"Saving {model_out} ...")
-    # clone() breaks weight-tying between embed_tokens and lm_head so safetensors
-    # doesn't complain about shared memory (they map to separate tensors on disk)
-    save_file({k: v.contiguous().clone() for k, v in hf_decoder_sd.items()}, model_out)
-
-    # ---- Save encoders.safetensors -------------------------------------
-    encoders_out = os.path.join(args.output_dir, "encoders.safetensors")
-    print(f"Saving {encoders_out} ...")
-    # Wrap as input_encoder.*; tie_encoders=True so no output_encoder needed
-    enc_prefixed = {f"input_encoder.{k}": v.contiguous() for k, v in encoder_sd.items()}
-    save_file(enc_prefixed, encoders_out)
-
-    # ---- Build zip2zip_config.json -------------------------------------
-    n_heads = args.encoder_n_heads or (enc_info["hidden_size"] // 64)
-
-    if args.disabled_ids is not None:
-        disabled_ids = [int(x) for x in args.disabled_ids.split(",")]
-        initial_vocab_size = vocab_size
-    else:
-        print(f"Loading tokenizer from {args.base_model} to compute disabled_ids ...")
-        from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(args.base_model)
-        disabled_ids = list(tok.get_added_vocab().values())
-        initial_vocab_size = len(tok)
-        print(f"  initial_vocab_size={initial_vocab_size}, disabled_ids count={len(disabled_ids)}")
-        print(f"Saving tokenizer to {args.output_dir} ...")
-        tok.save_pretrained(args.output_dir)
-
-    config = {
-        "base_model_name_or_path": args.base_model,
-        "encoder_type": "res_latent_attn",
-        "encoder": {
-            "hidden_size": enc_info["hidden_size"],
-            "model_hidden_size": enc_info["model_hidden_size"],
-            "num_hidden_layers": enc_info["num_hidden_layers"],
-            "intermediate_size": enc_info["intermediate_size"],
-            "num_heads": n_heads,
-            "causal": args.causal,
-            "residual": args.residual,
-            "tie_encoders": True,
-            "position_encoding": None,
-        },
-        "compression": {
-            "initial_vocab_size": initial_vocab_size,
-            "max_codebook_size": args.max_codebook_size,
-            "max_subtokens": enc_info["max_subtokens"],
-            "disabled_ids": sorted(disabled_ids),
-        },
-    }
-
-    config_out = os.path.join(args.output_dir, "zip2zip_config.json")
-    print(f"Saving {config_out} ...")
-    with open(config_out, "w") as f:
-        json.dump(config, f, indent=2)
-
-    print("\nDone. Output:")
-    for fn in ("zip2zip_config.json", "model.safetensors", "encoders.safetensors"):
-        path = os.path.join(args.output_dir, fn)
-        size_mb = os.path.getsize(path) / 1e6
-        print(f"  {fn:30s} {size_mb:8.1f} MB")
-    print(f"\nLoad with:\n  Zip2ZipModel.from_pretrained('{args.output_dir}')")
+    export(
+        ckpt_dir=args.ckpt_dir,
+        output_dir=args.output_dir,
+        base_model=args.base_model,
+        model_config=args.model_config,
+        encoder_n_heads=args.encoder_n_heads,
+        max_codebook_size=args.max_codebook_size,
+        disabled_ids=[int(x) for x in args.disabled_ids.split(",")] if args.disabled_ids else None,
+        residual=args.residual,
+        causal=args.causal,
+    )
 
 
 if __name__ == "__main__":
