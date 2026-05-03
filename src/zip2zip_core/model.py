@@ -359,57 +359,35 @@ class HierarchicalHyperEncoder(nn.Module):
         )
 
     def forward(
-        self, token_embeddings: torch.Tensor, mask: torch.Tensor
-    ) -> torch.Tensor:
-        """Left-fold valid subtokens into a single composed embedding."""
-        num_entries = token_embeddings.shape[0]
-        lengths = mask.sum(dim=1).long()
-        outputs = torch.zeros(
-            num_entries,
-            self.model_dim,
-            dtype=token_embeddings.dtype,
-            device=token_embeddings.device,
-        )
-
-        # single_mask = lengths == 1
-        # if single_mask.any():
-        #     first_valid_idx = mask.long().argmax(dim=1)
-        #     outputs[single_mask] = token_embeddings[
-        #         single_mask, first_valid_idx[single_mask]
-        #     ]
-
-        active_indices = torch.nonzero(lengths >= 2, as_tuple=False).flatten()
-        if active_indices.numel() == 0:
-            return outputs
-
-        # Codebook entries are right-padded, so valid subtokens occupy a prefix.
-        states = self.pair_encoder(token_embeddings[active_indices, :2, :])
-        next_positions = torch.full_like(active_indices, 2)
-
-        while True:
-            still_active = next_positions < lengths[active_indices]
-            if not still_active.any():
-                break
-
-            current_indices = active_indices[still_active]
-            pair_inputs = torch.stack(
-                [
-                    states[still_active],
-                    token_embeddings[
-                        current_indices,
-                        next_positions[still_active],
-                    ],
-                ],
-                dim=1,
+            self, token_embeddings: torch.Tensor, mask: torch.Tensor
+        ) -> torch.Tensor:
+            """Left-fold valid subtokens into a single composed embedding."""
+            num_entries = token_embeddings.shape[0]
+            lengths = mask.sum(dim=1).long()
+            outputs = torch.zeros(
+                num_entries,
+                self.model_dim,
+                dtype=token_embeddings.dtype,
+                device=token_embeddings.device,
             )
-            updated_states = self.pair_encoder(pair_inputs)
-            states = states.clone()
-            states[still_active] = updated_states
-            next_positions = next_positions.clone()
-            next_positions[still_active] += 1
 
-        outputs[active_indices] = states
-        return outputs
+            active_indices = torch.nonzero(lengths >= 2, as_tuple=False).flatten()
+            if active_indices.numel() == 0:
+                return outputs
+
+            states = self.pair_encoder(token_embeddings[active_indices, :2, :])
+
+            for pos in range(2, self.max_subtokens):
+                still_active = (pos < lengths[active_indices]).unsqueeze(-1)
+                pair_inputs = torch.stack(
+                    [states, token_embeddings[active_indices, pos]],
+                    dim=1,
+                )
+                updated = self.pair_encoder(pair_inputs)
+                states = torch.where(still_active, updated, states)
+
+            outputs[active_indices] = states
+            return outputs
 
 
 class FastHierarchicalHyperEncoder(nn.Module):

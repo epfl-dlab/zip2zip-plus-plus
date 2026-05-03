@@ -438,6 +438,12 @@ def main():
     parser.add_argument("--init_from_hf", type=str, default=None,
                         help="HuggingFace model name to initialize decoder weights from (e.g. meta-llama/Llama-3.2-1B). "
                              "Hyper-encoder stays randomly initialized.")
+    parser.add_argument("--freeze_decoder", action="store_true",
+                        help="Freeze all decoder parameters, only train hyper-encoder.")
+    parser.add_argument("--lora_rank", type=int, default=None,
+                        help="Apply LoRA to decoder attention layers with this rank. Implies frozen base weights.")
+    parser.add_argument("--lora_alpha", type=float, default=1.0,
+                        help="LoRA alpha scaling factor.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Global random seed for torch, cuda, and numpy")
     parser.add_argument("--hf_repo", type=str, default=None,
@@ -468,9 +474,11 @@ def main():
     parser.add_argument("--eval", action="store_true",
                         help="Eval-only mode: load checkpoint, run --steps batches with no gradient, print stats.")
     parser.add_argument("--profile", action="store_true",
-                        help="Run torch.profiler for the first 5 training steps (3 warmup + 2 active) and save a Chrome trace.")
+                        help="Run torch.profiler for the first N training steps and save a Chrome trace.")
     parser.add_argument("--profile_steps", type=int, default=5,
-                        help="Number of active profiling steps (after 3 warmup steps)")
+                        help="Number of active profiling steps (after warmup)")
+    parser.add_argument("--profile_warmup", type=int, default=3,
+                        help="Number of profiler warmup steps before active profiling")
     parser.add_argument("--disable_varlen", action="store_true",
                         help="Disable varlen attention in hyper-encoder (use padded path instead)")
     parser.add_argument("--no_encoder_residual", action="store_true",
@@ -484,6 +492,7 @@ def main():
 
     # Initialize distributed
     dist.init_process_group("nccl")
+    wall_clock_start = time.time()
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -578,6 +587,23 @@ def main():
     if args.init_from_hf:
         load_hf_pretrained(model, args.init_from_hf, device)
 
+    # Freeze decoder / apply LoRA
+    if args.freeze_decoder or args.lora_rank:
+        for name, param in model.named_parameters():
+            if not name.startswith("hyper_encoder") and not name.startswith("hyper_output") and not name.startswith("token_type_head"):
+                param.requires_grad_(False)
+        if rank == 0:
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"[freeze_decoder] Decoder frozen. Trainable params: {trainable:,}")
+
+    if args.lora_rank:
+        from zip2zip_core.lora import apply_lora
+        lora_params = apply_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
+        model = model.to(device=device)
+        if rank == 0:
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"[lora] Applied LoRA (rank={args.lora_rank}, alpha={args.lora_alpha}), added {lora_params:,} params. Trainable: {trainable:,}")
+
     param_count = sum(p.numel() for p in model.parameters())
     if rank == 0:
         print(f"Model parameters: {param_count:,} ({param_count/1e9:.2f}B)")
@@ -594,7 +620,8 @@ def main():
 
     if not args.eval:
         # fp32 master weights: optimizer states stay in fp32, model stays in bf16
-        master_params = [p.detach().float().requires_grad_(True) for p in model.parameters()]
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        master_params = [p.detach().float().requires_grad_(True) for p in trainable_params]
 
         # Optimizer
         optimizer = torch.optim.AdamW(
@@ -886,7 +913,7 @@ def main():
             print(f"Profiling enabled: 3 warmup + {args.profile_steps} active steps → {profile_trace_dir}")
         profiler = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-            schedule=torch.profiler.schedule(wait=0, warmup=3, active=args.profile_steps, repeat=1),
+            schedule=torch.profiler.schedule(wait=0, warmup=args.profile_warmup, active=args.profile_steps, repeat=1),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(profile_trace_dir),
             record_shapes=True,
         )
@@ -1009,14 +1036,14 @@ def main():
                     accum_hyper_ratio += hyper_mask_cls.float().mean().item() / args.gradient_accumulation_steps
 
         # Copy bf16 grads → fp32 master params, clip, step, copy back
-        for mp, p in zip(master_params, model.parameters()):
+        for mp, p in zip(master_params, trainable_params):
             mp.grad = p.grad.float() if p.grad is not None else None
         grad_norm = torch.nn.utils.clip_grad_norm_(master_params, args.max_grad_norm)
 
         optimizer.step()
 
         with torch.no_grad():
-            for mp, p in zip(master_params, model.parameters()):
+            for mp, p in zip(master_params, trainable_params):
                 p.copy_(mp.to(p.dtype))
 
         log_loss += accum_loss
@@ -1153,7 +1180,7 @@ def main():
         # Profiler step
         if profiler is not None:
             profiler.step()
-            if step - start_step >= 3 + args.profile_steps:
+            if step - start_step >= args.profile_warmup + args.profile_steps:
                 if rank == 0:
                     print("Profiling complete — stopping early.")
                 break
@@ -1239,7 +1266,11 @@ def main():
         save_checkpoint(model, optimizer, step, args, args.output_dir, hf_repo=args.hf_repo)
 
     if rank == 0:
-        print("Training complete!")
+        torch.cuda.synchronize()
+        wall_clock_elapsed = time.time() - wall_clock_start
+        hours, rem = divmod(wall_clock_elapsed, 3600)
+        minutes, seconds = divmod(rem, 60)
+        print(f"Training complete! Wall time: {int(hours)}h {int(minutes)}m {seconds:.1f}s")
         if args.wandb:
             wandb.finish()
 

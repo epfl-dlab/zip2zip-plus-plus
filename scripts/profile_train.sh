@@ -31,11 +31,8 @@ torchrun --nproc_per_node=$NGPU -m zip2zip_core.train \
     --output_dir "$OUTPUT_DIR" \
     --model_config "$MODEL_CONFIG" \
     --max_subtokens "$MAX_SUBTOKENS" \
-    --no_compile \
-    --profile \
-    --profile_steps "$PROFILE_STEPS" \
     --local_batch_size 4 \
     --gradient_accumulation_steps 1 \
     --steps 100 \
     --log_freq 1 \
-    --save_freq 9999
+    --save_freq 9999 --hyper_encoder_type flat --no_remap_codebook --hyper_causal_mask --no_encoder_residual --encoder_dim 2048
