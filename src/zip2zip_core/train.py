@@ -295,6 +295,15 @@ def _push_checkpoint_to_hub(ckpt_dir, repo_id, step):
     )
     print(f"[Rank 0] Pushed checkpoint to {repo_id} (revision: {revision})")
 
+    try:
+        import wandb
+        if wandb.run is not None:
+            hf_url = f"https://huggingface.co/{repo_id}/tree/{revision}"
+            wandb.run.summary["hf_repo"] = repo_id
+            wandb.run.summary["hf_url"] = hf_url
+    except Exception:
+        pass
+
 
 def _clean_state_dict(model_state):
     """Strip FSDP wrapper prefixes for compatibility."""
@@ -565,7 +574,7 @@ def main():
 
             run_name = wandb.run.name
             if not args.no_hf_repo and args.hf_repo is None:
-                args.hf_repo = f"{HF_ORG}/{run_name}"
+                args.hf_repo = f"{HF_ORG}/candidate-{run_name}"
                 print(f"[hf_repo] Auto-set to {args.hf_repo}")
 
     # Build model

@@ -8,11 +8,11 @@ Usage:
     # Auto-detect format:
     python scripts/push_checkpoint.py \
         --ckpt_dir /mnt/scratch/checkpoints/ft/step_2000 \
-        --repo_id epfl-dlab/zip2zip-Llama-3.2-1B-preview
+        --repo_id epfl-dlab/Llaza-3.2-1B-v0.1
 
     python scripts/push_checkpoint.py \
-        --ckpt_dir /mnt/scratch/export/zip2zip_1b_step1908 \
-        --repo_id epfl-dlab/zip2zip-Llama-3.2-1B-preview \
+        --ckpt_dir /mnt/scratch/export/llaza_1b_step1908 \
+        --repo_id epfl-dlab/Llaza-3.2-1B-v0.1 \
         --step 1908
 """
 
@@ -26,7 +26,7 @@ def main():
     parser.add_argument("--ckpt_dir", type=str, required=True,
                         help="Path to checkpoint directory")
     parser.add_argument("--repo_id", type=str, required=True,
-                        help="HuggingFace repo ID (e.g. epfl-dlab/zip2zip-Llama-3.2-1B-preview)")
+                        help="HuggingFace repo ID (e.g. epfl-dlab/Llaza-3.2-1B-v0.1)")
     parser.add_argument("--step", type=int, default=None,
                         help="Step number. Default: extracted from ckpt_dir name (e.g. step_6000 -> 6000)")
     parser.add_argument("--branch", type=str, default=None,

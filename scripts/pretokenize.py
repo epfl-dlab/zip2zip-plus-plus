@@ -25,7 +25,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.1-8B")
-    parser.add_argument("--dataset", type=str, default="epfl-dlab/zip2zip-plus-mixture-20b")
+    parser.add_argument("--dataset", type=str, default="epfl-dlab/llaza-20B")
     parser.add_argument("--dataset_name", type=str, default=None)
     parser.add_argument("--dataset_split", type=str, default="train")
     parser.add_argument("--column", type=str, default="text")

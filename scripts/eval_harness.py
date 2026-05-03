@@ -13,7 +13,7 @@ Usage:
     python scripts/eval_harness.py --ckpt_dir /path/to/step_6000
     python scripts/eval_harness.py --ckpt_dir /path/to/step_6000 \\
         --tasks gsm8k,humaneval,mbpp,ifeval
-    python scripts/eval_harness.py --hf_repo user/zip2zip-1b --hf_revision step_6000
+    python scripts/eval_harness.py --hf_repo epfl-dlab/Llaza-3.2-1B-v0.1 --hf_revision step_6000
 
 The checkpoint's `meta.pt` is read to recover the model config, max_subtokens,
 max_codebook_size, and other architectural fields, so passing the right model
@@ -49,7 +49,7 @@ DEFAULT_MC_TASKS = [
 ]
 DEFAULT_PPL_TASKS_BUILTIN = ["wikitext"]
 DEFAULT_PPL_TASKS_CUSTOM = ["zip2zip_pile", "zip2zip_mc4", "zip2zip_dc4"]
-DEFAULT_TASKS = DEFAULT_MC_TASKS + DEFAULT_PPL_TASKS_BUILTIN + DEFAULT_PPL_TASKS_CUSTOM
+DEFAULT_TASKS = DEFAULT_MC_TASKS #+ DEFAULT_PPL_TASKS_BUILTIN + DEFAULT_PPL_TASKS_CUSTOM
 
 
 def _resolve_ckpt_dir(args: argparse.Namespace) -> str:
@@ -110,6 +110,15 @@ def main():
                         "Defaults to scripts/lm_eval_tasks/ next to this script.")
     p.add_argument("--output_path", default=None,
                    help="If set, write results JSON here.")
+    p.add_argument("--no_wandb", action="store_true", help="Disable W&B logging.")
+    p.add_argument("--wandb_project", default=None,
+                   help="W&B project name. Defaults to WANDB_PROJECT from project.py.")
+    p.add_argument("--wandb_name", default=None, help="W&B run name.")
+    p.add_argument("--resume_wandb_id", type=str, required=True,
+                   help="W&B run ID to log eval results into (e.g. '8d11iyds'). "
+                        "Pass 'none' to create a new run instead.")
+    p.add_argument("--no_log_samples", action="store_true",
+                   help="Disable logging per-sample results to W&B.")
     p.add_argument("--seed", type=int, default=1234)
     args = p.parse_args()
 
@@ -155,12 +164,56 @@ def main():
         numpy_random_seed=args.seed,
         torch_random_seed=args.seed,
         fewshot_random_seed=args.seed,
+        log_samples=not args.no_log_samples,
     )
 
     print("\n" + "=" * 72)
     print("Results:")
     print(json.dumps(results.get("results", results), indent=2, default=str))
     print("=" * 72)
+
+    if not args.no_wandb:
+        from zip2zip_core.project import WANDB_ENTITY, WANDB_PROJECT
+        from lm_eval.loggers import WandbLogger
+        import wandb
+
+        if args.wandb_name:
+            wandb_name = f"eval-{args.wandb_name}"
+        elif args.hf_repo:
+            repo_short = args.hf_repo.split("/")[-1]
+            rev = args.hf_revision or "main"
+            wandb_name = f"eval-{repo_short}-{rev}"
+        else:
+            ckpt_name = os.path.basename(os.path.normpath(ckpt_dir))
+            wandb_name = f"eval-{ckpt_name}"
+
+        resume_id = args.resume_wandb_id
+        if resume_id and resume_id.lower() != "none":
+            wandb.init(
+                entity=WANDB_ENTITY,
+                project=args.wandb_project or WANDB_PROJECT,
+                id=resume_id,
+                resume="must",
+                tags=["eval"],
+                config=vars(args),
+            )
+        else:
+            wandb.init(
+                entity=WANDB_ENTITY,
+                project=args.wandb_project or WANDB_PROJECT,
+                name=wandb_name,
+                job_type="eval",
+                tags=["eval"],
+                config=vars(args),
+            )
+        wandb_logger = WandbLogger()
+        if "versions" in results:
+            results["versions"] = {k: str(v) for k, v in results["versions"].items()}
+        wandb_logger.post_init(results)
+        wandb_logger.log_eval_result()
+        if not args.no_log_samples and "samples" in results:
+            wandb_logger.log_eval_samples(results["samples"])
+        print(f"[eval_harness] Results logged to W&B: {wandb_logger.run.url}")
 
     if args.output_path:
         out_dir = os.path.dirname(os.path.abspath(args.output_path))

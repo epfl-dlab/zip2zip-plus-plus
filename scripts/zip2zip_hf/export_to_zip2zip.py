@@ -202,8 +202,6 @@ def main():
         tok = AutoTokenizer.from_pretrained(args.base_model)
         disabled_ids = list(tok.get_added_vocab().values())
         initial_vocab_size = len(tok)
-        if len(tok) != len(tokenizer.vocab):
-            raise ValueError(f"Ambiguous tokenizer vocab size: {len(tok)} vs {len(tokenizer.vocab)}. "
         print(f"  initial_vocab_size={initial_vocab_size}, disabled_ids count={len(disabled_ids)}")
         print(f"Saving tokenizer to {args.output_dir} ...")
         tok.save_pretrained(args.output_dir)

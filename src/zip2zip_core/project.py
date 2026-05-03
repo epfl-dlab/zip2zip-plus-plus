@@ -1,3 +1,3 @@
 WANDB_ENTITY = "epfl-dlab"
-WANDB_PROJECT = "zip2zip"
+WANDB_PROJECT = "llaza"
 HF_ORG = "epfl-dlab"
