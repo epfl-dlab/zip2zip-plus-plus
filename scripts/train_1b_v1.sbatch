@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=z2z-1b-v1
 #SBATCH --partition=normal
-#SBATCH --nodes=4
+#SBATCH --nodes=8
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64
@@ -13,9 +13,13 @@
 set -euo pipefail
 
 # ---------- paths ----------
-export SCRATCH=/iopsstor/scratch/cscs/nathanrchn
+# Nathan defaults:
+# export SCRATCH=/iopsstor/scratch/cscs/nathanrchn
+# PROJECT_DIR=/capstor/scratch/cscs/nathanrchn/zip2zip-core
+# OUTPUT_DIR default: /users/nathanrchn/capstor_scratch/zip2zip-outputs/zip2zip-1b-v1
+export SCRATCH=/iopsstor/scratch/cscs/mxx
 export HF_HOME=$SCRATCH/.cache/huggingface
-PROJECT_DIR=/capstor/scratch/cscs/nathanrchn/zip2zip-core
+PROJECT_DIR=/capstor/scratch/cscs/mxx/zip2zip-core
 
 # Use the uv venv (has torch nightly with varlen_attn + all deps)
 export PYTHON=$PROJECT_DIR/.venv/bin/python
@@ -32,16 +36,18 @@ export WANDB_API_KEY=<your-wandb-api-key>
 # ---------- training config ----------
 # 1M total batch size: local_bs=8 * seq_len=4096 * 16 GPUs * grad_accum=2 = 1,048,576 tokens/step
 # 15B tokens / 1M = 15,000 steps
-DATA_DIR=${DATA_DIR:-$SCRATCH/zip2zip-data/fineweb-llama3-tokens}
-OUTPUT_DIR=${OUTPUT_DIR:-/users/nathanrchn/capstor_scratch/zip2zip-outputs/zip2zip-1b-v1}
+DATA_DIR=${DATA_DIR:-/capstor/scratch/cscs/mxx/zip2zip-data/llaza-20B-tokens}
+OUTPUT_DIR=${OUTPUT_DIR:-$SCRATCH/zip2zip-outputs/zip2zip-1b-v1}
 MAX_SUBTOKENS=${MAX_SUBTOKENS:-4}
 ENCODER_DIM=${ENCODER_DIM:-512}
 ENCODER_INTERMEDIATE_SIZE=${ENCODER_INTERMEDIATE_SIZE:-2048}
+HYPER_ENCODER_TYPE=${HYPER_ENCODER_TYPE:-flat}
 MAX_ACTIVE_CODEBOOK_SIZE=${MAX_ACTIVE_CODEBOOK_SIZE:-4096}
 STEPS=${STEPS:-20000}
+MAX_TOKENS=${MAX_TOKENS:-}
 SEQ_LEN=${SEQ_LEN:-4096}
-LOCAL_BATCH_SIZE=${LOCAL_BATCH_SIZE:-8}
-GRAD_ACCUM=${GRAD_ACCUM:-2}
+LOCAL_BATCH_SIZE=${LOCAL_BATCH_SIZE:-4}
+GRAD_ACCUM=${GRAD_ACCUM:-4}
 NUM_WORKERS=${NUM_WORKERS:-4}
 LR=${LR:-3e-4}
 MIN_LR=${MIN_LR:-3e-5}
@@ -77,6 +83,7 @@ export WORLD_SIZE=$((SLURM_NNODES * 4))
 echo "=== zip2zip-core 1B v1 training ==="
 echo "NODES=$SLURM_NNODES  WORLD_SIZE=$WORLD_SIZE  MAX_SUBTOKENS=$MAX_SUBTOKENS  MODE=$MODE  MODEL=$MODEL_CONFIG"
 echo "TOTAL_BATCH=1M tokens  LOCAL_BS=$LOCAL_BATCH_SIZE  GRAD_ACCUM=$GRAD_ACCUM  STEPS=$STEPS"
+echo "HYPER_ENCODER_TYPE=$HYPER_ENCODER_TYPE"
 echo "OUTPUT_DIR=$OUTPUT_DIR"
 
 RESUME_FLAG=""
@@ -103,6 +110,11 @@ if [ -n "$WANDB" ]; then
     fi
 fi
 
+MAX_TOKENS_FLAG=""
+if [ -n "$MAX_TOKENS" ]; then
+    MAX_TOKENS_FLAG="--max_tokens $MAX_TOKENS"
+fi
+
 srun --export=ALL bash -c '
 export LOCAL_RANK=$((SLURM_LOCALID))
 export RANK=$((SLURM_NODEID * 4 + SLURM_LOCALID))
@@ -115,8 +127,10 @@ export PYTHONUNBUFFERED=1
     --max_subtokens '"$MAX_SUBTOKENS"' \
     --encoder_dim '"$ENCODER_DIM"' \
     --encoder_intermediate_size '"$ENCODER_INTERMEDIATE_SIZE"' \
+    --hyper_encoder_type '"$HYPER_ENCODER_TYPE"' \
     --max_active_codebook_size '"$MAX_ACTIVE_CODEBOOK_SIZE"' \
     --steps '"$STEPS"' \
+    '"$MAX_TOKENS_FLAG"' \
     --seq_len '"$SEQ_LEN"' \
     --local_batch_size '"$LOCAL_BATCH_SIZE"' \
     --gradient_accumulation_steps '"$GRAD_ACCUM"' \

@@ -23,7 +23,7 @@ export PYTHON=$PROJECT_DIR/.venv/bin/python
 export WANDB_API_KEY=<your-wandb-api-key>
 
 # ---------- training config (override via environment) ----------
-DATA_DIR=${DATA_DIR:-$SCRATCH/zip2zip-data/fineweb-llama3-tokens}
+DATA_DIR=${DATA_DIR:-/capstor/scratch/cscs/mxx/zip2zip-data/llaza-20B-tokens}
 OUTPUT_DIR=${OUTPUT_DIR:-/users/nathanrchn/capstor_scratch/zip2zip-outputs}
 MAX_SUBTOKENS=${MAX_SUBTOKENS:-4}
 ENCODER_DIM=${ENCODER_DIM:-512}
