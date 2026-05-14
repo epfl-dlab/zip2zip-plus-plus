@@ -62,6 +62,7 @@ WANDB_RUN_NAME=${WANDB_RUN_NAME:-}
 MODE=${MODE:-lm}
 MODEL_CONFIG=${MODEL_CONFIG:-1B}
 TOKEN_TYPE_LOSS_WEIGHT=${TOKEN_TYPE_LOSS_WEIGHT:-0.0}
+NO_ENCODER_RESIDUAL=${NO_ENCODER_RESIDUAL:-}
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -113,6 +114,11 @@ if [ -n "$MAX_TOKENS" ]; then
     MAX_TOKENS_FLAG="--max_tokens $MAX_TOKENS"
 fi
 
+NO_ENCODER_RESIDUAL_FLAG=""
+if [ -n "$NO_ENCODER_RESIDUAL" ]; then
+    NO_ENCODER_RESIDUAL_FLAG="--no_encoder_residual"
+fi
+
 srun --export=ALL bash -c '
 export LOCAL_RANK=$((SLURM_LOCALID))
 export RANK=$((SLURM_NODEID * 4 + SLURM_LOCALID))
@@ -141,6 +147,7 @@ export PYTHONUNBUFFERED=1
     --mode '"$MODE"' \
     --token_type_loss_weight '"$TOKEN_TYPE_LOSS_WEIGHT"' \
     --no_remap_codebook --hyper_causal_mask \
+    '"$NO_ENCODER_RESIDUAL_FLAG"' \
     '"$RESUME_FLAG"' \
     '"$PUSH_FLAG"' \
     '"$WANDB_FLAG"'
