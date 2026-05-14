@@ -24,14 +24,12 @@ PROJECT_DIR=/capstor/scratch/cscs/mxx/zip2zip-core
 # Use the uv venv (has torch nightly with varlen_attn + all deps)
 export PYTHON=$PROJECT_DIR/.venv/bin/python
 
-export WANDB_API_KEY=<your-wandb-api-key>
-
+# export WANDB_API_KEY=<your-wandb-api-key>
 
 # 3 variants to run:
 # 1) no zip2zip, max_subtokens=1 (baseline)
 # 2) zip2zip, max_subtokens=4
 # 3) zip2zip nested merge, max_subtokens=4
-
 
 # ---------- training config ----------
 # 1M total batch size: local_bs=8 * seq_len=4096 * 16 GPUs * grad_accum=2 = 1,048,576 tokens/step

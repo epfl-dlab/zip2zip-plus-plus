@@ -20,7 +20,7 @@ PROJECT_DIR=/capstor/scratch/cscs/nathanrchn/zip2zip-core
 # Use the uv venv (has torch nightly with varlen_attn + all deps)
 export PYTHON=$PROJECT_DIR/.venv/bin/python
 
-export WANDB_API_KEY=<your-wandb-api-key>
+# export WANDB_API_KEY=<your-wandb-api-key>
 
 # ---------- training config (override via environment) ----------
 DATA_DIR=${DATA_DIR:-/capstor/scratch/cscs/mxx/zip2zip-data/llaza-20B-tokens}

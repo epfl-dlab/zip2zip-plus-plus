@@ -27,12 +27,6 @@ uv run torchrun --nproc_per_node=4 -m zip2zip_core.train \
 sbatch scripts/train.sbatch
 ```
 
-By default the SLURM training scripts expect pre-tokenized shards at:
-
-```bash
-/capstor/scratch/cscs/mxx/zip2zip-data/llaza-20B-tokens
-```
-
 Override training parameters via environment variables:
 
 ```bash
