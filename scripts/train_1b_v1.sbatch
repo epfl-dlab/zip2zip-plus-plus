@@ -34,7 +34,7 @@ export PYTHON=$PROJECT_DIR/.venv/bin/python
 # ---------- training config ----------
 # 1M total batch size: local_bs=8 * seq_len=4096 * 16 GPUs * grad_accum=2 = 1,048,576 tokens/step
 # 15B tokens / 1M = 15,000 steps
-DATA_DIR=${DATA_DIR:-/capstor/scratch/cscs/mxx/zip2zip-data/llaza-20B-tokens}
+DATA_DIR=${DATA_DIR:-/capstor/scratch/cscs/mxx/zip2zip-data/llaza-20B-tokens-128shards}
 OUTPUT_DIR=${OUTPUT_DIR:-$SCRATCH/zip2zip-outputs/zip2zip-1b-v1}
 MAX_SUBTOKENS=${MAX_SUBTOKENS:-4}
 ENCODER_DIM=${ENCODER_DIM:-512}
