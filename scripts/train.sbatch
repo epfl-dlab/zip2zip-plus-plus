@@ -20,10 +20,10 @@ PROJECT_DIR=/capstor/scratch/cscs/nathanrchn/zip2zip-core
 # Use the uv venv (has torch nightly with varlen_attn + all deps)
 export PYTHON=$PROJECT_DIR/.venv/bin/python
 
-export WANDB_API_KEY=<your-wandb-api-key>
+# export WANDB_API_KEY=<your-wandb-api-key>
 
 # ---------- training config (override via environment) ----------
-DATA_DIR=${DATA_DIR:-$SCRATCH/zip2zip-data/fineweb-llama3-tokens}
+DATA_DIR=${DATA_DIR:-/capstor/scratch/cscs/mxx/zip2zip-data/llaza-20B-tokens}
 OUTPUT_DIR=${OUTPUT_DIR:-/users/nathanrchn/capstor_scratch/zip2zip-outputs}
 MAX_SUBTOKENS=${MAX_SUBTOKENS:-4}
 ENCODER_DIM=${ENCODER_DIM:-512}
@@ -52,6 +52,7 @@ WANDB_RUN_NAME=${WANDB_RUN_NAME:-}
 MODE=${MODE:-lm}
 MODEL_CONFIG=${MODEL_CONFIG:-1B}
 TOKEN_TYPE_LOSS_WEIGHT=${TOKEN_TYPE_LOSS_WEIGHT:-0.0}
+NO_ENCODER_RESIDUAL=${NO_ENCODER_RESIDUAL:-}
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -107,6 +108,11 @@ if [ -n "$MAX_TOKENS" ]; then
     MAX_TOKENS_FLAG="--max_tokens $MAX_TOKENS"
 fi
 
+NO_ENCODER_RESIDUAL_FLAG=""
+if [ -n "$NO_ENCODER_RESIDUAL" ]; then
+    NO_ENCODER_RESIDUAL_FLAG="--no_encoder_residual"
+fi
+
 srun --export=ALL bash -c '
 export LOCAL_RANK=$((SLURM_LOCALID))
 export RANK=$((SLURM_NODEID * 4 + SLURM_LOCALID))
@@ -134,6 +140,7 @@ export PYTHONUNBUFFERED=1
     --log_freq '"$LOG_FREQ"' \
     --mode '"$MODE"' \
     --token_type_loss_weight '"$TOKEN_TYPE_LOSS_WEIGHT"' \
+    '"$NO_ENCODER_RESIDUAL_FLAG"' \
     '"$RESUME_FLAG"' \
     '"$RESET_STEP_FLAG"' \
     '"$PUSH_FLAG"' \

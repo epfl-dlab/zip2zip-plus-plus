@@ -4,9 +4,9 @@
 
 ```bash
 uv run python scripts/pretokenize.py \
-    --output_dir /path/to/tokens \
-    --dataset HuggingFaceFW/fineweb \
-    --dataset_name sample-10BT
+    --output_dir /path/to/llaza-20B-tokens \
+    --dataset epfl-dlab/llaza-20B \
+    --target_tokens 20e9
 ```
 
 Default dataset is `epfl-dlab/llaza-20B`. Outputs `.npy` shards (~1B tokens each) where all documents are concatenated into a continuous token stream with `<bos>`/`<eos>` boundaries.
@@ -33,6 +33,10 @@ Override training parameters via environment variables:
 MAX_SUBTOKENS=3 STEPS=12000 RESUME_FROM=/path/to/step_6000 \
     sbatch scripts/train.sbatch
 ```
+
+Use `scripts/train_1b_v1.sbatch` for the 1B v1 setup with 8 nodes,
+`MAX_ACTIVE_CODEBOOK_SIZE=4096`, `LOCAL_BATCH_SIZE=4`, `GRAD_ACCUM=4`,
+and the ablation flags `--no_remap_codebook --hyper_causal_mask`.
 
 ## W&B logging
 

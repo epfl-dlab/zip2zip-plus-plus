@@ -64,6 +64,12 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         )
         if not shard_files:
             raise ValueError(f"No .npy files in {data_dir}")
+        if world_size > len(shard_files):
+            raise ValueError(
+                f"world_size={world_size} exceeds available token shards={len(shard_files)} "
+                f"in {data_dir}. Each rank needs at least one shard with the current "
+                "rank::world_size partitioning."
+            )
 
         mask_files = [self._mask_path_for_shard(path) for path in shard_files]
         has_masks = [os.path.exists(path) for path in mask_files]
