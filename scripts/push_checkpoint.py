@@ -11,6 +11,13 @@ Usage:
         --ckpt_dir /mnt/scratch/checkpoints/ft/step_2000 \
         --repo_id epfl-dlab/Llaza-3.2-1B-v0.1
 
+    # Override auto-export metadata for scratch-trained checkpoints:
+    python scripts/push_checkpoint.py \
+        --ckpt_dir /mnt/scratch/checkpoints/ft/step_2000 \
+        --repo_id epfl-dlab/Llaza-3.2-1B-v0.1 \
+        --export_base_model meta-llama/Llama-3.2-1B \
+        --export_model_config 1B
+
     # Skip auto-export:
     python scripts/push_checkpoint.py \
         --ckpt_dir /mnt/scratch/checkpoints/ft/step_2000 \
@@ -43,6 +50,12 @@ def main():
                              "Default: auto-detected from directory contents.")
     parser.add_argument("--no_export", action="store_true",
                         help="Skip auto-export to HF format for training checkpoints.")
+    parser.add_argument("--export_base_model", type=str, default=None,
+                        help="Override base model used for auto-export when meta.pt has no 'init_from_hf' "
+                             "(e.g. meta-llama/Llama-3.2-1B).")
+    parser.add_argument("--export_model_config", type=str, default=None,
+                        help="Override model_config used for auto-export when meta.pt is missing or ambiguous "
+                             "(e.g. 1B, 1B_legacy, 3B).")
     args = parser.parse_args()
 
     ckpt_dir = os.path.abspath(args.ckpt_dir)
@@ -99,20 +112,29 @@ def main():
     if is_training and not args.no_export and args.branch != "hf":
         from zip2zip_core.export import export
 
-        base_model = train_args.get("init_from_hf")
+        base_model = args.export_base_model or train_args.get("init_from_hf")
+        model_config = args.export_model_config or train_args.get("model_config")
         if not base_model:
-            print("WARNING: meta.pt missing 'init_from_hf' — skipping auto-export.")
+            print(
+                "WARNING: meta.pt missing 'init_from_hf' and no --export_base_model was provided "
+                "— skipping auto-export."
+            )
             return
 
         with tempfile.TemporaryDirectory(prefix="zip2zip_export_") as export_dir:
             print(f"\n{'='*60}")
             print(f"Auto-exporting to HF format...")
             print(f"{'='*60}")
+            if args.export_base_model or args.export_model_config:
+                print(
+                    "Using export overrides: "
+                    f"base_model={base_model}, model_config={model_config}"
+                )
             export(
                 ckpt_dir=ckpt_dir,
                 output_dir=export_dir,
                 base_model=base_model,
-                model_config=train_args.get("model_config"),
+                model_config=model_config,
                 max_codebook_size=train_args.get("max_codebook_size", 4096),
                 causal=train_args.get("hyper_causal_mask", False),
             )

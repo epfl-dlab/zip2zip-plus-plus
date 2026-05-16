@@ -161,7 +161,7 @@ zip2zip_llama_configs = {
             scaling="llama",
         ),
     ),
-    "1B": Zip2ZipLlama3Model.Config(
+    "1B_legacy": Zip2ZipLlama3Model.Config(
         dim=2048,
         n_layers=16,
         vocab_size=128256,
@@ -193,7 +193,7 @@ zip2zip_llama_configs = {
         ),
     ),
     # ~1B params — matches official Llama 3.2 1B architecture
-    "1B_llama3.2": Zip2ZipLlama3Model.Config(
+    "1B": Zip2ZipLlama3Model.Config(
         dim=2048,
         n_layers=16,
         vocab_size=128256,
