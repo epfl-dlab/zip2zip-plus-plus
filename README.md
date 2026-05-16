@@ -26,6 +26,13 @@ python scripts/eval_harness.py --ckpt_dir /path/to/step_6000 --resume_wandb_id n
 
 # Push to HF Hub (auto-exports to zip2zip format)
 python scripts/push_checkpoint.py --ckpt_dir /path/to/step_6000 --repo_id epfl-dlab/Llaza-3.2-1B-v0.1
+
+# Scratch-trained checkpoints can override auto-export metadata:
+python scripts/push_checkpoint.py \
+  --ckpt_dir /path/to/step_6000 \
+  --repo_id epfl-dlab/Llaza-3.2-1B-v0.1 \
+  --export_base_model meta-llama/Llama-3.2-1B \
+  --export_model_config 1B
 ```
 
 ## Llaza and zip2zip
@@ -35,7 +42,7 @@ We have two codebases:
 - **[zip2zip-core](https://github.com/epfl-dlab/zip2zip-core)** (this repo) — pretraining and finetuning framework (torchtitan-based, distributed training, curriculum learning)
 - **[zip2zip](https://github.com/epfl-dlab/zip2zip)** — inference library (`pip install zip2zip`), HuggingFace-compatible API, lm-evaluation-harness integration
 
-Models trained here are exported to zip2zip format via `scripts/zip2zip_hf/export_to_zip2zip.py` (or automatically when using `scripts/push_checkpoint.py`).
+Models trained here are exported to zip2zip format via `scripts/zip2zip_hf/export_to_zip2zip.py` (or automatically when using `scripts/push_checkpoint.py`, including scratch-trained checkpoints when `--export_base_model` and `--export_model_config` are provided).
 
 ## Documentation
 

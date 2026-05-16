@@ -44,6 +44,16 @@ What happens:
 
 Skip auto-export with `--no_export` if you only want the training checkpoint.
 
+If the checkpoint was trained from scratch and `meta.pt` has no `init_from_hf`, you can still keep the one-command flow by overriding the export metadata:
+
+```bash
+python scripts/push_checkpoint.py \
+    --ckpt_dir /path/to/checkpoints/step_6000 \
+    --repo_id epfl-dlab/Llaza-3.2-1B-MS2-v0.1 \
+    --export_base_model meta-llama/Llama-3.2-1B \
+    --export_model_config 1B
+```
+
 ## 4. Verify
 
 ```python

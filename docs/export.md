@@ -28,6 +28,18 @@ python scripts/push_checkpoint.py \
 
 This pushes the training checkpoint to `main` and the exported HF format to `hf`. Use `--no_export` to skip auto-export.
 
+For scratch-trained checkpoints where `meta.pt` does not contain `init_from_hf`, provide explicit export overrides:
+
+```bash
+python scripts/push_checkpoint.py \
+    --ckpt_dir /path/to/step_6000 \
+    --repo_id epfl-dlab/Llaza-3.2-1B-v0.1 \
+    --export_base_model meta-llama/Llama-3.2-1B \
+    --export_model_config 1B
+```
+
+This keeps the one-command workflow while avoiding a manual temporary export directory.
+
 ### Manual export
 
 ```bash
