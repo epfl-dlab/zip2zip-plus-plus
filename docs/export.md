@@ -133,6 +133,8 @@ The config describes the encoder architecture and compression settings:
 
 Encoder parameters are inferred from weight shapes. If `--base_model` is provided and no explicit `--disabled_ids`, the tokenizer is loaded to compute disabled IDs (all added/special tokens).
 
+Important: `encoder.causal` is the hyper-encoder architecture mode (bidirectional vs causal pooling), and is **not** the same as the training flag `hyper_causal_mask` (training-time logit masking only).
+
 ## Output files
 
 ```
