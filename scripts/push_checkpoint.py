@@ -136,7 +136,12 @@ def main():
                 base_model=base_model,
                 model_config=model_config,
                 max_codebook_size=train_args.get("max_codebook_size", 4096),
-                causal=train_args.get("hyper_causal_mask", False),
+                # NOTE:
+                # `hyper_causal_mask` controls training-time logit masking only.
+                # It is NOT the hyper-encoder architecture flag.
+                # Export causal encoder mode only when explicitly present.
+                causal=train_args.get("encoder_causal", False),
+                residual=not train_args.get("no_encoder_residual", False),
             )
             write_model_card(os.path.join(export_dir, "README.md"), args.repo_id, step, train_args)
             upload_folder(args.repo_id, export_dir, branch="hf", step=step,
