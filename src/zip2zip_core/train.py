@@ -193,6 +193,13 @@ def _count_target_bytes(labels, cb, vocab_size, pad_token_id, tokenizer):
 
 _hf_upload_thread = None
 
+
+def _debug_rank_log(enabled: bool, rank: int, step: int, micro_step: int, message: str):
+    """Emit a flushed per-rank debug log line for early-step hang diagnosis."""
+    if enabled:
+        now = time.strftime("%H:%M:%S")
+        print(f"[debug {now}] [rank{rank}] [step {step}] [micro {micro_step}] {message}", flush=True)
+
 def save_checkpoint(model, optimizer, step, args, output_dir, hf_repo=None):
     """Save model and optimizer state. Only rank 0 saves."""
     global _hf_upload_thread
@@ -420,6 +427,10 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--min_lr", type=float, default=3e-5)
+    parser.add_argument("--hyper_lr", type=float, default=None,
+                        help="LR for hyper_encoder (random init). Defaults to --lr if not set.")
+    parser.add_argument("--min_hyper_lr", type=float, default=None,
+                        help="Min LR for hyper_encoder cosine schedule. Defaults to --min_lr if not set.")
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--log_freq", type=int, default=10)
@@ -483,12 +494,19 @@ def main():
                         help="Disable varlen attention in hyper-encoder (use padded path instead)")
     parser.add_argument("--no_encoder_residual", action="store_true",
                         help="Disable residual connection in hyper-encoder (ablation experiment)")
+    parser.add_argument("--debug_first_steps", type=int, default=0,
+                        help="Print per-rank progress markers for the first N training steps. "
+                             "Useful for diagnosing hangs before step 1 logging.")
     args = parser.parse_args()
 
     if args.no_compile:
         args.compile = False
     if args.stop_at is None:
         args.stop_at = args.steps
+    if args.hyper_lr is None:
+        args.hyper_lr = args.lr
+    if args.min_hyper_lr is None:
+        args.min_hyper_lr = args.min_lr
 
     # Initialize distributed
     dist.init_process_group("nccl")
@@ -620,13 +638,33 @@ def main():
 
     if not args.eval:
         # fp32 master weights: optimizer states stay in fp32, model stays in bf16
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        master_params = [p.detach().float().requires_grad_(True) for p in trainable_params]
+        # Split into decoder params and hyper_encoder params for differential LR.
+        # (hyper_encoder is randomly initialized and benefits from a higher LR.)
+        hyper_trainable = []
+        decoder_trainable = []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "hyper_encoder" in n or "hyper_output" in n or "token_type_head" in n:
+                hyper_trainable.append(p)
+            else:
+                decoder_trainable.append(p)
+        # Keep a flat list in the same order for grad/weight copy later
+        trainable_params = decoder_trainable + hyper_trainable
+        master_decoder = [p.detach().float().requires_grad_(True) for p in decoder_trainable]
+        master_hyper   = [p.detach().float().requires_grad_(True) for p in hyper_trainable]
+        master_params  = master_decoder + master_hyper
 
-        # Optimizer
+        if rank == 0:
+            print(f"Optimizer param groups: decoder={len(decoder_trainable)} params "
+                  f"(lr={args.lr:.2e}), hyper={len(hyper_trainable)} params "
+                  f"(lr={args.hyper_lr:.2e})")
+
         optimizer = torch.optim.AdamW(
-            master_params,
-            lr=args.lr,
+            [
+                {"params": master_decoder, "lr": args.lr},
+                {"params": master_hyper,   "lr": args.hyper_lr},
+            ],
             betas=(0.9, 0.95),
             weight_decay=args.weight_decay,
         )
@@ -670,6 +708,7 @@ def main():
         num_workers=args.num_workers,
         mode=args.mode,
         remap_codebook=not args.no_remap_codebook,
+        debug_samples=max(0, args.debug_first_steps * max(1, args.gradient_accumulation_steps)),
     )
 
     use_token_type_head = args.token_type_loss_weight > 0
@@ -931,10 +970,11 @@ def main():
 
         step += 1
 
-        # Set learning rate
-        lr = get_lr(step, args.warmup_steps, schedule_total_steps, args.lr, args.min_lr)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
+        # Set learning rate (differential: decoder vs hyper_encoder)
+        lr       = get_lr(step, args.warmup_steps, schedule_total_steps, args.lr,       args.min_lr)
+        hyper_lr = get_lr(step, args.warmup_steps, schedule_total_steps, args.hyper_lr, args.min_hyper_lr)
+        optimizer.param_groups[0]["lr"] = lr
+        optimizer.param_groups[1]["lr"] = hyper_lr
 
         optimizer.zero_grad()
         model.zero_grad()
@@ -952,13 +992,30 @@ def main():
         accum_hyper_ratio = 0.0
 
         for micro_step in range(args.gradient_accumulation_steps):
+          debug_enabled = step <= args.debug_first_steps
           with torch.profiler.record_function("fwd+bwd"):
+            _debug_rank_log(debug_enabled, rank, step, micro_step, "before next(data_iter)")
             input_dict, labels = next(data_iter)
+            _debug_rank_log(
+                debug_enabled,
+                rank,
+                step,
+                micro_step,
+                f"after next(data_iter) input={tuple(input_dict['input'].shape)} "
+                f"codebook={tuple(input_dict['codebook'].shape)} labels={tuple(labels.shape)}",
+            )
 
             x = input_dict["input"].to(device)
             cb = input_dict["codebook"].to(device)
             n_base_tokens = input_dict["n_base_tokens"].to(device)
             labels = labels.to(device)
+            _debug_rank_log(
+                debug_enabled,
+                rank,
+                step,
+                micro_step,
+                f"after to(device) n_base_tokens_sum={int(n_base_tokens.sum().item())}",
+            )
 
             # Only sync gradients on last micro-step
             is_last = micro_step == args.gradient_accumulation_steps - 1
@@ -966,21 +1023,25 @@ def main():
 
             with ctx:
               with torch.profiler.record_function("fwd"):
+                _debug_rank_log(debug_enabled, rank, step, micro_step, "before model forward")
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     output = model(x, codebook=cb, hyper_causal_mask=args.hyper_causal_mask)
                     if use_token_type_head:
                         logits, token_type_logits = output
                     else:
                         logits = output
+                _debug_rank_log(debug_enabled, rank, step, micro_step, f"after model forward logits={tuple(logits.shape)}")
                 flat_logits = logits.flatten(0, 1).float()
                 flat_labels = labels.flatten(0, 1)
                 with torch.profiler.record_function("cross_entropy"):
+                    _debug_rank_log(debug_enabled, rank, step, micro_step, "before cross_entropy")
                     per_token_loss = F.cross_entropy(
                         flat_logits,
                         flat_labels,
                         reduction="none",
                         ignore_index=-100,
                     )
+                _debug_rank_log(debug_enabled, rank, step, micro_step, "after cross_entropy")
                 valid_mask = flat_labels != -100
                 loss_sum = per_token_loss.sum()
                 backward_loss = loss_sum / valid_mask.sum()
@@ -998,7 +1059,9 @@ def main():
                     backward_loss = backward_loss + args.token_type_loss_weight * type_loss
                 loss = backward_loss / args.gradient_accumulation_steps
               with torch.profiler.record_function("bwd"):
+                _debug_rank_log(debug_enabled, rank, step, micro_step, "before backward")
                 loss.backward()
+                _debug_rank_log(debug_enabled, rank, step, micro_step, "after backward")
             accum_loss += backward_loss.item() / args.gradient_accumulation_steps
             accum_base_loss += base_token_loss.item() / args.gradient_accumulation_steps
             accum_compression += (n_base_tokens.float().sum() / (valid_mask.sum())).item() / args.gradient_accumulation_steps
@@ -1036,15 +1099,22 @@ def main():
                     accum_hyper_ratio += hyper_mask_cls.float().mean().item() / args.gradient_accumulation_steps
 
         # Copy bf16 grads → fp32 master params, clip, step, copy back
+        debug_enabled = step <= args.debug_first_steps
+        _debug_rank_log(debug_enabled, rank, step, -1, "before master grad copy")
         for mp, p in zip(master_params, trainable_params):
             mp.grad = p.grad.float() if p.grad is not None else None
+        _debug_rank_log(debug_enabled, rank, step, -1, "after master grad copy")
         grad_norm = torch.nn.utils.clip_grad_norm_(master_params, args.max_grad_norm)
+        _debug_rank_log(debug_enabled, rank, step, -1, f"after grad clip grad_norm={float(grad_norm):.4f}")
 
+        _debug_rank_log(debug_enabled, rank, step, -1, "before optimizer.step")
         optimizer.step()
+        _debug_rank_log(debug_enabled, rank, step, -1, "after optimizer.step")
 
         with torch.no_grad():
             for mp, p in zip(master_params, trainable_params):
                 p.copy_(mp.to(p.dtype))
+        _debug_rank_log(debug_enabled, rank, step, -1, "after master->model copy")
 
         log_loss += accum_loss
         log_base_loss += accum_base_loss
@@ -1081,6 +1151,7 @@ def main():
             base_token_acc_tensor = torch.tensor(avg_base_token_acc, device=device)
             hyper_token_acc_tensor = torch.tensor(avg_hyper_token_acc, device=device)
             relaxed_acc_tensor = torch.tensor(avg_relaxed_acc, device=device)
+            _debug_rank_log(debug_enabled, rank, step, -1, "before metric all_reduce")
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
             dist.all_reduce(base_loss_tensor, op=dist.ReduceOp.AVG)
             dist.all_reduce(compression_tensor, op=dist.ReduceOp.AVG)
@@ -1088,6 +1159,7 @@ def main():
             dist.all_reduce(base_token_acc_tensor, op=dist.ReduceOp.AVG)
             dist.all_reduce(hyper_token_acc_tensor, op=dist.ReduceOp.AVG)
             dist.all_reduce(relaxed_acc_tensor, op=dist.ReduceOp.AVG)
+            _debug_rank_log(debug_enabled, rank, step, -1, "after metric all_reduce")
 
             if use_token_type_head:
                 avg_type_loss = log_type_loss / args.log_freq
@@ -1126,8 +1198,9 @@ def main():
                         f"base_acc={base_type_acc_tensor.item():.4f} | hyper_acc={hyper_type_acc_tensor.item():.4f} | "
                         f"hyper_ratio={hyper_ratio_tensor.item():.4f} | "
                     )
+                hyper_lr_suffix = f" | hyper_lr={hyper_lr:.2e}" if hyper_lr != lr else ""
                 log_msg += (
-                    f"lr={lr:.2e} | grad_norm={grad_norm:.4f} | "
+                    f"lr={lr:.2e}{hyper_lr_suffix} | grad_norm={grad_norm:.4f} | "
                     f"avg_step_time={avg_step_time:.2f}s | "
                     f"tok/s={tokens_per_sec:.0f} | "
                     f"tokens={total_tokens_seen/1e9:.2f}B"
@@ -1145,6 +1218,7 @@ def main():
                         "backward_loss": loss_tensor.item(),
                         "compression": compression_tensor.item(),
                         "lr": lr,
+                        "hyper_lr": hyper_lr,
                         "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
                         "avg_step_time": avg_step_time,
                         "tokens_per_sec": tokens_per_sec,

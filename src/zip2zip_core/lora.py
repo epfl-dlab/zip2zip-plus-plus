@@ -47,7 +47,10 @@ def apply_lora(model: nn.Module, rank: int, alpha: float = 1.0, target_modules: 
         Number of LoRA parameters added.
     """
     if target_modules is None:
-        target_modules = ["attention.wq", "attention.wk", "attention.wv", "attention.wo"]
+        target_modules = [
+            "attention.wq", "attention.wk", "attention.wv", "attention.wo",
+            "feed_forward.w1", "feed_forward.w2", "feed_forward.w3",
+        ]
 
     lora_params = 0
     for layer in model.layers.values():
