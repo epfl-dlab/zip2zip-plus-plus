@@ -6,34 +6,48 @@ Usage:
 """
 
 import argparse
+import json
 
 import torch
+from huggingface_hub import hf_hub_download
 from transformers import AutoModelForCausalLM
 from zip2zip.model import Zip2ZipModel
 from zip2zip.tokenizer import Zip2ZipTokenizer
 
+def resolve_base_model_name(repo: str, revision: str, cli_base_model: str | None) -> str:
+    if cli_base_model:
+        return str(cli_base_model)
+    cfg_path = hf_hub_download(repo_id=repo, filename="zip2zip_config.json", revision=revision)
+    with open(cfg_path, "r", encoding="utf-8") as file:
+        cfg = json.load(file)
+    return str(cfg["base_model_name_or_path"])
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--repo", type=str, default="epfl-dlab/candidate-Llaza-3.2-1B-MS3F-4K-FT-1BT-v0.1")
-    p.add_argument("--base_model", type=str, default="meta-llama/Llama-3.2-1B")
+    p.add_argument("--base_model", type=str, default=None, help="Optional override; defaults to the repo's zip2zip_config base model")
+    p.add_argument("--revision", type=str, default="hf")
     p.add_argument("--prompt", type=str, default="Please write a MultiHeadAttention layer in PyTorch.")
     p.add_argument("--max_new_tokens", type=int, default=128)
     args = p.parse_args()
 
+    resolved_base_model = resolve_base_model_name(args.repo, args.revision, args.base_model)
+
     # Load base model without revision (base_model repo doesn't have an "hf" branch)
     base_model = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
+        resolved_base_model,
         torch_dtype=torch.bfloat16,
     )
 
     model = Zip2ZipModel.from_pretrained(
         args.repo,
-        revision="hf",
+        revision=args.revision,
         base_model=base_model,
         dtype=torch.bfloat16,
     ).to("cuda").eval()
 
-    tokenizer = Zip2ZipTokenizer.from_pretrained(args.repo, revision="hf")
+    tokenizer = Zip2ZipTokenizer.from_pretrained(args.repo, revision=args.revision)
 
     inputs = tokenizer([args.prompt], return_tensors="pt", padding="longest").to(model.device)
 
