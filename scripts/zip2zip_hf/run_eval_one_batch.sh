@@ -26,6 +26,7 @@ REVISION="${REVISION:-hf}"
 OVERWRITE="${OVERWRITE:-1}"
 SKIP_GPT2="${SKIP_GPT2:-0}"
 DO_SAMPLE="${DO_SAMPLE:-1}"
+INSTRUCT="${INSTRUCT:-0}"
 GPT2_DEVICE="${GPT2_DEVICE:-cpu}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
@@ -54,6 +55,9 @@ if [[ "${SKIP_GPT2}" == "1" ]]; then
 fi
 if [[ "${DO_SAMPLE}" == "1" ]]; then
   ARGS+=(--do-sample)
+fi
+if [[ "${INSTRUCT}" == "1" ]]; then
+  ARGS+=(--instruct)
 fi
 
 echo "[run] repo=${REPO} gpu=${GPU} batch_size=${BATCH_SIZE} limit=${LIMIT} question_file=${QUESTION_FILE}"

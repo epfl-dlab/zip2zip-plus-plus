@@ -33,6 +33,7 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
 DO_SAMPLE="${DO_SAMPLE:-1}"
 OVERWRITE="${OVERWRITE:-1}"
 SKIP_GPT2="${SKIP_GPT2:-0}"
+INSTRUCT="${INSTRUCT:-0}"
 GPT2_DEVICE="${GPT2_DEVICE:-cpu}"
 GPUS="${GPUS:-0}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -84,6 +85,9 @@ if [[ "${OVERWRITE}" == "1" ]]; then
 fi
 if [[ "${SKIP_GPT2}" == "1" ]]; then
   COMMON_ARGS+=(--skip-gpt2)
+fi
+if [[ "${INSTRUCT}" == "1" ]]; then
+  COMMON_ARGS+=(--instruct)
 fi
 
 repo_index=0

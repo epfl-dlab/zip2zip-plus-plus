@@ -1262,7 +1262,17 @@ def generate_command(args) -> int:
 
         for batch_start in range(0, len(questions), args.batch_size):
             batch = questions[batch_start : batch_start + args.batch_size]
-            prompts = [row["prompt"] for row in batch]
+            if args.instruct:
+                prompts = [
+                    zip_tokenizer.apply_chat_template(
+                        [{"role": "user", "content": row["prompt"]}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                    for row in batch
+                ]
+            else:
+                prompts = [row["prompt"] for row in batch]
             if hasattr(model, "codebook_manager"):
                 model.codebook_manager.reset()
             inputs = zip_tokenizer(prompts, return_tensors="pt", padding="longest").to(model.device)
@@ -1293,7 +1303,7 @@ def generate_command(args) -> int:
                 response, prompt_base_ids, continuation_base_ids, lzw_prefix_match = decode_continuation_from_lzw_output(
                     output_ids=[int(token_id) for token_id in output_ids[index]],
                     prompt_zip_ids=prompt_zip_ids,
-                    prompt=row["prompt"],
+                    prompt=prompts[index],
                     decoded_text=decoded[index],
                     tokenizer=zip_tokenizer,
                 )
@@ -1462,6 +1472,7 @@ def add_generate_args(subparsers) -> None:
     parser.add_argument("--repetition-rate-threshold", type=float, default=0.3)
     parser.add_argument("--repetition-count-threshold", type=int, default=8)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--instruct", action="store_true", help="Apply chat template before tokenization (for instruct/chat models)")
     parser.set_defaults(func=generate_command)
 
 
