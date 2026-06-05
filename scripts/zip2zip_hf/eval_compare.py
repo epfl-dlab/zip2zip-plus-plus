@@ -1275,7 +1275,16 @@ def generate_command(args) -> int:
                 prompts = [row["prompt"] for row in batch]
             if hasattr(model, "codebook_manager"):
                 model.codebook_manager.reset()
-            inputs = zip_tokenizer(prompts, return_tensors="pt", padding="longest").to(model.device)
+            # In instruct mode the chat template already emits <|begin_of_text|>, so letting
+            # the tokenizer add special tokens again would produce a double BOS (training used
+            # a single BOS). For non-instruct/plain-text prompts we still want the tokenizer to
+            # add the single BOS, matching the from-scratch/base training setup.
+            inputs = zip_tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding="longest",
+                add_special_tokens=not args.instruct,
+            ).to(model.device)
             # LZWCompressor always right-pads; flip to left-pad for decoder-only generation
             pad_id = int(zip_tokenizer.pad_token_id)
             _ids, _mask = inputs["input_ids"], inputs["attention_mask"]

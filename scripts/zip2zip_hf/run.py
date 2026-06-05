@@ -59,7 +59,15 @@ def main():
             add_generation_prompt=True,
         )
 
-    inputs = tokenizer([prompt], return_tensors="pt", padding="longest").to(model.device)
+    # apply_chat_template already inserts <|begin_of_text|>; don't let the tokenizer add a
+    # second BOS for instruct prompts (training used a single BOS). Plain-text prompts still
+    # get their single BOS from the tokenizer.
+    inputs = tokenizer(
+        [prompt],
+        return_tensors="pt",
+        padding="longest",
+        add_special_tokens=not args.instruct,
+    ).to(model.device)
 
     with torch.no_grad():
         outputs = model.generate(

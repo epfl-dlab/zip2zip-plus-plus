@@ -20,11 +20,12 @@ import torch
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _merge_lora_weights(sd: dict) -> dict:
+def _merge_lora_weights(sd: dict, scaling: float = 1.0) -> dict:
     """Merge LoRA adapters into base weights if the checkpoint was saved with LoRA.
 
     Keys like  layers.N.attention.wq.{base_layer,lora_A,lora_B}.weight
-    are collapsed into  layers.N.attention.wq.weight = base + lora_B @ lora_A.
+    are collapsed into  layers.N.attention.wq.weight = base + scaling * (lora_B @ lora_A).
+    `scaling` must match the training-time LoRA scaling (alpha / rank); see LoRALinear.forward.
     Non-LoRA checkpoints are returned unchanged.
     """
     if not any("base_layer" in k for k in sd):
@@ -38,12 +39,29 @@ def _merge_lora_weights(sd: dict) -> dict:
             lora_a = sd.get(f"{prefix}.lora_A.weight")
             lora_b = sd.get(f"{prefix}.lora_B.weight")
             if lora_a is not None and lora_b is not None:
-                merged[f"{prefix}.weight"] = v + lora_b @ lora_a
+                merged[f"{prefix}.weight"] = v + scaling * (lora_b @ lora_a)
             else:
                 merged[f"{prefix}.weight"] = v
         elif not any(k.endswith(s) for s in lora_suffixes):
             merged[k] = v
     return merged
+
+
+def _lora_scaling_from_meta(ckpt_dir: str) -> float:
+    """Read LoRA scaling (alpha / rank) from the checkpoint's meta.pt, default 1.0.
+
+    Falls back to 1.0 when meta.pt is missing or the run was not LoRA (rank is None/0).
+    """
+    meta_pt = os.path.join(ckpt_dir, "meta.pt")
+    if not os.path.exists(meta_pt):
+        return 1.0
+    meta = torch.load(meta_pt, map_location="cpu", weights_only=False)
+    train_args = meta.get("args", {}) if isinstance(meta, dict) else {}
+    rank = train_args.get("lora_rank")
+    alpha = train_args.get("lora_alpha")
+    if rank and alpha:
+        return float(alpha) / float(rank)
+    return 1.0
 
 
 def _infer_llama_heads(sd: dict) -> tuple[int, int]:
@@ -171,7 +189,10 @@ def export(
     model_pt = os.path.join(ckpt_dir, "model.pt")
     print(f"Loading {model_pt} ...")
     sd = torch.load(model_pt, map_location="cpu", weights_only=True)
-    sd = _merge_lora_weights(sd)
+    lora_scaling = _lora_scaling_from_meta(ckpt_dir)
+    if any("base_layer" in k for k in sd):
+        print(f"  Merging LoRA adapters with scaling=alpha/rank={lora_scaling:g}")
+    sd = _merge_lora_weights(sd, lora_scaling)
 
     decoder_sd, encoder_sd = _split_state_dict(sd)
     enc_info = _infer_encoder_config(sd)
