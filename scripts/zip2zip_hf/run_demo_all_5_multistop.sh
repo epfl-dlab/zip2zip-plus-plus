@@ -11,6 +11,7 @@ set -euo pipefail
 # Useful env vars:
 #   RUN_DIR=outputs/demo_all_5_multistop
 #   DEMO_OUT_DIR=demo-data
+#   REPOS="epfl-dlab/model-a epfl-dlab/model-b"  (space-separated; falls back to built-in list)
 #   LIMIT=5
 #   MAX_NEW_TOKENS=256
 #   BATCH_SIZE=1
@@ -36,17 +37,21 @@ GPT2_DEVICE="${GPT2_DEVICE:-cpu}"
 GPUS="${GPUS:-0}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
-REPOS=(
-  # "epfl-dlab/candidate-Llaza-MS2-FT-1BT-v1"
-  # "epfl-dlab/candidate-Llaza-MS3-FT-1BT-v1"
-  # "epfl-dlab/candidate-Llaza-MS4-FT-1BT-v1"
-  "epfl-dlab/candidate-Llaza-MS2-FT-1BT-base-v1"
-  "epfl-dlab/candidate-Llaza-MS3-FT-1BT-base-v1"
-  "epfl-dlab/candidate-Llaza-MS4-FT-1BT-base-v1"
-  "epfl-dlab/candidate-Llaza-MS2-flat-20BT-v1"
-  "epfl-dlab/candidate-Llaza-MS3-flat-20BT-v1"
-  "epfl-dlab/candidate-Llaza-MS4-flat-20BT-v1"
-)
+if [[ -n "${REPOS:-}" ]]; then
+  read -r -a REPOS <<< "${REPOS}"
+else
+  REPOS=(
+    # "epfl-dlab/candidate-Llaza-MS2-FT-1BT-v1"
+    # "epfl-dlab/candidate-Llaza-MS3-FT-1BT-v1"
+    # "epfl-dlab/candidate-Llaza-MS4-FT-1BT-v1"
+    "epfl-dlab/candidate-Llaza-MS2-FT-1BT-base-v1"
+    "epfl-dlab/candidate-Llaza-MS3-FT-1BT-base-v1"
+    "epfl-dlab/candidate-Llaza-MS4-FT-1BT-base-v1"
+    "epfl-dlab/candidate-Llaza-MS2-flat-20BT-v1"
+    "epfl-dlab/candidate-Llaza-MS3-flat-20BT-v1"
+    "epfl-dlab/candidate-Llaza-MS4-flat-20BT-v1"
+  )
+fi
 
 if [[ -z "${QUESTION_FILE:-}" ]]; then
   echo "Set QUESTION_FILE=/path/to/question.jsonl" >&2

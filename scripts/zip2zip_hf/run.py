@@ -3,6 +3,7 @@
 Usage:
     python scripts/zip2zip_hf/run.py --repo epfl-dlab/Llaza-3.2-1B-MS2F-4K-v0.1
     python scripts/zip2zip_hf/run.py --repo epfl-dlab/Llaza-3.2-1B-MS2F-4K-v0.1 --prompt "Hello world"
+    python scripts/zip2zip_hf/run.py --repo epfl-dlab/Llaza-3.2-1B-MS2-instruct --instruct --prompt "Write a sort function"
 """
 
 import argparse
@@ -30,6 +31,7 @@ def main():
     p.add_argument("--revision", type=str, default="hf")
     p.add_argument("--prompt", type=str, default="Please write a MultiHeadAttention layer in PyTorch.")
     p.add_argument("--max_new_tokens", type=int, default=128)
+    p.add_argument("--instruct", action="store_true", help="Apply chat template (for Instruct models)")
     args = p.parse_args()
 
     resolved_base_model = resolve_base_model_name(args.repo, args.revision, args.base_model)
@@ -49,7 +51,15 @@ def main():
 
     tokenizer = Zip2ZipTokenizer.from_pretrained(args.repo, revision=args.revision)
 
-    inputs = tokenizer([args.prompt], return_tensors="pt", padding="longest").to(model.device)
+    prompt = args.prompt
+    if args.instruct:
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": args.prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    inputs = tokenizer([prompt], return_tensors="pt", padding="longest").to(model.device)
 
     with torch.no_grad():
         outputs = model.generate(

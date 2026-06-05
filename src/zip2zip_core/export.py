@@ -20,6 +20,32 @@ import torch
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _merge_lora_weights(sd: dict) -> dict:
+    """Merge LoRA adapters into base weights if the checkpoint was saved with LoRA.
+
+    Keys like  layers.N.attention.wq.{base_layer,lora_A,lora_B}.weight
+    are collapsed into  layers.N.attention.wq.weight = base + lora_B @ lora_A.
+    Non-LoRA checkpoints are returned unchanged.
+    """
+    if not any("base_layer" in k for k in sd):
+        return sd
+
+    lora_suffixes = (".base_layer.weight", ".lora_A.weight", ".lora_B.weight")
+    merged = {}
+    for k, v in sd.items():
+        if k.endswith(".base_layer.weight"):
+            prefix = k[: -len(".base_layer.weight")]
+            lora_a = sd.get(f"{prefix}.lora_A.weight")
+            lora_b = sd.get(f"{prefix}.lora_B.weight")
+            if lora_a is not None and lora_b is not None:
+                merged[f"{prefix}.weight"] = v + lora_b @ lora_a
+            else:
+                merged[f"{prefix}.weight"] = v
+        elif not any(k.endswith(s) for s in lora_suffixes):
+            merged[k] = v
+    return merged
+
+
 def _infer_llama_heads(sd: dict) -> tuple[int, int]:
     """Infer (n_heads, n_kv_heads) from wq/wk weight shapes."""
     wq = sd["layers.0.attention.wq.weight"]  # (n_heads * head_dim, dim)
@@ -145,6 +171,7 @@ def export(
     model_pt = os.path.join(ckpt_dir, "model.pt")
     print(f"Loading {model_pt} ...")
     sd = torch.load(model_pt, map_location="cpu", weights_only=True)
+    sd = _merge_lora_weights(sd)
 
     decoder_sd, encoder_sd = _split_state_dict(sd)
     enc_info = _infer_encoder_config(sd)

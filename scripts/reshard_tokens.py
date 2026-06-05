@@ -64,8 +64,7 @@ def load_shard(path: Path, dtype: np.dtype) -> np.ndarray:
 
 def compute_target_sizes(total_items: int, num_shards: int) -> list[int]:
     base = total_items // num_shards
-    remainder = total_items % num_shards
-    return [base + (1 if i < remainder else 0) for i in range(num_shards)]
+    return [base] * num_shards
 
 
 def save_array(path: Path, array: np.ndarray) -> None:

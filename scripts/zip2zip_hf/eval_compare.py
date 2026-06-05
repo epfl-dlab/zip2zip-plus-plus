@@ -497,6 +497,8 @@ def build_generation_kwargs(args, tokenizer: Zip2ZipTokenizer) -> dict[str, Any]
                 "top_p": args.top_p,
             }
         )
+    if args.repetition_penalty != 1.0:
+        kwargs["repetition_penalty"] = args.repetition_penalty
     return kwargs
 
 
@@ -1264,6 +1266,14 @@ def generate_command(args) -> int:
             if hasattr(model, "codebook_manager"):
                 model.codebook_manager.reset()
             inputs = zip_tokenizer(prompts, return_tensors="pt", padding="longest").to(model.device)
+            # LZWCompressor always right-pads; flip to left-pad for decoder-only generation
+            pad_id = int(zip_tokenizer.pad_token_id)
+            _ids, _mask = inputs["input_ids"], inputs["attention_mask"]
+            _seq_len = _ids.shape[1]
+            for _i in range(_ids.shape[0]):
+                _n = int(_mask[_i].sum())
+                _ids[_i] = torch.cat([_ids[_i].new_full((_seq_len - _n,), pad_id), _ids[_i][_mask[_i].bool()]])
+                _mask[_i] = torch.cat([_mask[_i].new_zeros(_seq_len - _n), _mask[_i].new_ones(_n)])
             prompt_width = int(inputs["input_ids"].shape[1])
             with torch.no_grad():
                 outputs = model.generate(**inputs, **generation_kwargs)
@@ -1443,6 +1453,7 @@ def add_generate_args(subparsers) -> None:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument("--gpt2-model", default="gpt2")
     parser.add_argument("--gpt2-device", default="auto")
     parser.add_argument("--gpt2-stride", type=int, default=512)
