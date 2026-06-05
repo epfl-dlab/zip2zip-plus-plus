@@ -11,5 +11,4 @@ target/
 wandb
 *.out
 *.vscode/
-mxx_outputs/
 outputs/
