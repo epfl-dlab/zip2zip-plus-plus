@@ -473,7 +473,7 @@ def load_generation_model(args):
 
 def get_generation_stop_token_ids(tokenizer: Zip2ZipTokenizer) -> int | list[int]:
     stop_ids: list[int] = []
-    for token_id in (getattr(tokenizer, "eos_token_id", None), 128001):
+    for token_id in (getattr(tokenizer, "eos_token_id", None),):
         if token_id is None:
             continue
         token_int = int(token_id)
