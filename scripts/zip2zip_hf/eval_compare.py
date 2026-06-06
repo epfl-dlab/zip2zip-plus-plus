@@ -459,8 +459,13 @@ def load_generation_model(args):
         revision=args.revision,
         base_model=base_model,
         dtype=dtype,
+        max_codebook_size=args.max_codebook_size,
     ).to(args.device).eval()
-    tokenizer = Zip2ZipTokenizer.from_pretrained(args.repo, revision=args.revision)
+    tokenizer = Zip2ZipTokenizer.from_pretrained(
+        args.repo,
+        revision=args.revision,
+        max_codebook_size=args.max_codebook_size,
+    )
     tokenizer.padding_side = "left"
     tokenizer.tokenizer.padding_side = "left"
     return model, tokenizer, resolved_base_model
@@ -1462,6 +1467,7 @@ def add_generate_args(subparsers) -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-codebook-size", type=int, default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--torch-dtype",
