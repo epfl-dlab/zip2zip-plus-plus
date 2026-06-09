@@ -471,9 +471,23 @@ def load_generation_model(args):
     return model, tokenizer, resolved_base_model
 
 
-def get_generation_stop_token_ids(tokenizer: Zip2ZipTokenizer) -> int | list[int]:
+CHAT_TURN_END_TOKENS = ("<|end|>", "<|eot_id|>", "<|im_end|>")
+
+
+def get_generation_stop_token_ids(
+    tokenizer: Zip2ZipTokenizer,
+    *,
+    include_chat_turn_end: bool = False,
+) -> int | list[int]:
     stop_ids: list[int] = []
-    for token_id in (getattr(tokenizer, "eos_token_id", None),):
+    candidate_ids: list[int | None] = [getattr(tokenizer, "eos_token_id", None)]
+    if include_chat_turn_end:
+        base_tokenizer = get_base_tokenizer(tokenizer)
+        for token in CHAT_TURN_END_TOKENS:
+            token_id = base_tokenizer.convert_tokens_to_ids(token)
+            if token_id is not None and token_id != base_tokenizer.unk_token_id:
+                candidate_ids.append(int(token_id))
+    for token_id in candidate_ids:
         if token_id is None:
             continue
         token_int = int(token_id)
@@ -492,7 +506,10 @@ def build_generation_kwargs(args, tokenizer: Zip2ZipTokenizer) -> dict[str, Any]
         "max_new_tokens": args.max_new_tokens,
         "use_cache": True,
         "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": get_generation_stop_token_ids(tokenizer),
+        "eos_token_id": get_generation_stop_token_ids(
+            tokenizer,
+            include_chat_turn_end=bool(args.instruct),
+        ),
     }
     if args.do_sample:
         kwargs.update(
@@ -629,7 +646,7 @@ def load_export_tokenizer(run_config: dict[str, Any]):
         or run_config.get("base_model")
         or "unknown"
     )
-    base_tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=False)
+    base_tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
     if base_tokenizer.pad_token_id is None:
         base_tokenizer.pad_token_id = base_tokenizer.eos_token_id
     zip_tokenizer = DemoZipTokenizer(
