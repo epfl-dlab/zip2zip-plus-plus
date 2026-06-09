@@ -42,6 +42,15 @@ from lm_eval.api.registry import register_model
 _LLAMA3_DISABLED_IDS = [128000, 128001, 128002, 128003]
 _DEFAULT_TOKENIZER = "meta-llama/Meta-Llama-3-8B"
 
+# Special-token ids that must never be merged into the codebook. The Llama
+# tokenizers historically disabled a fixed set; for other tokenizers (e.g.
+# Phi-3.5-mini) we fall back to the tokenizer's own special-token ids.
+_DISABLED_IDS_BY_TOKENIZER = {
+    "meta-llama/Meta-Llama-3-8B": _LLAMA3_DISABLED_IDS,
+    "meta-llama/Llama-3.1-8B": _LLAMA3_DISABLED_IDS,
+    "meta-llama/Llama-3.2-1B-Instruct": _LLAMA3_DISABLED_IDS,
+}
+
 
 def _strip_wrapper_prefixes(state_dict: dict) -> dict:
     out = {}
@@ -137,6 +146,12 @@ class Zip2ZipLM(LM):
             pretrained, self._device, self._dtype
         )
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+        disabled_ids = _DISABLED_IDS_BY_TOKENIZER.get(tokenizer)
+        if disabled_ids is None:
+            disabled_ids = [
+                i for i in (self.tokenizer.all_special_ids or []) if i < self.cfg.vocab_size
+            ]
+        self._disabled_ids = disabled_ids
         self._max_length = int(max_length)
         self.eval_mode = eval_mode
         self._batch_size = int(batch_size)
@@ -147,7 +162,7 @@ class Zip2ZipLM(LM):
             max_codebook_size=self.cfg.max_codebook_size,
             max_subtokens=self.cfg.max_subtokens,
             pad_token_id=self.cfg.pad_token_id,
-            disabled_ids=_LLAMA3_DISABLED_IDS,
+            disabled_ids=self._disabled_ids,
         )
 
     # ───────────────────── lm-eval registry hooks ─────────────────────────

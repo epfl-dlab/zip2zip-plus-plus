@@ -8,6 +8,7 @@ Extends the standard Llama decoder with:
 from dataclasses import dataclass, field
 
 import torch
+import torch.utils.checkpoint
 from torch import nn
 
 try:
@@ -539,6 +540,7 @@ class Zip2ZipLlama3Model(Decoder):
         encoder_n_heads: int = 8
         encoder_intermediate_size: int | None = None
         encoder_causal: bool = False
+        tie_word_embeddings: bool = True
         hyper_encoder_type: str = "flat"
         reconstruction_loss_weight: float = 0.0
         token_type_loss_weight: float = (
@@ -573,8 +575,10 @@ class Zip2ZipLlama3Model(Decoder):
         super().__init__(config)
         self.zip2zip_config = config
 
-        # Tie input and output embeddings
-        self.output.weight = self.tok_embeddings.weight
+        # Tie input and output embeddings (Llama-style). Phi-3.5-mini uses
+        # untied embeddings, so keep self.output as a separate Linear in that case.
+        if config.tie_word_embeddings:
+            self.output.weight = self.tok_embeddings.weight
 
         # Optional token type prediction head (base vs hyper)
         if config.token_type_loss_weight > 0:
@@ -757,6 +761,12 @@ class Zip2ZipLlama3Model(Decoder):
         # Clamp IDs to valid range
         cb_clamped = codebook.clamp(min=0, max=self.zip2zip_config.vocab_size - 1)
 
+        # Under FSDP, weight_matrix (tok_embeddings.weight) is a sharded DTensor.
+        # nn.functional.embedding can't mix a DTensor weight with a plain-tensor
+        # index, so gather it to a full local tensor first (the embedding is small).
+        if hasattr(weight_matrix, "full_tensor"):
+            weight_matrix = weight_matrix.full_tensor()
+
         # Look up from given weight matrix
         cb_embeds = nn.functional.embedding(cb_clamped, weight_matrix)  # (B, H, S, dim)
 
@@ -817,10 +827,18 @@ class Zip2ZipLlama3Model(Decoder):
                 hyper_embeds = None
 
         # === Transformer layers ===
+        use_ac = getattr(self, "gradient_checkpointing", False) and self.training
         with torch.profiler.record_function("Main LM"):
             for layer_id, layer in enumerate(self.layers.values()):
                 with torch.profiler.record_function(f"layer_{layer_id}"):
-                    h = layer(h, self.freqs_cis, attention_masks, positions)
+                    if use_ac:
+                        # Recompute layer activations in backward to save memory.
+                        h = torch.utils.checkpoint.checkpoint(
+                            layer, h, self.freqs_cis, attention_masks, positions,
+                            use_reentrant=False,
+                        )
+                    else:
+                        h = layer(h, self.freqs_cis, attention_masks, positions)
 
         h = self.norm(h) if self.norm is not None else h
 

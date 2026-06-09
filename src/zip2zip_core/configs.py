@@ -224,6 +224,49 @@ zip2zip_llama_configs = {
             scaling="llama",
         ),
     ),
+    # ~3.8B params — matches official Phi-3.5-mini-instruct architecture
+    # (dim=3072, 32 layers, 32 heads MHA, head_dim=96, ffn=8192, vocab=32064,
+    #  rope theta=10000 no scaling, untied input/output embeddings).
+    # zip2zip components follow the from-scratch core defaults (flat encoder,
+    # encoder_dim=512, intermediate=2048, max_codebook_size=4096), max_subtokens=3.
+    "Phi3.5-mini": Zip2ZipLlama3Model.Config(
+        dim=3072,
+        n_layers=32,
+        vocab_size=32064,
+        tie_word_embeddings=False,
+        max_codebook_size=4096,
+        max_subtokens=3,
+        encoder_dim=512,
+        encoder_n_layers=2,
+        encoder_n_heads=8,
+        encoder_intermediate_size=2048,
+        pad_token_id=32000,
+        # Untied embeddings: init the input embedding with a small std (~dim^-0.5),
+        # matching the output head's init. The default Embedding init_std=1.0 makes
+        # the hyper-token embeddings (derived from tok_embeddings) ~55x too large,
+        # which blows up the hyper logits and gives a ~1500 initial loss. In the
+        # tied configs this was masked because the output init overwrote the shared
+        # weight; with untied embeddings we must set it explicitly.
+        tok_embeddings=Embedding.Config(init_std=3072 ** -0.5),
+        layer=Zip2ZipTransformerBlock.Config(
+            feed_forward=FeedForward.Config(
+                hidden_dim=8192,
+            ),
+            attention=GQAttention.Config(
+                n_heads=32,
+                n_kv_heads=32,
+                attn_backend="sdpa",
+                rope_backend="complex",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=3072 // 32,
+            max_seq_len=131072,
+            theta=10000,
+            backend="complex",
+            scaling="none",
+        ),
+    ),
     # ~3B params (dim=3072, 28 layers, head_dim=128)
     "3B": Zip2ZipLlama3Model.Config(
         dim=3072,
