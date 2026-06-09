@@ -176,13 +176,21 @@ def main():
     print(f"Loading tokenizer from {cli.tokenizer}...")
     hf_tok = AutoTokenizer.from_pretrained(cli.tokenizer)
 
+    # Derive disabled_ids from the tokenizer (matches training) instead of the
+    # hardcoded Llama constant — correct for Phi (specials 0,1,2,32000..32010).
+    derived_disabled = sorted(
+        i for i in (set(hf_tok.all_special_ids or []) | set(hf_tok.get_added_vocab().values()))
+        if 0 <= i < cfg.vocab_size
+    )
+    print(f"  disabled_ids={derived_disabled}")
+
     codebook_manager = CodebookManager(
         initial_vocab_size=cfg.vocab_size,
         max_codebook_size=cfg.max_codebook_size,
         max_subtokens=cfg.max_subtokens,
         embedding_dim=cfg.dim,
         pad_token_id=cfg.pad_token_id,
-        disabled_ids=DISABLED_IDS,
+        disabled_ids=derived_disabled,
     )
 
     print(f"\nPrompt: {repr(cli.prompt)}\n")

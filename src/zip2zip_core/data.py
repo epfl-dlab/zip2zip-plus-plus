@@ -2,6 +2,7 @@
 
 import os
 import random
+import time
 from functools import partial
 
 import numpy as np
@@ -15,6 +16,13 @@ from zip2zip_compression import LZWCompressor
 COMPRESS_TOKEN_ID = 128002
 DECOMPRESS_TOKEN_ID = 128003
 LLAMA31_8B_SPECIAL_TOKEN_IDS = tuple(range(128000, 128256))
+
+
+def _debug_data_log(enabled: bool, rank: int, worker_id: int, message: str):
+    if not enabled:
+        return
+    ts = time.strftime("%H:%M:%S")
+    print(f"[data-debug {ts}] [rank{rank}] [worker{worker_id}] {message}", flush=True)
 
 
 class Zip2ZipDataset(IterableDataset, Stateful):
@@ -40,10 +48,12 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         bos_token_id: int = 128000,
         eos_token_id: int = 128001,
         pad_token_id: int = 128001,
+        disabled_ids: tuple[int, ...] | list[int] | None = None,
         rank: int = 0,
         world_size: int = 1,
         mode: str = "lm",
         remap_codebook: bool = True,
+        debug_samples: int = 0,
     ):
         self.data_dir = data_dir
         self.seq_len = seq_len
@@ -54,6 +64,11 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         self.mode = mode
         self.remap_codebook = remap_codebook
         self.base_chunk_len = seq_len * 2
+        self.rank = rank
+        self.debug_samples = debug_samples
+        self._debug_samples_emitted = 0
+        self._debug_event_budget = max(16, debug_samples * 8) if debug_samples > 0 else 0
+        self._debug_worker_id = 0
 
         shard_files = sorted(
             [
@@ -83,13 +98,27 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         self._shard_idx = 0
         self._offset = 0
 
+        # Special-token ids that must never be merged into the codebook. Defaults
+        # to the Llama-3.1 reserved range for back-compat; callers training on a
+        # different tokenizer (e.g. Phi-3.5-mini) must pass the matching ids.
+        if disabled_ids is None:
+            disabled_ids = LLAMA31_8B_SPECIAL_TOKEN_IDS
         self.compressor_args = dict(
             initial_vocab_size=initial_vocab_size,
             max_codebook_size=max_codebook_size,
             max_subtokens=max_subtokens,
             pad_token_id=pad_token_id,
-            disabled_ids=list(LLAMA31_8B_SPECIAL_TOKEN_IDS),
+            disabled_ids=list(disabled_ids),
         )
+
+    def _debug_enabled(self) -> bool:
+        return self.debug_samples > 0 and self._debug_event_budget > 0
+
+    def _debug_log(self, message: str):
+        enabled = self._debug_enabled()
+        _debug_data_log(enabled, self.rank, self._debug_worker_id, message)
+        if enabled:
+            self._debug_event_budget -= 1
 
     @staticmethod
     def _mask_path_for_shard(shard_path: str) -> str:
@@ -194,14 +223,27 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         while True:
             for shard_idx in range(self._shard_idx, len(shards)):
                 self._shard_idx = shard_idx
+                self._debug_log(
+                    f"loading lm shard idx={shard_idx} path={os.path.basename(shards[shard_idx])} "
+                    f"resume_offset={self._offset}"
+                )
                 shard = self._load_token_shard(shards[shard_idx])
                 mask_shard = np.load(mask_shards[shard_idx]) if mask_shards is not None else None
                 if mask_shard is not None and len(mask_shard) != len(shard):
                     raise ValueError(f"Mask length mismatch for {shards[shard_idx]}")
                 offset = self._offset
                 self._offset = 0
+                self._debug_log(
+                    f"loaded lm shard idx={shard_idx} tokens={len(shard)} "
+                    f"has_mask={mask_shard is not None} start_offset={offset}"
+                )
 
                 while offset + self.base_chunk_len <= len(shard):
+                    if self._debug_samples_emitted < self.debug_samples:
+                        self._debug_log(
+                            f"lm chunk shard_idx={shard_idx} offset={offset} "
+                            f"chunk_len={self.base_chunk_len} before encode"
+                        )
                     chunk = shard[offset : offset + self.base_chunk_len].tolist()
                     chunk_mask = (
                         mask_shard[offset : offset + self.base_chunk_len]
@@ -216,7 +258,16 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                             chunk, padding="do_not_pad", truncation=False
                         )
                     except Exception:
+                        self._debug_log(
+                            f"lm encode failed shard_idx={shard_idx} offset={offset - self.base_chunk_len}"
+                        )
                         continue
+
+                    if self._debug_samples_emitted < self.debug_samples:
+                        self._debug_log(
+                            f"lm encoded shard_idx={shard_idx} offset={offset - self.base_chunk_len} "
+                            f"compressed_len={len(compressed)}"
+                        )
 
                     if len(compressed) < self.seq_len + 1:
                         continue
@@ -243,6 +294,13 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                     if self.remap_codebook:
                         x, y, cb = self._remap_hyper_ids(x, y, cb)
 
+                    if self._debug_samples_emitted < self.debug_samples:
+                        self._debug_log(
+                            f"lm yield sample_idx={self._debug_samples_emitted} shard_idx={shard_idx} "
+                            f"offset={offset - self.base_chunk_len} input={tuple(x.shape)} "
+                            f"codebook={tuple(cb.shape)} n_base_tokens={n_base_tokens}"
+                        )
+                    self._debug_samples_emitted += 1
                     yield {"input": x, "codebook": cb, "n_base_tokens": n_base_tokens}, y
 
             # Loop
@@ -265,11 +323,23 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         while True:
             for shard_idx in range(self._shard_idx, len(shards)):
                 self._shard_idx = shard_idx
+                self._debug_log(
+                    f"loading compress shard idx={shard_idx} path={os.path.basename(shards[shard_idx])} "
+                    f"resume_offset={self._offset}"
+                )
                 shard = self._load_token_shard(shards[shard_idx])
                 offset = self._offset
                 self._offset = 0
+                self._debug_log(
+                    f"loaded compress shard idx={shard_idx} tokens={len(shard)} start_offset={offset}"
+                )
 
                 while offset + self.base_chunk_len <= len(shard):
+                    if self._debug_samples_emitted < self.debug_samples:
+                        self._debug_log(
+                            f"compress chunk shard_idx={shard_idx} offset={offset} "
+                            f"chunk_len={self.base_chunk_len} before encode"
+                        )
                     chunk = shard[offset : offset + self.base_chunk_len].tolist()
 
                     compressor = LZWCompressor(**self.compressor_args)
@@ -332,6 +402,13 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                     if self.remap_codebook:
                         x, y, cb = self._remap_hyper_ids(x, y, cb)
 
+                    if self._debug_samples_emitted < self.debug_samples:
+                        self._debug_log(
+                            f"compress yield sample_idx={self._debug_samples_emitted} shard_idx={shard_idx} "
+                            f"offset={offset} input={tuple(x.shape)} codebook={tuple(cb.shape)} "
+                            f"base_count={base_count} comp_len={comp_len}"
+                        )
+                    self._debug_samples_emitted += 1
                     yield {"input": x, "codebook": cb, "n_base_tokens": base_count}, y
 
             # Loop
@@ -341,9 +418,17 @@ class Zip2ZipDataset(IterableDataset, Stateful):
     def __iter__(self):
         worker_info = get_worker_info()
         if worker_info is not None:
+            self._debug_worker_id = worker_info.id
             shards = self.shard_files[worker_info.id :: worker_info.num_workers]
         else:
+            self._debug_worker_id = 0
             shards = self.shard_files
+
+        self._debug_log(
+            f"iter start mode={self.mode} assigned_shards={len(shards)} "
+            f"shard_preview={[os.path.basename(s) for s in shards[:3]]} "
+            f"resume_state=(shard_idx={self._shard_idx}, offset={self._offset})"
+        )
 
         if self.mode == "compress":
             yield from self._iter_compress(shards)
@@ -402,8 +487,11 @@ def build_dataloader(
     world_size: int = 1,
     num_workers: int = 0,
     pad_token_id: int = 128001,
+    initial_vocab_size: int = 128256,
+    disabled_ids: tuple[int, ...] | list[int] | None = None,
     mode: str = "lm",
     remap_codebook: bool = True,
+    debug_samples: int = 0,
 ) -> DataLoader:
     """Build a Zip2Zip DataLoader with remapping collation."""
     dataset = Zip2ZipDataset(
@@ -411,10 +499,14 @@ def build_dataloader(
         seq_len=seq_len,
         max_subtokens=max_subtokens,
         max_codebook_size=max_codebook_size,
+        initial_vocab_size=initial_vocab_size,
+        pad_token_id=pad_token_id,
+        disabled_ids=disabled_ids,
         rank=rank,
         world_size=world_size,
         mode=mode,
         remap_codebook=remap_codebook,
+        debug_samples=debug_samples,
     )
 
     collate_fn = partial(

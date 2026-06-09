@@ -1,4 +1,4 @@
-"""Standalone zip2zip pretraining script using DDP + torch.compile.
+"""Standalone zip2zip pretraining script using FSDP2 + torch.compile.
 
 Usage:
     torchrun --nnodes=N --nproc_per_node=4 -m zip2zip_core.train \
@@ -37,7 +37,6 @@ import time
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 from zip2zip_core.configs import zip2zip_llama_configs
 from zip2zip_core.data import build_dataloader
@@ -56,11 +55,56 @@ def get_lr(step: int, warmup_steps: int, total_steps: int, max_lr: float, min_lr
 
 
 def _unwrap_model(model):
-    """Unwrap DDP and torch.compile wrappers to get the raw model."""
+    """Unwrap DDP and torch.compile wrappers to get the raw model.
+
+    FSDP2 (fully_shard) modifies modules in place and adds no wrapper, so for the
+    FSDP path this returns the model directly (per-block torch.compile only wraps
+    the inner blocks, not the root)."""
     raw = model.module if hasattr(model, "module") else model
     if hasattr(raw, "_orig_mod"):
         raw = raw._orig_mod
     return raw
+
+
+def apply_fsdp(model, world_size):
+    """Shard the model with FSDP2 (fully_shard) across all DP ranks.
+
+    Params/grads/optimizer states are sharded, so a 3.8B model needs only
+    ~footprint/world_size per GPU (vs DDP which replicates everything).
+
+    Params stay in fp32 (no MixedPrecisionPolicy) and bf16 compute is provided by
+    the ``torch.autocast`` context in the training loop — same numerics as the old
+    DDP path. We deliberately avoid param_dtype=bf16 here because the zip2zip
+    hyper-encoder reads ``tok_embeddings.weight`` directly (see
+    Zip2ZipLlama3Model._encode_codebook_with_weights), and mixing an autocast/bf16
+    activation path with an mp-casted weight is brittle; keeping params fp32 +
+    autocast is the robust combination.
+
+    NOTE: per-block torch.compile is applied *after* checkpoint load (see
+    compile_transformer_blocks), not here — compiling first renames params to
+    ``layers.N._orig_mod.*`` which breaks DCP set_model_state_dict on resume.
+    """
+    from torch.distributed.fsdp import fully_shard
+    from torch.distributed.device_mesh import init_device_mesh
+
+    mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
+
+    if model.tok_embeddings is not None:
+        fully_shard(model.tok_embeddings, mesh=mesh)
+    fully_shard(model.hyper_encoder, mesh=mesh)
+    for block in model.layers.values():
+        fully_shard(block, mesh=mesh)
+    if model.norm is not None and model.output is not None:
+        fully_shard([model.norm, model.output], mesh=mesh, reshard_after_forward=False)
+    fully_shard(model, mesh=mesh)
+    return model
+
+
+def compile_transformer_blocks(model):
+    """torch.compile each transformer block in place. Call AFTER checkpoint load so
+    the on-disk (canonical) param names match the model at load time."""
+    for layer_id, block in list(model.layers.items()):
+        model.layers.register_module(layer_id, torch.compile(block))
 
 
 def _relaxed_prefix_correct(hyper_preds, hyper_labels, batch_idx, cb, vocab_size, pad_token_id):
@@ -201,21 +245,37 @@ def _debug_rank_log(enabled: bool, rank: int, step: int, micro_step: int, messag
         print(f"[debug {now}] [rank{rank}] [step {step}] [micro {micro_step}] {message}", flush=True)
 
 def save_checkpoint(model, optimizer, step, args, output_dir, hf_repo=None):
-    """Save model and optimizer state. Only rank 0 saves."""
+    """Save a consolidated (full, unsharded) checkpoint.
+
+    The model is FSDP-sharded, so we gather the full state via DCP's
+    get_*_state_dict(full_state_dict=True). The resulting model.pt / optimizer.pt
+    are plain state dicts with canonical keys (no FSDP/compile prefixes), so they
+    stay compatible with eval/export/resume.
+    """
     global _hf_upload_thread
+    from torch.distributed.checkpoint.state_dict import (
+        get_model_state_dict, get_optimizer_state_dict, StateDictOptions,
+    )
     rank = dist.get_rank()
     ckpt_dir = os.path.join(output_dir, f"step_{step}")
 
-    dist.barrier()
+    # Collective: every rank must participate in gathering the full state.
+    opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    model_sd = get_model_state_dict(model, options=opts)
+    optim_sd = (
+        get_optimizer_state_dict(model, optimizer, options=opts)
+        if optimizer is not None else None
+    )
+
     if rank == 0:
         if _hf_upload_thread is not None and _hf_upload_thread.is_alive():
             print(f"[Rank 0] Waiting for previous HF upload to finish ...")
             _hf_upload_thread.join()
 
         os.makedirs(ckpt_dir, exist_ok=True)
-        raw_model = _unwrap_model(model)
-        torch.save(raw_model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
-        torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
+        torch.save(model_sd, os.path.join(ckpt_dir, "model.pt"))
+        if optim_sd is not None:
+            torch.save(optim_sd, os.path.join(ckpt_dir, "optimizer.pt"))
         torch.save({"step": step, "args": vars(args)}, os.path.join(ckpt_dir, "meta.pt"))
         print(f"[Rank 0] Saved checkpoint at step {step}")
 
@@ -285,7 +345,7 @@ def _clean_state_dict(model_state):
     """Strip FSDP wrapper prefixes for compatibility."""
     cleaned = {}
     for k, v in model_state.items():
-        cleaned[k.replace("_fsdp_wrapped_module.", "")] = v
+        cleaned[k.replace("_fsdp_wrapped_module.", "").replace("_orig_mod.", "")] = v
     return cleaned
 
 
@@ -307,7 +367,10 @@ def load_checkpoint(model, optimizer, resume_dir, device, random_weights=False):
         if dist.get_rank() == 0:
             print("No meta.pt found — starting from step 0")
 
-    raw_model = _unwrap_model(model)
+    from torch.distributed.checkpoint.state_dict import (
+        set_model_state_dict, set_optimizer_state_dict, StateDictOptions,
+    )
+    set_opts = StateDictOptions(full_state_dict=True, broadcast_from_rank0=True)
 
     if random_weights:
         if dist.get_rank() == 0:
@@ -317,21 +380,23 @@ def load_checkpoint(model, optimizer, resume_dir, device, random_weights=False):
         model_state = torch.load(os.path.join(resume_dir, "model.pt"), map_location="cpu")
         model_state = _clean_state_dict(model_state)
 
-        # Handle pos_embed size mismatch from curriculum phase transitions
+        # Handle pos_embed size mismatch from curriculum phase transitions. Read the
+        # current (global) shape from the sharded param without gathering weights.
         pos_key = "hyper_encoder.pos_embed.weight"
         curriculum_transition = False
         if pos_key in model_state:
-            current_pos = raw_model.state_dict()[pos_key]
+            current_pos = dict(_unwrap_model(model).named_parameters())[pos_key]
             saved_pos = model_state[pos_key]
             if saved_pos.shape[0] < current_pos.shape[0]:
-                padded = torch.zeros_like(current_pos)
+                padded = torch.zeros((current_pos.shape[0], saved_pos.shape[1]), dtype=saved_pos.dtype)
                 padded[:saved_pos.shape[0]] = saved_pos
                 model_state[pos_key] = padded
                 curriculum_transition = True
                 if dist.get_rank() == 0:
                     print(f"Padded pos_embed from {saved_pos.shape[0]} to {current_pos.shape[0]} positions")
 
-        raw_model.load_state_dict(model_state)
+        # Scatter the full state dict onto the FSDP-sharded model.
+        set_model_state_dict(model, model_state, options=set_opts)
 
     opt_path = os.path.join(resume_dir, "optimizer.pt")
     if optimizer is None:
@@ -344,7 +409,7 @@ def load_checkpoint(model, optimizer, resume_dir, device, random_weights=False):
             print("Curriculum transition detected — skipping optimizer state load (will re-init)")
     elif os.path.exists(opt_path):
         opt_state = torch.load(opt_path, map_location="cpu")
-        optimizer.load_state_dict(opt_state)
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=opt_state, options=set_opts)
     else:
         if dist.get_rank() == 0:
             print("No optimizer.pt found — optimizer will start fresh")
@@ -449,6 +514,15 @@ def main():
     parser.add_argument("--init_from_hf", type=str, default=None,
                         help="HuggingFace model name to initialize decoder weights from (e.g. meta-llama/Llama-3.2-1B). "
                              "Hyper-encoder stays randomly initialized.")
+    parser.add_argument("--tokenizer", type=str, default="meta-llama/Llama-3.1-8B",
+                        help="HF tokenizer used for byte-PPL/BPB eval decoding stats. "
+                             "Must match the tokenizer the data was pretokenized with "
+                             "(e.g. microsoft/Phi-3.5-mini-instruct for the Phi3.5-mini config).")
+    parser.add_argument("--activation_checkpoint", action="store_true",
+                        help="Recompute transformer-layer activations during backward "
+                             "(gradient checkpointing) to cut activation memory. Optional with "
+                             "FSDP (which already shards params/grads/optimizer); useful for extra "
+                             "headroom or very long sequences. Default off.")
     parser.add_argument("--freeze_decoder", action="store_true",
                         help="Freeze all decoder parameters, only train hyper-encoder.")
     parser.add_argument("--lora_rank", type=int, default=None,
@@ -508,8 +582,11 @@ def main():
     if args.min_hyper_lr is None:
         args.min_hyper_lr = args.min_lr
 
-    # Initialize distributed
-    dist.init_process_group("nccl")
+    # Initialize distributed. Generous timeout so the first step's torch.compile
+    # (which can take minutes and skews across ranks at large scale) doesn't trip
+    # the NCCL watchdog before the first collective completes.
+    from datetime import timedelta
+    dist.init_process_group("nccl", timeout=timedelta(minutes=30))
     wall_clock_start = time.time()
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -593,13 +670,18 @@ def main():
     config = dataclasses.replace(config, **replace_kwargs)
 
     model = config.build()
+    model.gradient_checkpointing = args.activation_checkpoint
+    if args.activation_checkpoint and rank == 0:
+        print("[activation_checkpoint] gradient checkpointing enabled on transformer layers")
     if args.disable_varlen:
         model.hyper_encoder.disable_varlen = True
     if args.no_encoder_residual:
         model.encoder_residual = False
     with torch.no_grad():
         model.init_weights()
-    model = model.to(device=device, dtype=torch.bfloat16)
+    # Keep params in fp32 on device; FSDP's MixedPrecisionPolicy casts to bf16 for
+    # compute and the optimizer runs on the (sharded) fp32 params.
+    model = model.to(device=device)
 
     # Load pretrained HF decoder weights if specified
     if args.init_from_hf:
@@ -626,20 +708,19 @@ def main():
     if rank == 0:
         print(f"Model parameters: {param_count:,} ({param_count/1e9:.2f}B)")
 
-    # torch.compile the model before DDP wrapping
-    if args.compile:
-        if rank == 0:
-            print("Compiling model with torch.compile...")
-        model = torch.compile(model)
-
-    # find_unused_parameters: when max_subtokens=1 the codebook is all-pad,
-    # so the hyper encoder is skipped and its params don't receive gradients.
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    # Shard with FSDP2 (params/grads/optimizer sharded across all DP ranks),
+    # with optional per-block torch.compile. Replaces DDP, which replicated the
+    # full model + fp32 optimizer on every GPU and cannot fit a 3.8B model.
+    if rank == 0:
+        print(f"Applying FSDP2 (fully_shard) across {world_size} ranks...")
+    model = apply_fsdp(model, world_size)
 
     if not args.eval:
-        # fp32 master weights: optimizer states stay in fp32, model stays in bf16
-        # Split into decoder params and hyper_encoder params for differential LR.
-        # (hyper_encoder is randomly initialized and benefits from a higher LR.)
+        # AdamW runs directly on the FSDP-sharded fp32 params (no fp32 master copy
+        # needed — the params already are fp32 and sharded, so optimizer states are
+        # fp32 and sharded too). Split into decoder vs hyper_encoder param groups
+        # for differential LR (the hyper_encoder is randomly init'd and benefits
+        # from a higher LR).
         hyper_trainable = []
         decoder_trainable = []
         for n, p in model.named_parameters():
@@ -649,21 +730,16 @@ def main():
                 hyper_trainable.append(p)
             else:
                 decoder_trainable.append(p)
-        # Keep a flat list in the same order for grad/weight copy later
-        trainable_params = decoder_trainable + hyper_trainable
-        master_decoder = [p.detach().float().requires_grad_(True) for p in decoder_trainable]
-        master_hyper   = [p.detach().float().requires_grad_(True) for p in hyper_trainable]
-        master_params  = master_decoder + master_hyper
 
         if rank == 0:
             print(f"Optimizer param groups: decoder={len(decoder_trainable)} params "
                   f"(lr={args.lr:.2e}), hyper={len(hyper_trainable)} params "
-                  f"(lr={args.hyper_lr:.2e})")
+                  f"(lr={args.hyper_lr:.2e}) | FSDP-sharded fp32 AdamW")
 
         optimizer = torch.optim.AdamW(
             [
-                {"params": master_decoder, "lr": args.lr},
-                {"params": master_hyper,   "lr": args.hyper_lr},
+                {"params": decoder_trainable, "lr": args.lr},
+                {"params": hyper_trainable,   "lr": args.hyper_lr},
             ],
             betas=(0.9, 0.95),
             weight_decay=args.weight_decay,
@@ -695,6 +771,30 @@ def main():
             print(f"[reset_step] Resetting start_step from {start_step} to 0 (fresh LR schedule)")
         start_step = 0
 
+    # Compile transformer blocks AFTER loading the checkpoint (compiling first
+    # renames params to layers.N._orig_mod.* and breaks DCP resume). Param identity
+    # is unchanged by compile, so the already-built optimizer stays valid.
+    if args.compile:
+        if rank == 0:
+            print("Compiling transformer blocks with torch.compile...")
+        compile_transformer_blocks(model)
+
+    # Special-token ids the LZW compressor must never merge into the codebook,
+    # derived from the active tokenizer so this is correct for Llama, Phi, etc.
+    # (For Llama-3.1 this reproduces the reserved 128000-128255 range.)
+    from transformers import AutoTokenizer
+    _dl_tok = AutoTokenizer.from_pretrained(args.tokenizer)
+    _special_ids = set(_dl_tok.all_special_ids or [])
+    _added_ids = set(_dl_tok.get_added_vocab().values())
+    disabled_ids = sorted(
+        i for i in (_special_ids | _added_ids) if 0 <= i < config.vocab_size
+    )
+    if rank == 0:
+        print(f"[data] initial_vocab_size={config.vocab_size} "
+              f"pad_token_id={config.pad_token_id} "
+              f"disabled_ids={disabled_ids[:6]}{'...' if len(disabled_ids) > 6 else ''} "
+              f"({len(disabled_ids)} ids)")
+
     # Dataset and dataloader
     dataloader = build_dataloader(
         data_dir=args.data_dir,
@@ -706,6 +806,9 @@ def main():
         rank=rank,
         world_size=world_size,
         num_workers=args.num_workers,
+        pad_token_id=config.pad_token_id,
+        initial_vocab_size=config.vocab_size,
+        disabled_ids=disabled_ids,
         mode=args.mode,
         remap_codebook=not args.no_remap_codebook,
         debug_samples=max(0, args.debug_first_steps * max(1, args.gradient_accumulation_steps)),
@@ -724,7 +827,7 @@ def main():
                 "Byte-PPL/BPB evaluation requires `transformers`. "
                 "Install it in the current environment, e.g. `uv pip install transformers`."
             ) from e
-        byte_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B")
+        byte_tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
         total_loss_sum = 0.0
         total_valid_tokens = 0
         total_base_tokens = 0
@@ -1017,9 +1120,10 @@ def main():
                 f"after to(device) n_base_tokens_sum={int(n_base_tokens.sum().item())}",
             )
 
-            # Only sync gradients on last micro-step
+            # FSDP2 grad accumulation: only reduce-scatter grads on the last micro-step
             is_last = micro_step == args.gradient_accumulation_steps - 1
-            ctx = contextlib.nullcontext() if is_last else model.no_sync()
+            model.set_requires_gradient_sync(is_last)
+            ctx = contextlib.nullcontext()
 
             with ctx:
               with torch.profiler.record_function("fwd"):
@@ -1098,23 +1202,17 @@ def main():
                         accum_hyper_type_acc += (type_preds[hyper_mask_cls] == 1).float().mean().item() / args.gradient_accumulation_steps
                     accum_hyper_ratio += hyper_mask_cls.float().mean().item() / args.gradient_accumulation_steps
 
-        # Copy bf16 grads → fp32 master params, clip, step, copy back
+        # Clip + step directly on the FSDP-sharded fp32 params.
         debug_enabled = step <= args.debug_first_steps
-        _debug_rank_log(debug_enabled, rank, step, -1, "before master grad copy")
-        for mp, p in zip(master_params, trainable_params):
-            mp.grad = p.grad.float() if p.grad is not None else None
-        _debug_rank_log(debug_enabled, rank, step, -1, "after master grad copy")
-        grad_norm = torch.nn.utils.clip_grad_norm_(master_params, args.max_grad_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        # clip_grad_norm_ may return a DTensor under FSDP; reduce to a python float.
+        if hasattr(grad_norm, "full_tensor"):
+            grad_norm = grad_norm.full_tensor()
         _debug_rank_log(debug_enabled, rank, step, -1, f"after grad clip grad_norm={float(grad_norm):.4f}")
 
         _debug_rank_log(debug_enabled, rank, step, -1, "before optimizer.step")
         optimizer.step()
         _debug_rank_log(debug_enabled, rank, step, -1, "after optimizer.step")
-
-        with torch.no_grad():
-            for mp, p in zip(master_params, trainable_params):
-                p.copy_(mp.to(p.dtype))
-        _debug_rank_log(debug_enabled, rank, step, -1, "after master->model copy")
 
         log_loss += accum_loss
         log_base_loss += accum_base_loss
@@ -1182,9 +1280,19 @@ def main():
 
             if rank == 0:
                 total_tokens_seen = step * global_batch_tokens
+                _base_loss_val = base_loss_tensor.item()
+                # Guard ppl: a diverged/inf loss must not crash the logging (and
+                # the whole job). Print inf instead and flag it.
+                if not math.isfinite(_base_loss_val) or _base_loss_val > 60:
+                    _ppl_val = float("inf")
+                else:
+                    _ppl_val = math.exp(_base_loss_val)
+                if not math.isfinite(_base_loss_val):
+                    print(f"[WARN] step {step}: non-finite base_loss={_base_loss_val} "
+                          f"(training diverged or numerical issue)")
                 log_msg = (
-                    f"step={step:6d} | loss={base_loss_tensor.item():.4f} | "
-                    f"ppl={math.exp(base_loss_tensor.item()):.2f} | "
+                    f"step={step:6d} | loss={_base_loss_val:.4f} | "
+                    f"ppl={_ppl_val:.2f} | "
                     f"acc={acc_tensor.item():.4f} | "
                     f"base_token_acc={base_token_acc_tensor.item():.4f} | "
                     f"hyper_token_acc={hyper_token_acc_tensor.item():.4f} | "
