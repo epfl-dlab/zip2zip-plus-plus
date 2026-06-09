@@ -15,6 +15,10 @@ from transformers import AutoModelForCausalLM
 from zip2zip.model import Zip2ZipModel
 from zip2zip.tokenizer import Zip2ZipTokenizer
 
+
+CHAT_TURN_END_TOKENS = ("<|end|>", "<|eot_id|>", "<|im_end|>")
+
+
 def resolve_base_model_name(repo: str, revision: str, cli_base_model: str | None) -> str:
     if cli_base_model:
         return str(cli_base_model)
@@ -22,6 +26,30 @@ def resolve_base_model_name(repo: str, revision: str, cli_base_model: str | None
     with open(cfg_path, "r", encoding="utf-8") as file:
         cfg = json.load(file)
     return str(cfg["base_model_name_or_path"])
+
+
+def get_base_tokenizer(tokenizer):
+    return getattr(tokenizer, "hf_tokenizer", getattr(tokenizer, "tokenizer", tokenizer))
+
+
+def get_generation_stop_token_ids(tokenizer: Zip2ZipTokenizer, *, instruct: bool) -> int | list[int]:
+    base_tokenizer = get_base_tokenizer(tokenizer)
+    stop_ids: list[int] = []
+    candidates = [getattr(tokenizer, "eos_token_id", None)]
+    if instruct:
+        for token in CHAT_TURN_END_TOKENS:
+            token_id = base_tokenizer.convert_tokens_to_ids(token)
+            if token_id is not None and token_id != base_tokenizer.unk_token_id:
+                candidates.append(int(token_id))
+    for token_id in candidates:
+        if token_id is None:
+            continue
+        token_id = int(token_id)
+        if token_id not in stop_ids:
+            stop_ids.append(token_id)
+    if not stop_ids:
+        raise ValueError("No generation stop token ids found")
+    return stop_ids[0] if len(stop_ids) == 1 else stop_ids
 
 
 def main():
@@ -76,6 +104,8 @@ def main():
             max_new_tokens=args.max_new_tokens,
             use_cache=True,
             top_k=50,
+            eos_token_id=get_generation_stop_token_ids(tokenizer, instruct=args.instruct),
+            pad_token_id=tokenizer.pad_token_id,
         )
 
     for text in tokenizer.batch_decode(outputs, skip_special_tokens=True):
