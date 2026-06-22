@@ -419,11 +419,55 @@ def load_checkpoint(model, optimizer, resume_dir, device, random_weights=False):
     return step
 
 
+def _split_phi3_to_llama(hf_sd, config):
+    """Split Phi3 fused weights into HF-Llama layout so Llama3StateDictAdapter works.
+
+    Phi-3 stores fused ``self_attn.qkv_proj`` and ``mlp.gate_up_proj``; the
+    torchtitan decoder (and Llama3StateDictAdapter) expects separate q/k/v and
+    gate/up. This is the exact inverse of ``_fuse_llama_to_phi3`` in
+    ``scripts/zip2zip_hf/export_phi.py`` — split here, then ``from_hf`` applies
+    the RoPE reverse-permute, mirroring how export fuses *after* ``to_hf``.
+    """
+    n_layers = config.n_layers
+    n_heads = config.layer.attention.n_heads
+    n_kv_heads = config.layer.attention.n_kv_heads
+    if n_kv_heads is None:
+        n_kv_heads = n_heads
+    head_dim = config.dim // n_heads
+    q_dim = n_heads * head_dim
+    kv_dim = n_kv_heads * head_dim
+
+    out = {}
+    # pass-through tensors (same names in HF-Llama)
+    for k in ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"):
+        if k in hf_sd:
+            out[k] = hf_sd[k]
+    for i in range(n_layers):
+        p = f"model.layers.{i}."
+        # Phi3 concatenates qkv_proj as [q | k | v] along the output dim.
+        qkv = hf_sd[f"{p}self_attn.qkv_proj.weight"]
+        q, k, v = torch.split(qkv, [q_dim, kv_dim, kv_dim], dim=0)
+        out[f"{p}self_attn.q_proj.weight"] = q
+        out[f"{p}self_attn.k_proj.weight"] = k
+        out[f"{p}self_attn.v_proj.weight"] = v
+        out[f"{p}self_attn.o_proj.weight"] = hf_sd[f"{p}self_attn.o_proj.weight"]
+        # Phi3 chunks gate_up_proj as [gate | up].
+        gate_up = hf_sd[f"{p}mlp.gate_up_proj.weight"]
+        g, u = torch.chunk(gate_up, 2, dim=0)
+        out[f"{p}mlp.gate_proj.weight"] = g
+        out[f"{p}mlp.up_proj.weight"] = u
+        out[f"{p}mlp.down_proj.weight"] = hf_sd[f"{p}mlp.down_proj.weight"]
+        out[f"{p}input_layernorm.weight"] = hf_sd[f"{p}input_layernorm.weight"]
+        out[f"{p}post_attention_layernorm.weight"] = hf_sd[f"{p}post_attention_layernorm.weight"]
+    return out
+
+
 def load_hf_pretrained(model, hf_model_name, device):
-    """Load decoder weights from a HuggingFace pretrained Llama model.
+    """Load decoder weights from a HuggingFace pretrained Llama or Phi-3 model.
 
     Hyper-encoder and other zip2zip-specific parameters are left at their
-    current (randomly initialized) values.
+    current (randomly initialized) values. Phi-3 checkpoints (fused qkv_proj /
+    gate_up_proj) are split to Llama layout first via ``_split_phi3_to_llama``.
     """
     from safetensors.torch import load_file
     from huggingface_hub import snapshot_download
@@ -446,6 +490,13 @@ def load_hf_pretrained(model, hf_model_name, device):
     hf_sd = {}
     for f in shard_files:
         hf_sd.update(load_file(f, device="cpu"))
+
+    # Phi-3 stores fused qkv_proj / gate_up_proj — split to Llama layout first
+    # so Llama3StateDictAdapter (Llama-only) can convert + RoPE-permute them.
+    if any(k.endswith("self_attn.qkv_proj.weight") for k in hf_sd):
+        if dist.get_rank() == 0:
+            print("[init_from_hf] Detected fused Phi-3 qkv_proj/gate_up_proj — splitting to Llama layout")
+        hf_sd = _split_phi3_to_llama(hf_sd, config)
 
     # Convert HF keys to torchtitan keys using Llama3StateDictAdapter
     from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
