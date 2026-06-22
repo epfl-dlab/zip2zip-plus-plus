@@ -19,7 +19,7 @@ import numpy as np
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-OUTPUT_DIR = "/capstor/scratch/cscs/mxx/zip2zip-data/zip2zip-1B-sft-8shards"
+OUTPUT_DIR = "/capstor/store/cscs/swissai/a0101/mxx/zip2zip-data/zip2zip-1B-sft-8shards"
 TOKENS_PER_SHARD = 125_000_000
 TOKENIZE_BATCH_SIZE = 5_000
 TOKENIZE_NUM_PROC = 8

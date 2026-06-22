@@ -22,7 +22,7 @@ export PYTHON=$PROJECT_DIR/.venv/bin/python
 # export WANDB_API_KEY=<your-wandb-api-key>
 
 # ---------- finetuning config (override via environment) ----------
-DATA_DIR=${DATA_DIR:-/capstor/scratch/cscs/mxx/zip2zip-data/llaza-1B-tokens-8shards}
+DATA_DIR=${DATA_DIR:-/capstor/store/cscs/swissai/a0101/mxx/zip2zip-data/llaza-1B-tokens-8shards}
 OUTPUT_BASE=${OUTPUT_BASE:-$SCRATCH/zip2zip-outputs}
 RUN_NAME=${RUN_NAME:-llaza_1b_llama32_instruct_ms2_1bt_v1}
 OUTPUT_DIR=${OUTPUT_DIR:-${OUTPUT_BASE}/${RUN_NAME}}
