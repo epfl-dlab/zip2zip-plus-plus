@@ -1,33 +1,33 @@
 #!/bin/bash
-# Evaluate a zip2zip checkpoint on the EPFL RCP cluster using eval_harness.py.
+# Evaluate the released zip2zip HF model on the EPFL RCP cluster.
+#
+# Uses the zip2zip pip package (ext/zip2zip) which can load the HF adapter
+# format (adapter_model.safetensors + zip2zip_encoders.safetensors).
 #
 # ── Usage (Run:AI training jobs — fire and forget) ───────────────────────
 #
-#   # Smoke test (20 samples, no W&B):
+#   # Smoke test (20 samples):
 #   runai submit --name eval-z2z-smoke \
 #     --image ghcr.io/jkminder/dlab-runai-images/pytorch:master \
 #     --gpu 1 --cpu 8 --memory 64Gi \
 #     --pvc dlab-scratch:/mnt --large-shm \
 #     --node-pools default \
-#     --environment PRESET=smoke \
+#     --environment LIMIT=20 \
 #     -- bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/eval_z2z_rcp.sh
 #
-#   # Full eval (W&B enabled, matches paper Table 3):
+#   # Full eval:
 #   runai submit --name eval-z2z-full \
 #     --image ghcr.io/jkminder/dlab-runai-images/pytorch:master \
 #     --gpu 1 --cpu 8 --memory 64Gi \
 #     --pvc dlab-scratch:/mnt --large-shm \
 #     --node-pools default \
-#     --environment PRESET=default \
 #     -- bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/eval_z2z_rcp.sh
 #
 # ── Environment variables ────────────────────────────────────────────────
 #
-#   PRESET=smoke|default     Eval preset (default: smoke)
-#   HF_REPO=...              HF model repo (default: epfl-dlab/zip2zip-Phi-3.5-mini-instruct-v0.1)
-#   HF_REVISION=...          HF revision/branch (default: none)
-#   RESUME_WANDB_ID=...      W&B run ID to resume, or 'none' for new run (default: none)
-#   WANDB_PROJECT=...        Override W&B project (default: from project.py)
+#   HF_MODEL=...    HF model repo (default: epfl-dlab/zip2zip-Phi-3.5-mini-instruct-v0.1)
+#   LIMIT=20        Per-task sample limit for smoke tests
+#   LIMIT=          Full evaluation (default)
 #
 set -euo pipefail
 
@@ -50,52 +50,42 @@ if [ ! -f "$VENV_DIR/bin/activate" ]; then
     pip install --quiet lm-eval "zip2zip-compression>=0.3.3"
 else
     source "$VENV_DIR/bin/activate"
-    python -c "import zip2zip_compression" 2>/dev/null \
-        || pip install --quiet "zip2zip-compression>=0.3.3"
 fi
 
-# ---------- submodules (torchtitan is loaded via sys.path) ----------
+# ---------- install ext/zip2zip if missing ----------
 cd "$PROJECT_DIR"
-if [ ! -f ext/torchtitan/torchtitan/__init__.py ]; then
+if [ ! -f ext/zip2zip/src/zip2zip/model.py ]; then
     echo "[eval_z2z] Initializing git submodules..."
     git submodule update --init --recursive
 fi
+python -c "import zip2zip" 2>/dev/null \
+    || pip install --quiet -e ext/zip2zip
 
 # ---------- config ----------
-HF_REPO=${HF_REPO:-epfl-dlab/zip2zip-Phi-3.5-mini-instruct-v0.1}
-HF_REVISION=${HF_REVISION:-}
-PRESET=${PRESET:-smoke}
-RESUME_WANDB_ID=${RESUME_WANDB_ID:-none}
+HF_MODEL=${HF_MODEL:-epfl-dlab/zip2zip-Phi-3.5-mini-instruct-v0.1}
+LIMIT=${LIMIT:-}
 
-HF_REV_ARG=""
-if [ -n "$HF_REVISION" ]; then
-    HF_REV_ARG="--hf_revision $HF_REVISION"
+LIMIT_ARG=""
+if [ -n "$LIMIT" ]; then
+    LIMIT_ARG="--limit $LIMIT"
 fi
 
-WANDB_PROJECT_ARG=""
-if [ -n "${WANDB_PROJECT:-}" ]; then
-    WANDB_PROJECT_ARG="--wandb_project $WANDB_PROJECT"
-fi
-
-LOGFILE="$LOG_DIR/eval_z2z_${PRESET}_${TIMESTAMP}.log"
-OUTPUT_JSON="$LOG_DIR/results_z2z_${PRESET}_${TIMESTAMP}.json"
+LOGFILE="$LOG_DIR/eval_z2z_${TIMESTAMP}.log"
+OUTPUT_JSON="$LOG_DIR/results_z2z_${TIMESTAMP}.json"
 
 {
-echo "=== zip2zip checkpoint evaluation ==="
-echo "  HF_REPO:         $HF_REPO"
-echo "  HF_REVISION:     ${HF_REVISION:-<default>}"
-echo "  PRESET:          $PRESET"
-echo "  RESUME_WANDB_ID: $RESUME_WANDB_ID"
-echo "  LOGFILE:         $LOGFILE"
-echo "  OUTPUT_JSON:     $OUTPUT_JSON"
-echo "======================================="
+echo "=== zip2zip HF model evaluation ==="
+echo "  HF_MODEL:   $HF_MODEL"
+echo "  LIMIT:      ${LIMIT:-<full>}"
+echo "  LOGFILE:    $LOGFILE"
+echo "  OUTPUT_JSON: $OUTPUT_JSON"
+echo "====================================="
 
-python scripts/eval_harness.py \
-    --preset "$PRESET" \
-    --hf_repo "$HF_REPO" \
-    $HF_REV_ARG \
-    --resume_wandb_id "$RESUME_WANDB_ID" \
+python scripts/eval_hf_model.py \
+    --model "$HF_MODEL" \
+    --tasks "arc_challenge,arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k" \
+    --num_fewshot 2 \
     --output_path "$OUTPUT_JSON" \
-    $WANDB_PROJECT_ARG
+    $LIMIT_ARG
 
 } 2>&1 | tee "$LOGFILE"
