@@ -1,0 +1,72 @@
+# ============================================================================
+# Evaluation presets for scripts/eval_harness.py
+# ============================================================================
+#
+# Usage:
+#   python scripts/eval_harness.py --preset default \
+#       --ckpt_dir /path/to/step_N --resume_wandb_id none
+#
+#   python scripts/eval_harness.py --preset smoke \
+#       --ckpt_dir /path/to/step_N --resume_wandb_id none
+#
+# On the EPFL RCP cluster (Run:AI / SLURM):
+#   sbatch --export=ALL,CHECKPOINT=/path/to/step_N \
+#       scripts/eval_harness.sbatch
+#   (add PRESET=default or PRESET=smoke to the --export list
+#    if the sbatch is updated to pass --preset)
+#
+#   Or directly:
+#   python scripts/eval_harness.py --preset default \
+#       --ckpt_dir /path/to/step_N --resume_wandb_id none
+#
+# Validation plan
+# ---------------
+# The `default` preset is designed to match the paper's Table 3 setup
+# (2506.01084v2). To verify the pipeline produces correct results, run
+# standard lm-eval (not through the zip2zip adapter) on the base
+# microsoft/Phi-3.5-mini-instruct model with the same 2-shot setting,
+# and compare against the paper's "Base" row for Phi-3.5-4B:
+#
+#   ARC-c   ARC-e   HS      OBQA    PIQA    WG      GSM8K
+#   0.60    0.83    0.66    0.46    0.79    0.75    0.82
+#
+# This validation step uses standard lm-eval, not eval_harness.py:
+#
+#   lm_eval --model hf \
+#       --model_args pretrained=microsoft/Phi-3.5-mini-instruct \
+#       --tasks arc_challenge,arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k \
+#       --num_fewshot 2 \
+#       --device cuda \
+#       --batch_size 1
+#
+# If those numbers match, the benchmark configuration is correct and
+# results from eval_harness.py (which uses the same tasks/settings
+# through the zip2zip adapter) are trustworthy for comparing zip2zip
+# checkpoints.
+#
+# The model microsoft/Phi-3.5-mini-instruct is already cached in the
+# HF cache on the machine.
+# ============================================================================
+
+presets:
+  default:
+    description: "2-shot MC + generation benchmarks (matches paper Table 3)"
+    tasks: [arc_challenge, arc_easy, hellaswag, openbookqa, piqa, winogrande, gsm8k]
+    num_fewshot: 2
+    max_length: 4096
+    eval_mode: compressed
+    batch_size: 1
+    dtype: bfloat16
+    seed: 1234
+
+  smoke:
+    description: "Quick sanity check — all tasks, 20 samples each, no W&B"
+    tasks: [arc_challenge, arc_easy, hellaswag, openbookqa, piqa, winogrande, gsm8k]
+    num_fewshot: 2
+    max_length: 4096
+    eval_mode: compressed
+    batch_size: 1
+    dtype: bfloat16
+    seed: 1234
+    limit: 20
+    no_wandb: true

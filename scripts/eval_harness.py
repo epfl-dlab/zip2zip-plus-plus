@@ -81,6 +81,53 @@ def _resolve_ckpt_dir(args: argparse.Namespace) -> str:
     return ckpt
 
 
+def _apply_preset(parser):
+    """If --preset was given, load the YAML and set parser defaults.
+
+    Returns ``(name, description)`` when a preset is active, else ``None``.
+    Uses a throwaway parser so that ``required=True`` on other args doesn't
+    block the preliminary parse.
+    """
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--preset", default=None)
+    pre.add_argument("--preset_file", default=None)
+    ns, _ = pre.parse_known_args()
+
+    if ns.preset is None:
+        return None
+
+    import yaml
+
+    preset_file = ns.preset_file or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "eval_presets.yaml"
+    )
+    with open(preset_file) as f:
+        all_presets = yaml.safe_load(f)
+
+    name = ns.preset
+    presets = all_presets.get("presets", {})
+    if name not in presets:
+        raise SystemExit(
+            f"[eval_harness] Unknown preset '{name}'. "
+            f"Available: {list(presets.keys())}"
+        )
+
+    preset = presets[name]
+    desc = preset.get("description", "")
+
+    defaults = {}
+    for key, value in preset.items():
+        if key == "description":
+            continue
+        if key == "tasks" and isinstance(value, list):
+            defaults["tasks"] = ",".join(value)
+        else:
+            defaults[key] = value
+
+    parser.set_defaults(**defaults)
+    return name, desc
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt_dir", default=None,
@@ -120,6 +167,13 @@ def main():
     p.add_argument("--no_log_samples", action="store_true",
                    help="Disable logging per-sample results to W&B.")
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--preset", default=None,
+                   help="Named evaluation preset from the presets YAML file.")
+    p.add_argument("--preset_file", default=None,
+                   help="Path to presets YAML file. "
+                        "Default: scripts/eval_presets.yaml next to this script.")
+
+    preset_info = _apply_preset(p)
     args = p.parse_args()
 
     ckpt_dir = _resolve_ckpt_dir(args)
@@ -145,6 +199,8 @@ def main():
         hyper_causal_mask=not args.no_hyper_causal_mask,
     )
 
+    if preset_info:
+        print(f"[eval_harness] preset: {preset_info[0]} — {preset_info[1]}")
     print(f"[eval_harness] checkpoint:   {ckpt_dir}")
     print(f"[eval_harness] tasks:        {tasks}")
     print(f"[eval_harness] eval_mode:    {args.eval_mode}")
