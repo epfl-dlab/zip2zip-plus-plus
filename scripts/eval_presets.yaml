@@ -61,6 +61,16 @@ presets:
     apply_chat_template: true
     fewshot_as_multiturn: true
 
+  perplexity:
+    description: "Byte-level perplexity on four corpora (matches paper Table 3, 1024-token window)"
+    tasks: [wikitext, zip2zip_pile, zip2zip_mc4, zip2zip_dc4]
+    num_fewshot: 0
+    max_length: 1024
+    eval_mode: compressed
+    batch_size: 1
+    dtype: bfloat16
+    seed: 1234
+
   smoke:
     description: "Quick sanity check — all tasks, 20 samples each, no W&B"
     tasks: [arc_challenge, arc_easy, hellaswag, openbookqa, piqa, winogrande, gsm8k]
