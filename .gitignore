@@ -12,3 +12,4 @@ wandb
 *.out
 *.vscode/
 outputs/
+.DS_Store
