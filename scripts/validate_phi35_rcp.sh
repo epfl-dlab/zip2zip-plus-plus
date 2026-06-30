@@ -57,11 +57,9 @@ VENV_DIR=$SCRATCH/.venvs/lm-eval
 if [ ! -f "$VENV_DIR/bin/activate" ]; then
     echo "[validate] Creating venv at $VENV_DIR (first run only)..."
     python -m venv --system-site-packages "$VENV_DIR"
-    source "$VENV_DIR/bin/activate"
-    pip install --quiet lm-eval
-else
-    source "$VENV_DIR/bin/activate"
 fi
+source "$VENV_DIR/bin/activate"
+pip install --quiet lm-eval
 
 # ---------- config ----------
 MODEL="microsoft/Phi-3.5-mini-instruct"

@@ -46,11 +46,9 @@ VENV_DIR=$SCRATCH/.venvs/lm-eval
 if [ ! -f "$VENV_DIR/bin/activate" ]; then
     echo "[eval_z2z] Creating venv at $VENV_DIR..."
     python -m venv --system-site-packages "$VENV_DIR"
-    source "$VENV_DIR/bin/activate"
-    pip install --quiet lm-eval "zip2zip-compression>=0.3.3"
-else
-    source "$VENV_DIR/bin/activate"
 fi
+source "$VENV_DIR/bin/activate"
+pip install --quiet lm-eval "zip2zip-compression>=0.3.3"
 
 # ---------- install ext/zip2zip if missing ----------
 cd "$PROJECT_DIR"

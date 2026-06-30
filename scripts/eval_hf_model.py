@@ -79,11 +79,20 @@ def main():
     print("=" * 72)
 
     if args.output_path:
-        out_dir = os.path.dirname(os.path.abspath(args.output_path))
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
         with open(args.output_path, "w") as f:
-            json.dump(results, f, indent=2, default=str)
+            json.dump(
+                {
+                    "results": results.get("results"),
+                    "configs": results.get("configs"),
+                    "model": args.model,
+                    "tasks": tasks,
+                    "args": vars(args),
+                },
+                f,
+                indent=2,
+                default=str,
+            )
         print(f"[eval_hf] Saved to {args.output_path}")
 
 
