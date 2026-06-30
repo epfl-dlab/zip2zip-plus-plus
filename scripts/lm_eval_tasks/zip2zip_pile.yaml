@@ -11,7 +11,7 @@ test_split: validation
 # IterableColumn instead of a row dict.)
 output_type: loglikelihood_rolling
 doc_to_text: ""
-doc_to_target: "{{text}}"
+doc_to_target: !function utils.doc_to_target
 should_decontaminate: false
 metric_list:
   - metric: word_perplexity
