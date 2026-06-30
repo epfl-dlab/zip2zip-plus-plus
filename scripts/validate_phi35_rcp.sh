@@ -93,7 +93,7 @@ echo "==================================================="
 
 python -m lm_eval \
     --model hf \
-    --model_args "pretrained=$MODEL,max_length=$MAX_LENGTH" \
+    --model_args "pretrained=$MODEL,max_length=$MAX_LENGTH,use_fast_tokenizer=false" \
     --tasks "$TASKS" \
     --num_fewshot "$NUM_FEWSHOT" \
     --device cuda \
