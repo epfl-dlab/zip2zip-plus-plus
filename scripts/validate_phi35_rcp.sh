@@ -63,7 +63,7 @@ if [ ! -f "$VENV_DIR/bin/activate" ]; then
     python -m venv --system-site-packages "$VENV_DIR"
 fi
 source "$VENV_DIR/bin/activate"
-pip install --quiet lm-eval
+pip install --quiet "lm-eval==0.4.9"
 
 # ---------- config from eval_presets.yaml (single source of truth) ----------
 MODEL="microsoft/Phi-3.5-mini-instruct"

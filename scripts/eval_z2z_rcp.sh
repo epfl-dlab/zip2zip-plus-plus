@@ -48,7 +48,7 @@ if [ ! -f "$VENV_DIR/bin/activate" ]; then
     python -m venv --system-site-packages "$VENV_DIR"
 fi
 source "$VENV_DIR/bin/activate"
-pip install --quiet lm-eval "zip2zip-compression>=0.3.3"
+pip install --quiet "lm-eval==0.4.9" "zip2zip-compression>=0.3.3"
 
 # ---------- install ext/zip2zip if missing ----------
 cd "$PROJECT_DIR"
