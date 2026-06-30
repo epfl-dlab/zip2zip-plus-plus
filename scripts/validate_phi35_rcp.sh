@@ -99,6 +99,8 @@ python -m lm_eval \
     --device cuda \
     --batch_size "$BATCH_SIZE" \
     --output_path "$RESULTS_DIR" \
+    --apply_chat_template \
+    --fewshot_as_multiturn \
     $LIMIT_ARG
 
 echo ""

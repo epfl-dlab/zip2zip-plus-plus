@@ -69,6 +69,8 @@ def main():
         numpy_random_seed=args.seed,
         torch_random_seed=args.seed,
         fewshot_random_seed=args.seed,
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
     )
 
     print("\n" + "=" * 72)
