@@ -61,6 +61,7 @@ python -c "import zip2zip" 2>/dev/null \
 
 # ---------- config ----------
 HF_MODEL=${HF_MODEL:-epfl-dlab/zip2zip-Phi-3.5-mini-instruct-v0.1}
+PRESET=${PRESET:-default}
 LIMIT=${LIMIT:-}
 
 LIMIT_ARG=""
@@ -68,12 +69,13 @@ if [ -n "$LIMIT" ]; then
     LIMIT_ARG="--limit $LIMIT"
 fi
 
-LOGFILE="$LOG_DIR/eval_z2z_${TIMESTAMP}.log"
-OUTPUT_JSON="$LOG_DIR/results_z2z_${TIMESTAMP}.json"
+LOGFILE="$LOG_DIR/eval_z2z_${PRESET}_${TIMESTAMP}.log"
+OUTPUT_JSON="$LOG_DIR/results_z2z_${PRESET}_${TIMESTAMP}.json"
 
 {
 echo "=== zip2zip HF model evaluation ==="
 echo "  HF_MODEL:   $HF_MODEL"
+echo "  PRESET:     $PRESET"
 echo "  LIMIT:      ${LIMIT:-<full>}"
 echo "  LOGFILE:    $LOGFILE"
 echo "  OUTPUT_JSON: $OUTPUT_JSON"
@@ -81,6 +83,7 @@ echo "====================================="
 
 python scripts/eval_hf_model.py \
     --model "$HF_MODEL" \
+    --preset "$PRESET" \
     --output_path "$OUTPUT_JSON" \
     $LIMIT_ARG
 

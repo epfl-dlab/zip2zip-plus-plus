@@ -47,10 +47,14 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
 SCRATCH=/dlabscratch1/gentilin
+PRESET=${PRESET:-default}
+LIMIT=${LIMIT:-}
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 LOG_DIR=$SCRATCH/logs/eval
 mkdir -p "$LOG_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOGFILE="$LOG_DIR/validate_phi35_${TIMESTAMP}.log"
+LOGFILE="$LOG_DIR/validate_phi35_${PRESET}_${TIMESTAMP}.log"
 
 # ---------- persistent venv on scratch (survives across jobs) ----------
 VENV_DIR=$SCRATCH/.venvs/lm-eval
@@ -63,9 +67,8 @@ pip install --quiet lm-eval
 
 # ---------- config from eval_presets.yaml (single source of truth) ----------
 MODEL="microsoft/Phi-3.5-mini-instruct"
-LIMIT=${LIMIT:-}
 
-eval "$(python3 "$(dirname "$0")/load_preset.py")"
+eval "$(python3 "$SCRIPT_DIR/load_preset.py" "$PRESET")"
 
 LIMIT_ARG=""
 if [ -n "$LIMIT" ]; then
@@ -73,7 +76,7 @@ if [ -n "$LIMIT" ]; then
 fi
 
 # ---------- lm-eval results output ----------
-RESULTS_DIR="$LOG_DIR/results_phi35_${TIMESTAMP}"
+RESULTS_DIR="$LOG_DIR/results_phi35_${PRESET}_${TIMESTAMP}"
 mkdir -p "$RESULTS_DIR"
 
 {
@@ -90,12 +93,13 @@ echo "==================================================="
 
 python -m lm_eval \
     --model hf \
-    --model_args "pretrained=$MODEL" \
+    --model_args "pretrained=$MODEL,max_length=$MAX_LENGTH" \
     --tasks "$TASKS" \
     --num_fewshot "$NUM_FEWSHOT" \
     --device cuda \
     --batch_size "$BATCH_SIZE" \
     --output_path "$RESULTS_DIR" \
+    --include_path "$SCRIPT_DIR/lm_eval_tasks" \
     ${CHAT_TEMPLATE_FLAG:-} \
     ${MULTITURN_FLAG:-} \
     $LIMIT_ARG

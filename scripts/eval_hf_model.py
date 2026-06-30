@@ -22,6 +22,7 @@ from zip2zip.model import Zip2ZipModel
 from zip2zip.tokenizer import Zip2ZipTokenizer
 from zip2zip.tools.harness import Zip2ZipForLMEval
 from lm_eval import simple_evaluate
+from lm_eval.tasks import TaskManager
 
 
 from load_preset import apply_preset
@@ -40,12 +41,21 @@ def main():
     p.add_argument("--max_length", type=int, default=4096)
     p.add_argument("--device", default="cuda")
     p.add_argument("--output_path", default=None)
+    p.add_argument("--include_path", default=None,
+                   help="Directory of custom task YAMLs. "
+                        "Default: scripts/lm_eval_tasks/ next to this script.")
     p.add_argument("--seed", type=int, default=1234)
 
     preset_info = apply_preset(p, default="default")
     args = p.parse_args()
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
+
+    include_path = args.include_path or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "lm_eval_tasks"
+    )
+    if not os.path.isdir(include_path):
+        include_path = None
 
     if preset_info:
         print(f"[eval_hf] preset:      {preset_info[0]} — {preset_info[1]}")
@@ -67,6 +77,8 @@ def main():
         max_length=args.max_length,
     )
 
+    task_manager = TaskManager(include_path=include_path) if include_path else TaskManager()
+
     results = simple_evaluate(
         model=lm,
         tasks=tasks,
@@ -74,6 +86,7 @@ def main():
         limit=args.limit,
         batch_size=args.batch_size,
         device=args.device,
+        task_manager=task_manager,
         random_seed=args.seed,
         numpy_random_seed=args.seed,
         torch_random_seed=args.seed,

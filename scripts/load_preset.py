@@ -49,6 +49,7 @@ if __name__ == "__main__":
     print(f"TASKS={tasks}")
     print(f"NUM_FEWSHOT={p.get('num_fewshot', 2)}")
     print(f"BATCH_SIZE={p.get('batch_size', 1)}")
+    print(f"MAX_LENGTH={p.get('max_length', 4096)}")
     if p.get("apply_chat_template"):
         print("CHAT_TEMPLATE_FLAG=--apply_chat_template")
     if p.get("fewshot_as_multiturn"):
