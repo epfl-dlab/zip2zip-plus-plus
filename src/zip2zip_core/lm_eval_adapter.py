@@ -37,6 +37,7 @@ from zip2zip_core.model import Zip2ZipLlama3Model
 
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
+from lm_eval.utils import get_rolling_token_windows, make_disjoint_window
 
 
 _LLAMA3_DISABLED_IDS = [128000, 128001, 128002, 128003]
@@ -217,6 +218,16 @@ class Zip2ZipLM(LM):
     def tok_decode(self, ids) -> str:
         return self.tokenizer.decode(ids, skip_special_tokens=True)
 
+    def apply_chat_template(
+        self, chat_history: list[dict[str, str]], add_generation_prompt: bool = True
+    ) -> str:
+        return self.tokenizer.apply_chat_template(
+            chat_history,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            continue_final_message=not add_generation_prompt,
+        )
+
     # ───────────────────────── codebook helpers ───────────────────────────
 
     def _codebook_to_tensor(self, codebook) -> torch.LongTensor:
@@ -369,7 +380,7 @@ class Zip2ZipLM(LM):
         return out
 
     def loglikelihood_rolling(self, requests) -> List[float]:
-        """Sum logprobs over a long text, chunked into max_length base-token windows."""
+        """Sum logprobs over a long text using rolling windows with context overlap."""
         out: List[float] = []
         for req in tqdm(requests, desc="loglikelihood_rolling", disable=len(requests) < 4):
             text = req.args[0]
@@ -377,14 +388,20 @@ class Zip2ZipLM(LM):
             if len(ids) < 2:
                 out.append(0.0)
                 continue
-            stride = self._max_length
             total = 0.0
-            for i in range(0, len(ids), stride):
-                chunk = ids[i : i + stride]
-                if len(chunk) < 2:
+            for prefix_tokens, pred_tokens in map(
+                make_disjoint_window,
+                get_rolling_token_windows(
+                    ids,
+                    prefix_token=self.eot_token_id,
+                    max_seq_len=self._max_length,
+                    context_len=1,
+                ),
+            ):
+                full_ids = list(prefix_tokens) + list(pred_tokens)
+                if len(full_ids) < 2:
                     continue
-                # Score every position past index 0 (no preceding context).
-                lp, _, _, _ = self._score(chunk, cont_start_base=1)
+                lp, _, _, _ = self._score(full_ids, cont_start_base=len(prefix_tokens))
                 total += lp
             out.append(total)
         return out
