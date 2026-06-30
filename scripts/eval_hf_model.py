@@ -24,8 +24,13 @@ from zip2zip.tools.harness import Zip2ZipForLMEval
 from lm_eval import simple_evaluate
 
 
+from load_preset import apply_preset
+
+
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--preset", default="default")
+    p.add_argument("--preset_file", default=None)
     p.add_argument("--model", default="epfl-dlab/zip2zip-Phi-3.5-mini-instruct-v0.1")
     p.add_argument("--tasks",
                    default="arc_challenge,arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k")
@@ -36,10 +41,14 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--output_path", default=None)
     p.add_argument("--seed", type=int, default=1234)
+
+    preset_info = apply_preset(p, default="default")
     args = p.parse_args()
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
 
+    if preset_info:
+        print(f"[eval_hf] preset:      {preset_info[0]} — {preset_info[1]}")
     print(f"[eval_hf] model:       {args.model}")
     print(f"[eval_hf] tasks:       {tasks}")
     print(f"[eval_hf] num_fewshot: {args.num_fewshot}")
@@ -69,8 +78,8 @@ def main():
         numpy_random_seed=args.seed,
         torch_random_seed=args.seed,
         fewshot_random_seed=args.seed,
-        apply_chat_template=True,
-        fewshot_as_multiturn=True,
+        apply_chat_template=getattr(args, 'apply_chat_template', True),
+        fewshot_as_multiturn=getattr(args, 'fewshot_as_multiturn', True),
     )
 
     print("\n" + "=" * 72)

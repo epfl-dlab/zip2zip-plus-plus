@@ -81,51 +81,7 @@ def _resolve_ckpt_dir(args: argparse.Namespace) -> str:
     return ckpt
 
 
-def _apply_preset(parser):
-    """If --preset was given, load the YAML and set parser defaults.
-
-    Returns ``(name, description)`` when a preset is active, else ``None``.
-    Uses a throwaway parser so that ``required=True`` on other args doesn't
-    block the preliminary parse.
-    """
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--preset", default=None)
-    pre.add_argument("--preset_file", default=None)
-    ns, _ = pre.parse_known_args()
-
-    if ns.preset is None:
-        return None
-
-    import yaml
-
-    preset_file = ns.preset_file or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "eval_presets.yaml"
-    )
-    with open(preset_file) as f:
-        all_presets = yaml.safe_load(f)
-
-    name = ns.preset
-    presets = all_presets.get("presets", {})
-    if name not in presets:
-        raise SystemExit(
-            f"[eval_harness] Unknown preset '{name}'. "
-            f"Available: {list(presets.keys())}"
-        )
-
-    preset = presets[name]
-    desc = preset.get("description", "")
-
-    defaults = {}
-    for key, value in preset.items():
-        if key == "description":
-            continue
-        if key == "tasks" and isinstance(value, list):
-            defaults["tasks"] = ",".join(value)
-        else:
-            defaults[key] = value
-
-    parser.set_defaults(**defaults)
-    return name, desc
+from load_preset import apply_preset as _apply_preset
 
 
 def main():
@@ -221,6 +177,8 @@ def main():
         torch_random_seed=args.seed,
         fewshot_random_seed=args.seed,
         log_samples=not args.no_log_samples,
+        apply_chat_template=getattr(args, 'apply_chat_template', False),
+        fewshot_as_multiturn=getattr(args, 'fewshot_as_multiturn', False),
     )
 
     print("\n" + "=" * 72)

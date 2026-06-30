@@ -61,12 +61,11 @@ fi
 source "$VENV_DIR/bin/activate"
 pip install --quiet lm-eval
 
-# ---------- config ----------
+# ---------- config from eval_presets.yaml (single source of truth) ----------
 MODEL="microsoft/Phi-3.5-mini-instruct"
-TASKS="arc_challenge,arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k"
-NUM_FEWSHOT=2
-BATCH_SIZE=1
 LIMIT=${LIMIT:-}
+
+eval "$(python3 "$(dirname "$0")/load_preset.py")"
 
 LIMIT_ARG=""
 if [ -n "$LIMIT" ]; then
@@ -97,8 +96,8 @@ python -m lm_eval \
     --device cuda \
     --batch_size "$BATCH_SIZE" \
     --output_path "$RESULTS_DIR" \
-    --apply_chat_template \
-    --fewshot_as_multiturn \
+    ${CHAT_TEMPLATE_FLAG:-} \
+    ${MULTITURN_FLAG:-} \
     $LIMIT_ARG
 
 echo ""

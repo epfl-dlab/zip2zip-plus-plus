@@ -81,8 +81,6 @@ echo "====================================="
 
 python scripts/eval_hf_model.py \
     --model "$HF_MODEL" \
-    --tasks "arc_challenge,arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k" \
-    --num_fewshot 2 \
     --output_path "$OUTPUT_JSON" \
     $LIMIT_ARG
 

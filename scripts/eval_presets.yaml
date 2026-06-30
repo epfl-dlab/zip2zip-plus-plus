@@ -58,6 +58,8 @@ presets:
     batch_size: 1
     dtype: bfloat16
     seed: 1234
+    apply_chat_template: true
+    fewshot_as_multiturn: true
 
   smoke:
     description: "Quick sanity check — all tasks, 20 samples each, no W&B"
@@ -68,5 +70,7 @@ presets:
     batch_size: 1
     dtype: bfloat16
     seed: 1234
+    apply_chat_template: true
+    fewshot_as_multiturn: true
     limit: 20
     no_wandb: true
