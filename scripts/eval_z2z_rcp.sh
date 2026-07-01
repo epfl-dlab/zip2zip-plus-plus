@@ -69,8 +69,9 @@ if [ -n "$LIMIT" ]; then
     LIMIT_ARG="--limit $LIMIT"
 fi
 
-LOGFILE="$LOG_DIR/eval_z2z_${PRESET}_${TIMESTAMP}.log"
-OUTPUT_JSON="$LOG_DIR/results_z2z_${PRESET}_${TIMESTAMP}.json"
+MODEL_SHORT=$(basename "$HF_MODEL")
+LOGFILE="$LOG_DIR/eval_${MODEL_SHORT}_${PRESET}_${TIMESTAMP}.log"
+OUTPUT_JSON="$LOG_DIR/results_${MODEL_SHORT}_${PRESET}_${TIMESTAMP}.json"
 
 {
 echo "=== zip2zip HF model evaluation ==="
