@@ -6,4 +6,4 @@
 	url = https://github.com/epfl-dlab/zip2zip-compression.git
 [submodule "ext/zip2zip"]
 	path = ext/zip2zip
-	url = https://github.com/epfl-dlab/zip2zip.git
+	url = https://github.com/andrea-gentilini/zip2zip.git
