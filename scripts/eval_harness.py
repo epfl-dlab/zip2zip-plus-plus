@@ -191,6 +191,22 @@ def main():
     print(json.dumps(compression, indent=2))
     print("=" * 72)
 
+    if not args.no_log_samples and results.get("samples"):
+        print("Sample generations (prompt + model output):")
+        max_per_task = 10
+        for task_name, task_samples in results["samples"].items():
+            for i, sample in enumerate(task_samples[:max_per_task]):
+                print(f"\n--- {task_name} sample {i} ---")
+                arguments = sample.get("arguments") or []
+                prompt = arguments[0][0] if arguments else sample.get("doc")
+                print("PROMPT:")
+                print(prompt)
+                print("MODEL OUTPUT:")
+                print(sample.get("filtered_resps") or sample.get("resps"))
+            if len(task_samples) > max_per_task:
+                print(f"\n... {len(task_samples) - max_per_task} more {task_name} samples omitted")
+        print("=" * 72)
+
     if not args.no_wandb:
         from zip2zip_core.project import WANDB_ENTITY, WANDB_PROJECT
         from lm_eval.loggers import WandbLogger
