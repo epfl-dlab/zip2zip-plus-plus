@@ -186,6 +186,11 @@ def main():
     print(json.dumps(results.get("results", results), indent=2, default=str))
     print("=" * 72)
 
+    compression = lm.compression_summary()
+    print("Compression (base tokens per compressed token, >1 = more compression):")
+    print(json.dumps(compression, indent=2))
+    print("=" * 72)
+
     if not args.no_wandb:
         from zip2zip_core.project import WANDB_ENTITY, WANDB_PROJECT
         from lm_eval.loggers import WandbLogger
@@ -225,6 +230,9 @@ def main():
             results["versions"] = {k: str(v) for k, v in results["versions"].items()}
         wandb_logger.post_init(results)
         wandb_logger.log_eval_result()
+        wandb.log(
+            {f"eval/{k}": v for k, v in compression.items() if k.endswith("_ratio")}
+        )
         if not args.no_log_samples and "samples" in results:
             wandb_logger.log_eval_samples(results["samples"])
         print(f"[eval_harness] Results logged to W&B: {wandb_logger.run.url}")
@@ -238,6 +246,7 @@ def main():
                 {
                     "results": results.get("results"),
                     "configs": results.get("configs"),
+                    "compression": compression,
                     "ckpt_dir": ckpt_dir,
                     "tasks": tasks,
                     "args": vars(args),

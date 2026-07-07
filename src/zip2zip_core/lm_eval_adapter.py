@@ -158,6 +158,12 @@ class Zip2ZipLM(LM):
         self._batch_size = int(batch_size)
         self.hyper_causal_mask = bool(hyper_causal_mask)
 
+        # Aggregate compression counters over the whole run, read by callers
+        # (e.g. scripts/eval_harness.py) after simple_evaluate returns.
+        # in_*: full (context + continuation) sequences fed for scoring.
+        # gen_*: tokens emitted by generate_until.
+        self.compression_stats = {"in_comp": 0, "in_base": 0, "gen_comp": 0, "gen_base": 0}
+
         self._compressor_kwargs = dict(
             initial_vocab_size=self.cfg.vocab_size,
             max_codebook_size=self.cfg.max_codebook_size,
@@ -274,6 +280,9 @@ class Zip2ZipLM(LM):
         if len(compressed) < 2:
             return 0.0, True, 0, 0
 
+        self.compression_stats["in_base"] += len(full_ids)
+        self.compression_stats["in_comp"] += len(compressed)
+
         cb_dict = codebook.to_dict()
         V = self.cfg.vocab_size
 
@@ -316,6 +325,8 @@ class Zip2ZipLM(LM):
         """Vanilla LM scoring: feed base tokens, no codebook, base-vocab logits only."""
         if len(full_ids) < 2:
             return 0.0, True, 0, 0
+        self.compression_stats["in_base"] += len(full_ids)
+        self.compression_stats["in_comp"] += len(full_ids)
         x = torch.tensor(full_ids[:-1], dtype=torch.long, device=self._device).unsqueeze(0)
         with torch.autocast(device_type=self._device.type, dtype=self._dtype):
             out = self.model(x)
@@ -340,6 +351,17 @@ class Zip2ZipLM(LM):
         if self.eval_mode == "base":
             return self._score_base(full_ids, cont_start_base)
         return self._score_compressed(full_ids, cont_start_base)
+
+    def compression_summary(self) -> dict:
+        """Raw counters plus derived ratios (base tokens per compressed token,
+        > 1 = more compression; same orientation as train.py's eval/compression).
+        """
+        s = dict(self.compression_stats)
+        if s["in_comp"]:
+            s["input_compression_ratio"] = s["in_base"] / s["in_comp"]
+        if s["gen_comp"]:
+            s["gen_compression_ratio"] = s["gen_base"] / s["gen_comp"]
+        return s
 
     # ──────────────────────── lm-eval interface ───────────────────────────
 
@@ -495,6 +517,8 @@ class Zip2ZipLM(LM):
                     break
             if len(seq) >= self._max_length:
                 break
+        self.compression_stats["gen_comp"] += len(gen_ids)
+        self.compression_stats["gen_base"] += len(gen_ids)
         return self.tok_decode(gen_ids)
 
     @torch.no_grad()
@@ -569,6 +593,7 @@ class Zip2ZipLM(LM):
         logits = out[0] if isinstance(out, tuple) else out
 
         gen_base_ids: List[int] = []
+        n_gen_comp = 0  # sampled compressed tokens that emitted >= 1 base token
         for _ in range(max_gen_toks):
             last = logits[0, -1].float()  # (V + max_codebook_size,)
             next_tok = self._sample_next(last, do_sample, temperature, top_p, top_k)
@@ -584,9 +609,12 @@ class Zip2ZipLM(LM):
             if eos in expansion:
                 cut = expansion.index(eos)
                 gen_base_ids.extend(expansion[:cut])
+                if cut > 0:
+                    n_gen_comp += 1
                 break
 
             gen_base_ids.extend(expansion)
+            n_gen_comp += 1
 
             if until:
                 text = self.tok_decode(gen_base_ids)
@@ -618,6 +646,8 @@ class Zip2ZipLM(LM):
                 )
             logits = out[0] if isinstance(out, tuple) else out
 
+        self.compression_stats["gen_comp"] += n_gen_comp
+        self.compression_stats["gen_base"] += len(gen_base_ids)
         return self.tok_decode(gen_base_ids)
 
     def generate_until(self, requests) -> List[str]:
