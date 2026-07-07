@@ -27,6 +27,7 @@
 #   HF_REPO=...     (required) HF repo with model.pt + meta.pt
 #   PRESET=...      Eval preset (default: default_base)
 #   LIMIT=20        Per-task sample limit for smoke tests
+#   TASKS=gsm8k     Comma-separated task override (default: preset's tasks)
 #
 set -euo pipefail
 
@@ -44,11 +45,13 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 HF_REPO=${HF_REPO:?HF_REPO is required}
 PRESET=${PRESET:-default_base}
 LIMIT=${LIMIT:-}
+TASKS=${TASKS:-}
 
 MODEL_SHORT=$(echo "$HF_REPO" | sed 's|.*/||')
+TASKS_SUFFIX=${TASKS:+_${TASKS//,/-}}
 
-LOGFILE="$LOG_DIR/eval_${MODEL_SHORT}_${PRESET}_${TIMESTAMP}.log"
-OUTPUT_JSON="$LOG_DIR/results_${MODEL_SHORT}_${PRESET}_${TIMESTAMP}.json"
+LOGFILE="$LOG_DIR/eval_${MODEL_SHORT}_${PRESET}${TASKS_SUFFIX}_${TIMESTAMP}.log"
+OUTPUT_JSON="$LOG_DIR/results_${MODEL_SHORT}_${PRESET}${TASKS_SUFFIX}_${TIMESTAMP}.json"
 
 # ---------- venv ----------
 VENV_DIR=$SCRATCH/.venvs/lm-eval
@@ -66,11 +69,16 @@ LIMIT_ARG=""
 if [ -n "$LIMIT" ]; then
     LIMIT_ARG="--limit $LIMIT"
 fi
+TASKS_ARG=""
+if [ -n "$TASKS" ]; then
+    TASKS_ARG="--tasks $TASKS"
+fi
 
 {
 echo "=== zip2zip checkpoint evaluation ==="
 echo "  HF_REPO:     $HF_REPO"
 echo "  PRESET:      $PRESET"
+echo "  TASKS:       ${TASKS:-<preset default>}"
 echo "  LIMIT:       ${LIMIT:-<full>}"
 echo "  LOGFILE:     $LOGFILE"
 echo "  OUTPUT_JSON: $OUTPUT_JSON"
@@ -82,6 +90,7 @@ python scripts/eval_harness.py \
     --no_wandb \
     --resume_wandb_id none \
     --output_path "$OUTPUT_JSON" \
-    $LIMIT_ARG
+    $LIMIT_ARG \
+    $TASKS_ARG
 
 } 2>&1 | tee "$LOGFILE"
