@@ -19,7 +19,7 @@ import numpy as np
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-OUTPUT_DIR = "/capstor/store/cscs/swissai/a0101/mxx/zip2zip-data/zip2zip-1B-sft-8shards"
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/capstor/store/cscs/swissai/a0101/mxx/zip2zip-data/zip2zip-1B-sft-8shards")
 TOKENS_PER_SHARD = 125_000_000
 TOKENIZE_BATCH_SIZE = 5_000
 TOKENIZE_NUM_PROC = 8
@@ -40,8 +40,9 @@ TURN_END = "<|eot_id|>"
 # Sources that have chat format in Zephyr style
 CHAT_SOURCES = {"HuggingFaceH4/ultrachat_200k"}
 
-tokenizer = AutoTokenizer.from_pretrained(BASE_TOKENIZER_NAME)
-chat_tokenizer = AutoTokenizer.from_pretrained(CHAT_TOKENIZER_NAME)
+user_cache = os.environ.get("USER_HF_CACHE", None)
+tokenizer = AutoTokenizer.from_pretrained(BASE_TOKENIZER_NAME, cache_dir=user_cache)
+chat_tokenizer = AutoTokenizer.from_pretrained(CHAT_TOKENIZER_NAME, cache_dir=user_cache)
 
 
 def parse_zephyr_to_messages(text):
