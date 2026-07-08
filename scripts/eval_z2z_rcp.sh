@@ -26,6 +26,7 @@
 # ── Environment variables ────────────────────────────────────────────────
 #
 #   HF_MODEL=...    HF model repo (default: epfl-dlab/zip2zip-Phi-3.5-mini-instruct-v0.1)
+#   PRESET=default  Eval preset from eval_presets.yaml (default: default)
 #   LIMIT=20        Per-task sample limit for smoke tests
 #   LIMIT=          Full evaluation (default)
 #   TASKS=gsm8k     Comma-separated task override (default: preset's task list)
