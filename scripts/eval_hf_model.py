@@ -26,6 +26,7 @@ from lm_eval.tasks import TaskManager
 
 
 from load_preset import apply_preset
+from sample_logging import print_samples
 
 
 def main():
@@ -44,6 +45,8 @@ def main():
     p.add_argument("--include_path", default=None,
                    help="Directory of custom task YAMLs. "
                         "Default: scripts/lm_eval_tasks/ next to this script.")
+    p.add_argument("--no_log_samples", action="store_true",
+                   help="Disable per-sample console logging.")
     p.add_argument("--seed", type=int, default=1234)
 
     preset_info = apply_preset(p, default="default")
@@ -91,6 +94,7 @@ def main():
         numpy_random_seed=args.seed,
         torch_random_seed=args.seed,
         fewshot_random_seed=args.seed,
+        log_samples=not args.no_log_samples,
         apply_chat_template=getattr(args, 'apply_chat_template', True),
         fewshot_as_multiturn=getattr(args, 'fewshot_as_multiturn', True),
     )
@@ -104,6 +108,9 @@ def main():
     print("Compression (base tokens per compressed token, >1 = more compression):")
     print(json.dumps(compression, indent=2))
     print("=" * 72)
+
+    if not args.no_log_samples:
+        print_samples(results)
 
     if args.output_path:
         os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)

@@ -82,6 +82,7 @@ def _resolve_ckpt_dir(args: argparse.Namespace) -> str:
 
 
 from load_preset import apply_preset as _apply_preset
+from sample_logging import print_samples
 
 
 def main():
@@ -191,29 +192,8 @@ def main():
     print(json.dumps(compression, indent=2))
     print("=" * 72)
 
-    if not args.no_log_samples and results.get("samples"):
-        print("Sample generations (prompt + gold target + model output + score):")
-        max_per_task = 10
-        _internal_keys = {"doc", "doc_id", "arguments", "resps", "filtered_resps", "target"}
-        for task_name, task_samples in results["samples"].items():
-            for i, sample in enumerate(task_samples[:max_per_task]):
-                print(f"\n--- {task_name} sample {i} ---")
-                arguments = sample.get("arguments") or []
-                prompt = arguments[0][0] if arguments else sample.get("doc")
-                print("PROMPT:")
-                print(prompt)
-                print("TARGET (gold answer):")
-                print(sample.get("target"))
-                print("MODEL OUTPUT (raw generation):")
-                print(sample.get("resps"))
-                print("MODEL OUTPUT (filtered/extracted answer):")
-                print(sample.get("filtered_resps"))
-                metrics = {k: v for k, v in sample.items() if k not in _internal_keys}
-                print("SCORE:")
-                print(json.dumps(metrics, default=str))
-            if len(task_samples) > max_per_task:
-                print(f"\n... {len(task_samples) - max_per_task} more {task_name} samples omitted")
-        print("=" * 72)
+    if not args.no_log_samples:
+        print_samples(results)
 
     if not args.no_wandb:
         from zip2zip_core.project import WANDB_ENTITY, WANDB_PROJECT
