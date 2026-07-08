@@ -77,8 +77,9 @@ if [ -n "$TASKS" ]; then
 fi
 
 MODEL_SHORT=$(basename "$HF_MODEL")
-LOGFILE="$LOG_DIR/eval_${MODEL_SHORT}_${PRESET}_${TIMESTAMP}.log"
-OUTPUT_JSON="$LOG_DIR/results_${MODEL_SHORT}_${PRESET}_${TIMESTAMP}.json"
+TASKS_SUFFIX=${TASKS:+_${TASKS//,/-}}
+LOGFILE="$LOG_DIR/eval_${MODEL_SHORT}_${PRESET}${TASKS_SUFFIX}_${TIMESTAMP}.log"
+OUTPUT_JSON="$LOG_DIR/results_${MODEL_SHORT}_${PRESET}${TASKS_SUFFIX}_${TIMESTAMP}.json"
 
 {
 echo "=== zip2zip HF model evaluation ==="
