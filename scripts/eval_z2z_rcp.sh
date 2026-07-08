@@ -28,6 +28,7 @@
 #   HF_MODEL=...    HF model repo (default: epfl-dlab/zip2zip-Phi-3.5-mini-instruct-v0.1)
 #   LIMIT=20        Per-task sample limit for smoke tests
 #   LIMIT=          Full evaluation (default)
+#   TASKS=gsm8k     Comma-separated task override (default: preset's task list)
 #
 set -euo pipefail
 
@@ -63,10 +64,16 @@ python -c "import zip2zip" 2>/dev/null \
 HF_MODEL=${HF_MODEL:-epfl-dlab/zip2zip-Phi-3.5-mini-instruct-v0.1}
 PRESET=${PRESET:-default}
 LIMIT=${LIMIT:-}
+TASKS=${TASKS:-}
 
 LIMIT_ARG=""
 if [ -n "$LIMIT" ]; then
     LIMIT_ARG="--limit $LIMIT"
+fi
+
+TASKS_ARG=""
+if [ -n "$TASKS" ]; then
+    TASKS_ARG="--tasks $TASKS"
 fi
 
 MODEL_SHORT=$(basename "$HF_MODEL")
@@ -78,6 +85,7 @@ echo "=== zip2zip HF model evaluation ==="
 echo "  HF_MODEL:   $HF_MODEL"
 echo "  PRESET:     $PRESET"
 echo "  LIMIT:      ${LIMIT:-<full>}"
+echo "  TASKS:      ${TASKS:-<preset default>}"
 echo "  LOGFILE:    $LOGFILE"
 echo "  OUTPUT_JSON: $OUTPUT_JSON"
 echo "====================================="
@@ -86,6 +94,6 @@ python scripts/eval_hf_model.py \
     --model "$HF_MODEL" \
     --preset "$PRESET" \
     --output_path "$OUTPUT_JSON" \
-    $LIMIT_ARG
+    $LIMIT_ARG $TASKS_ARG
 
 } 2>&1 | tee "$LOGFILE"

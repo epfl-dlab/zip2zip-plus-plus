@@ -100,6 +100,11 @@ def main():
     print(json.dumps(results.get("results", results), indent=2, default=str))
     print("=" * 72)
 
+    compression = lm.compression_summary()
+    print("Compression (base tokens per compressed token, >1 = more compression):")
+    print(json.dumps(compression, indent=2))
+    print("=" * 72)
+
     if args.output_path:
         os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
         with open(args.output_path, "w") as f:
@@ -107,6 +112,7 @@ def main():
                 {
                     "results": results.get("results"),
                     "configs": results.get("configs"),
+                    "compression": compression,
                     "model": args.model,
                     "tasks": tasks,
                     "args": vars(args),
