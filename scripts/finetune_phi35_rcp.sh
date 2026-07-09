@@ -96,7 +96,6 @@ MAX_ACTIVE_CODEBOOK_SIZE=${MAX_ACTIVE_CODEBOOK_SIZE:-2048}
 
 # Released run: 8000 steps x 32,768 tokens/step = ~262M tokens.
 STEPS=${STEPS:-8000}
-MAX_TOKENS=${MAX_TOKENS:-262144000}
 SEQ_LEN=${SEQ_LEN:-2048}
 LOCAL_BATCH_SIZE=${LOCAL_BATCH_SIZE:-1}
 # Keep 32,768 tokens/step regardless of GPU count: accum = 32768/(bs*seq*gpus).
@@ -104,6 +103,14 @@ GRAD_ACCUM=${GRAD_ACCUM:-$(( 32768 / (LOCAL_BATCH_SIZE * SEQ_LEN * NUM_GPUS) ))}
 [ "$GRAD_ACCUM" -lt 1 ] && GRAD_ACCUM=1
 # 1BT datasets hang with the default 4 dataloader workers — keep at 1.
 NUM_WORKERS=${NUM_WORKERS:-1}
+
+# train.py's main loop only checks --max_tokens when it's set at all (it
+# silently ignores --steps/--stop_at in that case — see train.py's
+# `while True:` loop). Deriving the MAX_TOKENS default from STEPS keeps the
+# two in sync, so overriding STEPS alone (e.g. for a smoke test) actually
+# shortens the run instead of being silently ignored.
+TOKENS_PER_STEP=$(( LOCAL_BATCH_SIZE * SEQ_LEN * NUM_GPUS * GRAD_ACCUM ))
+MAX_TOKENS=${MAX_TOKENS:-$(( STEPS * TOKENS_PER_STEP ))}
 
 LR=${LR:-3e-4}
 MIN_LR=${MIN_LR:-1e-5}
@@ -147,8 +154,6 @@ DISABLE_VARLEN=${DISABLE_VARLEN:-}
 
 mkdir -p "$OUTPUT_DIR"
 LOGFILE="$LOG_DIR/finetune_${RUN_NAME}_${TIMESTAMP}.log"
-
-TOKENS_PER_STEP=$(( LOCAL_BATCH_SIZE * SEQ_LEN * NUM_GPUS * GRAD_ACCUM ))
 
 # ---------- assemble optional flags ----------
 HYPER_LR_FLAG=""
