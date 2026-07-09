@@ -548,6 +548,9 @@ def main():
     parser.add_argument("--min_hyper_lr", type=float, default=None,
                         help="Min LR for hyper_encoder cosine schedule. Defaults to --min_lr if not set.")
     parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--adam_beta2", type=float, default=0.95,
+                        help="AdamW beta2. The released ozz-main finetunes used the torch "
+                             "default 0.999; zip2zip-core pretraining runs used 0.95.")
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--log_freq", type=int, default=10)
     parser.add_argument("--save_freq", type=int, default=1000)
@@ -792,7 +795,7 @@ def main():
                 {"params": decoder_trainable, "lr": args.lr},
                 {"params": hyper_trainable,   "lr": args.hyper_lr},
             ],
-            betas=(0.9, 0.95),
+            betas=(0.9, args.adam_beta2),
             weight_decay=args.weight_decay,
         )
 

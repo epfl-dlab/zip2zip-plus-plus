@@ -96,6 +96,20 @@ bash scripts/finetune_w_zip2zip_1b_data.sh
 
 When using SFT datasets where loss should only apply to certain spans (e.g. assistant responses in chat data), prepare loss mask files alongside the token shards (see [Data Pipeline](data.md#loss-masks-optional)). The dataset automatically propagates masks through LZW compression.
 
+## Reproducing a released model's exact recipe
+
+`scripts/finetune_phi35_rcp.sh` reproduces `epfl-dlab/zip2zip-Phi-3.5-mini-instruct-v0.1`
+(originally trained with `ozz-main`) on the EPFL RCP cluster (Run:AI). Its defaults are
+verified against the released run's config and HF checkpoint metadata — max_subtokens=4,
+seq_len=2048, 32,768 tokens/optimizer-step, 8000 steps, frozen decoder + LoRA r=32/α=32,
+hyper-encoder 3072-dim/2-layer/32-head. See the script header for accepted deviations
+(single tied hyper-encoder, packed-stream compression, assistant-turn loss masking) that
+keep it from being bit-identical. `scripts/finetune_phi35_from_hf_instruct.sbatch` is the
+CSCS-SLURM counterpart (same `train.py` flags, different job launcher).
+
+`scripts/tokenize_sft_phi_rcp.sh` prepares the required Phi-tokenized `epfl-dlab/zip2zip-1B`
+shards on RCP; sanity-checks the max token ID to catch accidentally-Llama-tokenized data.
+
 ## Curriculum finetuning
 
 You can combine finetuning with curriculum training — start with `max_subtokens=2` and increase in later phases:
