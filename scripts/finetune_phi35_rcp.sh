@@ -133,7 +133,11 @@ LORA_RANK=${LORA_RANK:-32}
 LORA_ALPHA=${LORA_ALPHA:-32}
 
 WANDB=${WANDB:-1}
-WANDB_PROJECT=${WANDB_PROJECT:-zip2zip-phi35-repro}
+# Left unset, no --wandb_project flag is passed at all, so train.py falls back
+# to its own canonical default (WANDB_PROJECT in src/zip2zip_core/project.py,
+# currently "llaza") — the same project the eval scripts already log to.
+# Set explicitly (e.g. WANDB_PROJECT=zip2zip-core) to log elsewhere.
+WANDB_PROJECT=${WANDB_PROJECT:-}
 WANDB_RUN_NAME=${WANDB_RUN_NAME:-$RUN_NAME}
 WANDB_GROUP=${WANDB_GROUP:-}
 # Until epfl-dlab org access is granted, set this to your own personal W&B
@@ -176,7 +180,10 @@ fi
 
 WANDB_FLAG=""
 if [ -n "$WANDB" ] && [ "$WANDB" != "0" ]; then
-    WANDB_FLAG="--wandb --wandb_project $WANDB_PROJECT --wandb_name $WANDB_RUN_NAME"
+    WANDB_FLAG="--wandb --wandb_name $WANDB_RUN_NAME"
+    if [ -n "$WANDB_PROJECT" ]; then
+        WANDB_FLAG="$WANDB_FLAG --wandb_project $WANDB_PROJECT"
+    fi
     if [ -n "$WANDB_GROUP" ]; then
         WANDB_FLAG="$WANDB_FLAG --wandb_group $WANDB_GROUP"
     fi
