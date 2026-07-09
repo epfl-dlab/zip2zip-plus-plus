@@ -9,16 +9,15 @@ dependencies = [
     "numpy",
     "zip2zip-compression>=0.3.3",
     "torchtitan",
+    "transformers>=4.47.0,<5.0",
 ]
 
 [project.optional-dependencies]
 data = [
-    "transformers>=4.47.0,<5.0",
     "datasets>=3.6.0",
 ]
 eval = [
     "lm-eval>=0.4.4",
-    "transformers>=4.47.0,<5.0",
     "datasets>=3.6.0",
     "tqdm",
 ]
