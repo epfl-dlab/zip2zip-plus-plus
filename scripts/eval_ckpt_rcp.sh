@@ -11,7 +11,7 @@
 #     --pvc dlab-scratch:/mnt --large-shm --node-pools default \
 #     --environment HF_REPO=epfl-dlab/candidate-Llaza-MS4-flat-20BT-v1 \
 #     --environment PRESET=default_base \
-#     -- bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/eval_ckpt_rcp.sh
+#     -- bash /dlabscratch1/<your-username>/code/zip2zip-core/scripts/eval_ckpt_rcp.sh
 #
 #   # Perplexity:
 #   runai submit --name eval-llaza-ms4-ppl \
@@ -20,7 +20,7 @@
 #     --pvc dlab-scratch:/mnt --large-shm --node-pools default \
 #     --environment HF_REPO=epfl-dlab/candidate-Llaza-MS4-flat-20BT-v1 \
 #     --environment PRESET=perplexity \
-#     -- bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/eval_ckpt_rcp.sh
+#     -- bash /dlabscratch1/<your-username>/code/zip2zip-core/scripts/eval_ckpt_rcp.sh
 #
 # ── Environment variables ───────────────────────────────────────────────
 #
@@ -28,10 +28,11 @@
 #   PRESET=...      Eval preset (default: default_base)
 #   LIMIT=20        Per-task sample limit for smoke tests
 #   TASKS=gsm8k     Comma-separated task override (default: preset's tasks)
+#   SCRATCH=...     Your PVC scratch dir (default: /dlabscratch1/gentilin)
 #
 set -euo pipefail
 
-SCRATCH=/dlabscratch1/gentilin
+SCRATCH=${SCRATCH:-/dlabscratch1/gentilin}
 export HF_HOME=$SCRATCH/.cache/huggingface
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false

@@ -13,7 +13,7 @@
 #     --pvc dlab-scratch:/mnt --large-shm \
 #     --node-pools default \
 #     --environment LIMIT=20 \
-#     -- bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/eval_z2z_rcp.sh
+#     -- bash /dlabscratch1/<your-username>/code/zip2zip-core/scripts/eval_z2z_rcp.sh
 #
 #   # Full eval:
 #   runai submit --name eval-z2z-full \
@@ -21,7 +21,7 @@
 #     --gpu 1 --cpu 8 --memory 64Gi \
 #     --pvc dlab-scratch:/mnt --large-shm \
 #     --node-pools default \
-#     -- bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/eval_z2z_rcp.sh
+#     -- bash /dlabscratch1/<your-username>/code/zip2zip-core/scripts/eval_z2z_rcp.sh
 #
 # ── Environment variables ────────────────────────────────────────────────
 #
@@ -30,10 +30,11 @@
 #   LIMIT=20        Per-task sample limit for smoke tests
 #   LIMIT=          Full evaluation (default)
 #   TASKS=gsm8k     Comma-separated task override (default: preset's task list)
+#   SCRATCH=...     Your PVC scratch dir (default: /dlabscratch1/gentilin)
 #
 set -euo pipefail
 
-SCRATCH=/dlabscratch1/gentilin
+SCRATCH=${SCRATCH:-/dlabscratch1/gentilin}
 export HF_HOME=$SCRATCH/.cache/huggingface
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false

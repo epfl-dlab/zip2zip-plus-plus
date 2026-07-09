@@ -17,7 +17,7 @@
 #     --pvc dlab-scratch:/mnt --large-shm \
 #     --node-pools default \
 #     --environment LIMIT=20 \
-#     -- bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/validate_phi35_rcp.sh
+#     -- bash /dlabscratch1/<your-username>/code/zip2zip-core/scripts/validate_phi35_rcp.sh
 #
 #   # Full eval (no LIMIT, ~1-2 hours on A100):
 #   runai submit \
@@ -26,13 +26,14 @@
 #     --gpu 1 --cpu 8 --memory 64Gi \
 #     --pvc dlab-scratch:/mnt --large-shm \
 #     --node-pools default \
-#     -- bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/validate_phi35_rcp.sh
+#     -- bash /dlabscratch1/<your-username>/code/zip2zip-core/scripts/validate_phi35_rcp.sh
 #
 # ── Environment variables (override via --environment or export) ─────────
 #
 #   LIMIT=20        Run only 20 samples per task (quick smoke test)
 #   LIMIT=          Full evaluation (default)
 #   HF_HOME=...     HuggingFace cache dir (default: /dlabscratch1/gentilin/.cache/huggingface)
+#   SCRATCH=...     Your PVC scratch dir (default: /dlabscratch1/gentilin)
 #
 # ── Expected results (paper Table 3, Phi-3.5-4B Base, 2-shot) ───────────
 #
@@ -42,11 +43,10 @@
 set -euo pipefail
 
 # ---------- paths ----------
-export HF_HOME=${HF_HOME:-/dlabscratch1/gentilin/.cache/huggingface}
+SCRATCH=${SCRATCH:-/dlabscratch1/gentilin}
+export HF_HOME=${HF_HOME:-$SCRATCH/.cache/huggingface}
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
-
-SCRATCH=/dlabscratch1/gentilin
 PRESET=${PRESET:-default}
 LIMIT=${LIMIT:-}
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
