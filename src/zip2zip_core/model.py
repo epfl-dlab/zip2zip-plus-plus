@@ -719,9 +719,13 @@ class Zip2ZipLlama3Model(Decoder):
             new_embeds = self._encode_codebook_with_weights(
                 codebook_updates, self.tok_embeddings.weight
             )  # (B, max_updates, dim)
+            # The hyper-encoder's padded attention path can upcast to fp32;
+            # index_put refuses mismatched dtypes, so cast to the buffer's.
             for i, ui in enumerate(codebook_updates_indices):
                 if ui:
-                    self._hyper_embeds_buf[i, ui] = new_embeds[i, : len(ui)]
+                    self._hyper_embeds_buf[i, ui] = new_embeds[i, : len(ui)].to(
+                        self._hyper_embeds_buf.dtype
+                    )
                     self._hyper_embeds_used[i, ui] = True
 
         hyper_embeds = self._hyper_embeds_buf  # (B, max_codebook_size, dim)

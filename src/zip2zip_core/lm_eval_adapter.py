@@ -61,6 +61,36 @@ def _strip_wrapper_prefixes(state_dict: dict) -> dict:
     return out
 
 
+def _fold_lora_weights(sd: dict, train_args: dict) -> dict:
+    """Merge LoRA-format weights into plain linear weights.
+
+    Checkpoints trained with --lora_rank store each wrapped linear as
+    X.base_layer.weight + X.lora_A.weight + X.lora_B.weight. The eval model is
+    a vanilla (non-LoRA) module, so fold W' = W + (B @ A) * (alpha/rank) and
+    rename to X.weight — otherwise load_state_dict(strict=False) silently skips
+    every decoder weight and the model scores with random layers.
+    """
+    bases = [k[: -len(".base_layer.weight")] for k in sd if k.endswith(".base_layer.weight")]
+    if not bases:
+        return sd
+    rank = train_args.get("lora_rank") or 0
+    alpha = train_args.get("lora_alpha") or 1.0
+    scaling = (alpha / rank) if rank else 1.0
+    out = dict(sd)
+    for base in bases:
+        w = out.pop(f"{base}.base_layer.weight")
+        a = out.pop(f"{base}.lora_A.weight", None)
+        b = out.pop(f"{base}.lora_B.weight", None)
+        if a is not None and b is not None:
+            w = w.float() + (b.float() @ a.float()) * scaling
+        out[f"{base}.weight"] = w
+        bias = out.pop(f"{base}.base_layer.bias", None)
+        if bias is not None:
+            out[f"{base}.bias"] = bias
+    print(f"[zip2zip-lm-eval] folded LoRA into {len(bases)} linear layers (scaling={scaling:g})")
+    return out
+
+
 def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.dtype):
     """Load a checkpoint produced by zip2zip_core.train.
 
@@ -102,6 +132,7 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
         weights_only=True,
     )
     sd = _strip_wrapper_prefixes(sd)
+    sd = _fold_lora_weights(sd, train_args)
     missing, unexpected = model.load_state_dict(sd, strict=False)
     if missing:
         print(f"[zip2zip-lm-eval] missing keys ({len(missing)}): {missing[:5]}")
