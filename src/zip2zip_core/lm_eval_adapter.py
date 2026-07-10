@@ -234,6 +234,10 @@ class Zip2ZipLM(LM):
             continue_final_message=not add_generation_prompt,
         )
 
+    @property
+    def tokenizer_name(self) -> str:
+        return self.tokenizer.name_or_path.replace("/", "__")
+
     # ───────────────────────── codebook helpers ───────────────────────────
 
     def _codebook_to_tensor(self, codebook) -> torch.LongTensor:
