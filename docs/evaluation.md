@@ -95,6 +95,9 @@ Three `runai submit`-ready wrappers, all under `scripts/`, sharing the `SCRATCH`
 
 All three write JSON results + a `tee`'d log to `$SCRATCH/logs/eval`, with the model name
 (and task name, if `TASKS` is set) baked into the output filename for traceability.
+`eval_ckpt_rcp.sh` can additionally log to W&B (results, per-sample tables, compression
+ratios): set `WANDB=1` + `WANDB_NAME`/`WANDB_PROJECT`, and pass `WANDB_API_KEY` into the
+job env. Run names get an `eval-` prefix automatically.
 
 ## Compression ratio
 
