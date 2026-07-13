@@ -124,7 +124,15 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
     if overrides:
         cfg = dataclasses.replace(cfg, **overrides)
 
-    model = Zip2ZipLlama3Model(cfg).to(device=device, dtype=dtype)
+    model = Zip2ZipLlama3Model(cfg).to(device=device)
+    if dtype is not None and dtype != torch.float32:
+        # Cast parameters and real-valued buffers ONLY. A blanket .to(dtype)
+        # also converts the complex64 RoPE cache (freqs_cis and rope.cache) to
+        # a real dtype, silently discarding the imaginary part — which destroys
+        # position encoding and caps any checkpoint at ~5 nats/token no matter
+        # how good its weights are (the "Casting complex values to real
+        # discards the imaginary part" UserWarning in earlier eval logs).
+        model._apply(lambda t: t.to(dtype) if t.is_floating_point() else t)
 
     sd = torch.load(
         os.path.join(ckpt_dir, "model.pt"),
