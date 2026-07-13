@@ -180,14 +180,38 @@ class Zip2ZipLM(LM):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
         disabled_ids = _DISABLED_IDS_BY_TOKENIZER.get(tokenizer)
         if disabled_ids is None:
-            disabled_ids = [
-                i for i in (self.tokenizer.all_special_ids or []) if i < self.cfg.vocab_size
-            ]
+            # Must mirror train.py's derivation (all_special_ids | added vocab):
+            # for Phi-3.5, all_special_ids alone is {unk,bos,eos} and misses the
+            # chat tokens <|user|>/<|assistant|>/<|end|> (32001-32010), which the
+            # compressor would then merge into hyper-tokens the model never saw
+            # in training — collapsing every chat-templated eval.
+            special = set(self.tokenizer.all_special_ids or [])
+            added = set(self.tokenizer.get_added_vocab().values())
+            disabled_ids = sorted(
+                i for i in (special | added) if 0 <= i < self.cfg.vocab_size
+            )
         self._disabled_ids = disabled_ids
+        print(f"[zip2zip-lm-eval] disabled_ids ({len(disabled_ids)}): {disabled_ids[:16]}"
+              f"{'...' if len(disabled_ids) > 16 else ''}")
         self._max_length = int(max_length)
         self.eval_mode = eval_mode
         self._batch_size = int(batch_size)
         self.hyper_causal_mask = bool(hyper_causal_mask)
+
+        # Generation must stop on every eos the base model declares, not just
+        # tokenizer.eos_token_id: Phi-3.5's generation_config lists
+        # [<|end|>, <|assistant|>, <|endoftext|>] and chat turns end with <|end|>.
+        stop_ids = {self.eot_token_id}
+        try:
+            from transformers import GenerationConfig
+            gen_cfg = GenerationConfig.from_pretrained(tokenizer)
+            eos = gen_cfg.eos_token_id
+            if eos is not None:
+                stop_ids.update(eos if isinstance(eos, (list, tuple)) else [eos])
+        except Exception:
+            pass
+        self._stop_token_ids = {i for i in stop_ids if i is not None}
+        print(f"[zip2zip-lm-eval] generation stop token ids: {sorted(self._stop_token_ids)}")
 
         # Aggregate compression counters over the whole run, read by callers
         # (e.g. scripts/eval_harness.py) after simple_evaluate returns.
@@ -528,7 +552,6 @@ class Zip2ZipLM(LM):
         top_k: int,
     ) -> str:
         """Vanilla LM generation: feed base tokens, no codebook, base-vocab logits."""
-        eos = self.eot_token_id
         max_ctx = max(1, self._max_length - max_gen_toks)
         if len(ctx_ids) > max_ctx:
             ctx_ids = ctx_ids[-max_ctx:]
@@ -542,7 +565,7 @@ class Zip2ZipLM(LM):
             logits = out[0] if isinstance(out, tuple) else out
             last = logits[0, -1, : self.cfg.vocab_size].float()
             tok = self._sample_next(last, do_sample, temperature, top_p, top_k)
-            if tok == eos:
+            if tok in self._stop_token_ids:
                 break
             gen_ids.append(tok)
             seq.append(tok)
@@ -576,7 +599,6 @@ class Zip2ZipLM(LM):
         """
         cfg = self.cfg
         V = cfg.vocab_size
-        eos = self.eot_token_id
         max_ctx = max(1, self._max_length - max_gen_toks)
 
         compressor = LZWCompressor(**self._compressor_kwargs)
@@ -641,8 +663,9 @@ class Zip2ZipLM(LM):
                     # Model produced an unused hyper slot; treat as stop.
                     break
 
-            if eos in expansion:
-                cut = expansion.index(eos)
+            stop_at = [i for i, t in enumerate(expansion) if t in self._stop_token_ids]
+            if stop_at:
+                cut = stop_at[0]
                 gen_base_ids.extend(expansion[:cut])
                 if cut > 0:
                     n_gen_comp += 1
