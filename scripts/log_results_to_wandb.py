@@ -52,8 +52,20 @@ def parse_samples(log_path: str):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--json", required=True, help="results_*.json from an eval run")
-    p.add_argument("--name", required=True, help="W&B run name")
+    p.add_argument("--json", default=None, help="results_*.json from an eval run")
+    p.add_argument("--name", default=None,
+                   help="W&B run name (creates a NEW run; mutually exclusive with --resume_id)")
+    p.add_argument("--resume_id", default=None,
+                   help="Existing W&B run id: log the metrics INTO that run instead "
+                        "of creating one (used by the finetune->eval pipeline)")
+    p.add_argument("--step", type=int, default=None,
+                   help="With --resume_id: checkpoint step for these metrics. Logged "
+                        "on a dedicated '<prefix>/step' x-axis (via define_metric) so "
+                        "it never conflicts with the training run's own step counter.")
+    p.add_argument("--prefix", default=None,
+                   help="Namespace metrics as <prefix>/<task>/<metric> (e.g. 'smoke', 'final')")
+    p.add_argument("--append_notes", default=None,
+                   help="With --resume_id: text appended to the run's notes")
     p.add_argument("--notes", default="", help="Run notes (e.g. RCP log/JSON paths)")
     p.add_argument("--log", default=None,
                    help="Matching eval_*.log; its printed sample blocks are "
@@ -63,36 +75,61 @@ def main():
     p.add_argument("--tags", default="eval,backfill", help="Comma-separated run tags")
     args = p.parse_args()
 
-    data = json.load(open(args.json))
-    flat = flatten_results(data.get("results"))
-    if not flat:
-        raise SystemExit(f"No numeric metrics found in {args.json}")
-    compression = data.get("compression") or {}
-    for k, v in compression.items():
-        if k.endswith("_ratio"):
-            flat[f"eval/{k}"] = v
+    if bool(args.name) == bool(args.resume_id):
+        raise SystemExit("Pass exactly one of --name (new run) or --resume_id (existing run).")
+    if args.step is not None and not args.prefix:
+        raise SystemExit("--step requires --prefix (metrics need their own x-axis namespace).")
 
-    notes = args.notes or ""
-    src = f"results JSON: {args.json}"
-    notes = f"{notes}\n{src}" if notes else src
+    flat, compression, data = {}, {}, {}
+    if args.json:
+        data = json.load(open(args.json))
+        flat = flatten_results(data.get("results"))
+        if not flat:
+            raise SystemExit(f"No numeric metrics found in {args.json}")
+        compression = data.get("compression") or {}
+        for k, v in compression.items():
+            if k.endswith("_ratio"):
+                flat[f"eval/{k}"] = v
+    elif not args.append_notes:
+        raise SystemExit("Nothing to do: pass --json and/or --append_notes.")
+
+    if args.prefix:
+        flat = {f"{args.prefix}/{k}": v for k, v in flat.items()}
 
     import wandb
 
-    run = wandb.init(
-        entity=args.entity,
-        project=args.project,
-        name=args.name,
-        job_type="eval",
-        tags=[t.strip() for t in args.tags.split(",") if t.strip()],
-        notes=notes,
-        config={
-            "eval_args": data.get("args"),
-            "ckpt_dir": data.get("ckpt_dir") or data.get("model"),
-            "tasks": data.get("tasks"),
-            "compression": compression,
-        },
-    )
-    wandb.log(flat)
+    if args.resume_id:
+        run = wandb.init(entity=args.entity, project=args.project,
+                         id=args.resume_id, resume="must")
+    else:
+        notes = args.notes or ""
+        if args.json:
+            src = f"results JSON: {args.json}"
+            notes = f"{notes}\n{src}" if notes else src
+        run = wandb.init(
+            entity=args.entity,
+            project=args.project,
+            name=args.name,
+            job_type="eval",
+            tags=[t.strip() for t in args.tags.split(",") if t.strip()],
+            notes=notes,
+            config={
+                "eval_args": data.get("args"),
+                "ckpt_dir": data.get("ckpt_dir") or data.get("model"),
+                "tasks": data.get("tasks"),
+                "compression": compression,
+            },
+        )
+
+    if flat:
+        if args.step is not None:
+            # Own x-axis: a resumed training run's global step is already past
+            # the checkpoint steps, and wandb drops non-monotonic step= values.
+            wandb.define_metric(f"{args.prefix}/step")
+            wandb.define_metric(f"{args.prefix}/*", step_metric=f"{args.prefix}/step")
+            wandb.log({**flat, f"{args.prefix}/step": args.step})
+        else:
+            wandb.log(flat)
 
     if args.log:
         rows = parse_samples(args.log)
@@ -102,12 +139,16 @@ def main():
                          "raw_generation", "filtered_answer", "score"],
                 data=rows,
             )
-            wandb.log({"samples": table})
+            key = f"{args.prefix}/samples" if args.prefix else "samples"
+            wandb.log({key: table})
             print(f"logged {len(rows)} sample rows from {args.log}")
         else:
             print(f"warning: no sample blocks found in {args.log}")
 
-    print(f"logged {len(flat)} metrics to W&B run: {run.url if hasattr(run, 'url') else run.id}")
+    if args.append_notes:
+        run.notes = ((run.notes or "") + "\n" + args.append_notes).strip()
+
+    print(f"logged {len(flat)} metrics to W&B run: {getattr(run, 'url', None) or run.id}")
     run.finish()
 
 

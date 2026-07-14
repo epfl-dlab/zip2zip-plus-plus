@@ -140,6 +140,12 @@ WANDB=${WANDB:-1}
 WANDB_PROJECT=${WANDB_PROJECT:-}
 WANDB_RUN_NAME=${WANDB_RUN_NAME:-$RUN_NAME}
 WANDB_GROUP=${WANDB_GROUP:-}
+# Pre-chosen W&B run id (8 lowercase alnum chars). Lets an orchestrator (e.g.
+# scripts/pipeline_ft_eval_rcp.sh) create the training run under a known id and
+# later log eval results into the SAME run via eval_harness --resume_wandb_id.
+# Also disables train.py's random name suffixing, so the W&B run name is
+# exactly WANDB_RUN_NAME.
+WANDB_ID=${WANDB_ID:-}
 # Until epfl-dlab org access is granted, set this to your own personal W&B
 # username. Left unset, train.py falls back to a hardcoded "epfl-dlab" entity
 # (src/zip2zip_core/project.py) and the run will fail if you're not a member.
@@ -186,6 +192,9 @@ if [ -n "$WANDB" ] && [ "$WANDB" != "0" ]; then
     fi
     if [ -n "$WANDB_GROUP" ]; then
         WANDB_FLAG="$WANDB_FLAG --wandb_group $WANDB_GROUP"
+    fi
+    if [ -n "$WANDB_ID" ]; then
+        WANDB_FLAG="$WANDB_FLAG --wandb_id $WANDB_ID --wandb_resume allow"
     fi
     if [ -n "$WANDB_ENTITY" ]; then
         WANDB_FLAG="$WANDB_FLAG --wandb_entity $WANDB_ENTITY"

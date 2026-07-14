@@ -131,11 +131,19 @@ Single source of truth for where things live on the cluster (`$SCRATCH =
 | Train / tokenize logs | `$SCRATCH/logs/train/`, `$SCRATCH/logs/tokenize/` | |
 
 Standard run sequence for a new finetune: `tokenize_sft_phi_rcp.sh` (only if the
-data recipe changed) → `finetune_phi35_rcp.sh` → **sanity gate**
-`diagnose_ckpt_rcp.sh` on the final checkpoint (15 min; train-style replay must land
-near the run's final W&B `loss`, ~1.6 nats/base-token for healthy Phi runs) →
-`eval_ckpt_rcp.sh` with `PRESET=perplexity` and `PRESET=default`. Compare against the
-frozen baseline numbers (see `docs/evaluation.md`), not the paper's.
+data recipe changed) → **`pipeline_ft_eval_rcp.sh`** — one Run:AI job that trains,
+smoke-evals every 1000-step checkpoint (arc_easy/hellaswag/winogrande/gsm8k_boxed
+@ 200 samples, curves at `smoke/step` in W&B), runs the full `default` preset +
+wikitext perplexity on the final checkpoint (all sample tables in W&B), and appends
+every RCP artifact path plus the ready-made 4-corpora-perplexity command to the run
+notes. All in ONE W&B run named `RUN_NAME`; hard-fails on an existing output dir
+(never suffixes `(1)`). Rehearse pipeline changes first with
+`STEPS=20 SAVE_FREQ=10 SMOKE_EVERY=10 SMOKE_LIMIT=8 FINAL_LIMIT=8` (~30 min).
+For manual/partial runs the individual pieces remain: `finetune_phi35_rcp.sh`,
+`diagnose_ckpt_rcp.sh` (15-min sanity gate: train-style replay must land near the
+run's final W&B `loss`, ~1.6 nats/base-token for healthy Phi runs),
+`eval_ckpt_rcp.sh`. Compare against the frozen baseline numbers (see
+`docs/evaluation.md`), not the paper's.
 
 ## Curriculum finetuning
 

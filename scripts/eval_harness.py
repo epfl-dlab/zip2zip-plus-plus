@@ -218,7 +218,10 @@ def main():
                 id=resume_id,
                 resume="must",
                 tags=["eval"],
-                config=vars(args),
+                # Nested under one key: when resuming a TRAINING run (the
+                # finetune->eval pipeline), flat eval args could collide with
+                # same-named training config keys (seed, tokenizer, ...).
+                config={"eval_args": vars(args)},
             )
         else:
             wandb.init(
