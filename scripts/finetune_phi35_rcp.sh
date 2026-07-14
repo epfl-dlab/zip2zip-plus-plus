@@ -162,7 +162,9 @@ DEBUG_FIRST_STEPS=${DEBUG_FIRST_STEPS:-0}
 ACTIVATION_CHECKPOINT=${ACTIVATION_CHECKPOINT:-}
 DISABLE_VARLEN=${DISABLE_VARLEN:-}
 
-mkdir -p "$OUTPUT_DIR"
+# Do NOT pre-create OUTPUT_DIR: train.py creates it itself, and its collision
+# logic appends "(1)" whenever the dir already exists — pre-creating it here is
+# what silently moved every run's checkpoints into a "(N)"-suffixed folder.
 LOGFILE="$LOG_DIR/finetune_${RUN_NAME}_${TIMESTAMP}.log"
 
 # ---------- assemble optional flags ----------

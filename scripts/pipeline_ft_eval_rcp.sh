@@ -123,6 +123,8 @@ bash "$PROJECT_DIR/scripts/finetune_phi35_rcp.sh"
 FINAL_CKPT="$OUTPUT_DIR/step_$STEPS"
 if [ ! -f "$FINAL_CKPT/model.pt" ]; then
     echo "FATAL: training finished but $FINAL_CKPT/model.pt is missing."
+    echo "If a '(1)'-suffixed sibling of $OUTPUT_DIR exists, something pre-created"
+    echo "the output dir and train.py's collision logic moved the run there."
     exit 1
 fi
 
