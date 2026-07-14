@@ -185,7 +185,26 @@ class Zip2ZipLM(LM):
         self.model, self.cfg, self.train_args = _load_zip2zip_checkpoint(
             pretrained, self._device, self._dtype
         )
+        # The harness/launchers default the tokenizer to Llama-3. If the
+        # checkpoint's meta.pt recorded the training tokenizer, prefer it over
+        # that default so a forgotten TOKENIZER env var cannot silently
+        # evaluate e.g. a Phi checkpoint with Llama special-token rules.
+        meta_tok = (self.train_args or {}).get("tokenizer")
+        if meta_tok and tokenizer == _DEFAULT_TOKENIZER and meta_tok != tokenizer:
+            print(f"[zip2zip-lm-eval] tokenizer left at the Llama default but "
+                  f"meta.pt records {meta_tok!r} — using the checkpoint's tokenizer")
+            tokenizer = meta_tok
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+        if len(self.tokenizer) > self.cfg.vocab_size:
+            raise ValueError(
+                f"tokenizer {tokenizer!r} has {len(self.tokenizer)} tokens but the "
+                f"model vocab is {self.cfg.vocab_size}: wrong tokenizer for this "
+                f"checkpoint. Pass the training tokenizer"
+                + (f" ({meta_tok!r} per meta.pt)." if meta_tok else ".")
+            )
+        if meta_tok and meta_tok != tokenizer:
+            print(f"[zip2zip-lm-eval] WARNING: eval tokenizer {tokenizer!r} != "
+                  f"training tokenizer {meta_tok!r} (meta.pt)")
         disabled_ids = _DISABLED_IDS_BY_TOKENIZER.get(tokenizer)
         if disabled_ids is None:
             # Must mirror train.py's derivation (all_special_ids | added vocab):
