@@ -176,6 +176,14 @@ python scripts/eval_harness.py \
     ${FINAL_LIMIT:+--limit "$FINAL_LIMIT"} \
     --output_path "$MC_JSON" 2>&1 | tee "$MC_LOG"
 
+# lm-eval's logger above writes the MC metrics as top-level summary keys and
+# uploads the per-sample tables; ALSO log them under final/ so every final
+# metric sits in one consistent W&B section next to final/wikitext/*.
+python scripts/log_results_to_wandb.py \
+    --json "$MC_JSON" \
+    --resume_id "$WANDB_ID" --project "$WANDB_PROJECT" \
+    --prefix final --step "$STEPS"
+
 PPL_JSON=""
 if [ "$SKIP_FULL_PPL" = "0" ]; then
     PPL_JSON="$EVAL_LOG_DIR/results_${RUN_NAME}_step${STEPS}_wikitext_${TS}.json"
