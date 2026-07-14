@@ -111,6 +111,40 @@ dependent — relevant for generative tasks like GSM8K, where the model chooses 
 emit hypertokens). Both scripts print this next to accuracy and include it in the output
 JSON; no extra GPU runs are needed to backfill it for past-configured evals.
 
+## GSM8K for zip2zip models: which number to trust
+
+Models finetuned on the zip2zip-1B mix answer in NuminaMath style (`$\boxed{42}$`),
+never `#### 42`, so lm-eval's `strict-match` is a format lottery — ignore it. Use
+`flexible-extract` for reported numbers. If a model does not stop after its answer
+(models trained on pre-`b12efc0` data run into a fabricated next problem, whose
+numbers poison flexible-extract's last-number rule), the diagnostic task
+`gsm8k_boxed` (`scripts/lm_eval_tasks/`, run with `TASKS=gsm8k_boxed`) adds a
+`boxed-first` filter reading the *first* `\boxed{}`/`####` answer. Use it only to
+decompose "format/stopping artifact vs math ability" — never as the headline number,
+since it isn't comparable with anyone else's published GSM8K results.
+
+## Eval-log health checks
+
+Grep every eval log before trusting its numbers (each line guards a past bug):
+
+```
+disabled_ids (14): [0, 1, 2, 32000, ...]   # chat specials protected from LZW merging
+folded LoRA into 224 linear layers          # decoder weights actually loaded
+# and the ABSENCE of:
+Casting complex values to real              # would mean RoPE destroyed at load
+```
+
+Generation-mode runs should show `gen_compression_ratio ≈ 1.4` (a healthy model
+emits hyper-tokens; ~1.0 means it never does). Before any full eval of a new
+checkpoint, run the 15-minute sanity gate `scripts/diagnose_ckpt_rcp.sh` (train-style
+replay must land near the run's final W&B `loss`).
+
+## Backfilling W&B for runs executed with WANDB=0
+
+`scripts/log_results_to_wandb.py` uploads a results JSON (metrics, compression,
+eval args) as a W&B run, with `--notes` for the RCP log paths and `--log` to attach
+the printed per-task sample blocks as a table.
+
 ## Per-sample logging
 
 `sample_logging.py` prints prompt + gold target + model output + score to the console

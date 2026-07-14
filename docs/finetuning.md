@@ -96,6 +96,12 @@ bash scripts/finetune_w_zip2zip_1b_data.sh
 
 When using SFT datasets where loss should only apply to certain spans (e.g. assistant responses in chat data), prepare loss mask files alongside the token shards (see [Data Pipeline](data.md#loss-masks-optional)). The dataset automatically propagates masks through LZW compression.
 
+**End-of-text must be in the loss.** The document-final `<|endoftext|>` gets `mask=1`
+(since commit `b12efc0`): with it masked out, models never learn to *emit* end-of-text
+after plain-text documents and at inference run past their answer into a fabricated
+next document (observed on GSM8K with the v0.1-repro checkpoint). Datasets tokenized
+before that commit have the old masks — re-tokenize before training new models.
+
 ## Reproducing a released model's exact recipe
 
 `scripts/finetune_phi35_rcp.sh` reproduces `epfl-dlab/zip2zip-Phi-3.5-mini-instruct-v0.1`
@@ -109,6 +115,27 @@ CSCS-SLURM counterpart (same `train.py` flags, different job launcher).
 
 `scripts/tokenize_sft_phi_rcp.sh` prepares the required Phi-tokenized `epfl-dlab/zip2zip-1B`
 shards on RCP; sanity-checks the max token ID to catch accidentally-Llama-tokenized data.
+
+## Canonical RCP locations and run conventions
+
+Single source of truth for where things live on the cluster (`$SCRATCH =
+/dlabscratch1/gentilin`); update this table in the same commit as any change.
+
+| What | Path | Notes |
+|---|---|---|
+| Phi SFT data (current) | `$SCRATCH/datasets/phi-1B-sft-8shards-eosfix` | EOS in loss (`b12efc0`); use for all new finetunes |
+| Phi SFT data (legacy) | `$SCRATCH/datasets/phi-1B-sft-8shards` | EOS masked out; input of the verified v0.1-repro baseline — keep until superseded baselines are retired |
+| Llama SFT data | `$SCRATCH/datasets/zip2zip-1B-sft-8shards` | For a future Llama-3.2-1B reproduction; do not delete |
+| Checkpoints | `$SCRATCH/zip2zip-outputs/<RUN_NAME>/step_N` | `train.py` suffixes `(N)` on name collision — always pick a fresh `RUN_NAME`; the verified baseline is `andrea-z2z-phi35-4B-repro-1BData-v0.1-Zip2zipCore(1)/step_8000` |
+| Eval logs + results JSON | `$SCRATCH/logs/eval/` | JSONs are the record when `WANDB=0`; backfill with `scripts/log_results_to_wandb.py` |
+| Train / tokenize logs | `$SCRATCH/logs/train/`, `$SCRATCH/logs/tokenize/` | |
+
+Standard run sequence for a new finetune: `tokenize_sft_phi_rcp.sh` (only if the
+data recipe changed) → `finetune_phi35_rcp.sh` → **sanity gate**
+`diagnose_ckpt_rcp.sh` on the final checkpoint (15 min; train-style replay must land
+near the run's final W&B `loss`, ~1.6 nats/base-token for healthy Phi runs) →
+`eval_ckpt_rcp.sh` with `PRESET=perplexity` and `PRESET=default`. Compare against the
+frozen baseline numbers (see `docs/evaluation.md`), not the paper's.
 
 ## Curriculum finetuning
 
