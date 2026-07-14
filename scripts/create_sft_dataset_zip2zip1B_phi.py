@@ -138,7 +138,15 @@ def maybe_add_boundary_tokens(tokens, mask):
     if ADD_EOS and tokenizer.eos_token_id is not None:
         if not tokens or tokens[-1] != tokenizer.eos_token_id:
             tokens = tokens + [tokenizer.eos_token_id]
-            mask = mask + [0]
+            # EOS must be IN the loss (mask=1): with mask=0 the model gets no
+            # gradient to ever emit end-of-text after a completed plain-text
+            # document, so at inference it runs past its answer into a
+            # fabricated next document (observed on GSM8K: the step_8000 repro
+            # answers correctly, then generates a new invented math problem
+            # whose numbers poison lm-eval's flexible-extract scoring).
+            # Chat docs already learn stopping via <|end|> in the assistant
+            # span; this fixes plain-text (NuminaMath/fineweb/stack) docs.
+            mask = mask + [1]
     return tokens, mask
 
 
