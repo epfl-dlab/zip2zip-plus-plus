@@ -50,6 +50,16 @@
 #   WANDB_NAME=...  W&B run name; eval_harness.py prepends "eval-" automatically
 #                   (default: auto from checkpoint/repo name)
 #   WANDB_PROJECT=. W&B project (default: project.py's WANDB_PROJECT, i.e. llaza)
+#   RESUME_WANDB_ID=... Existing W&B run id: log the results INTO that run
+#                   (via log_results_to_wandb.py) instead of creating a separate
+#                   eval run. Used by the ready-made perplexity command that
+#                   pipeline_ft_eval_rcp.sh appends to its W&B notes, so the
+#                   remaining corpora land next to the run's other evals.
+#                   Forces --no_wandb on the harness; requires WANDB_API_KEY.
+#   WANDB_PREFIX=final  With RESUME_WANDB_ID: metrics namespaced <prefix>/<task>/<metric>
+#   WANDB_STEP=...  With RESUME_WANDB_ID: checkpoint step, logged on the
+#                   '<prefix>/step' x-axis so it lines up with the pipeline's
+#                   final evals (e.g. final/wikitext/*)
 #
 set -euo pipefail
 
@@ -81,6 +91,14 @@ TASKS=${TASKS:-}
 WANDB=${WANDB:-0}
 WANDB_NAME=${WANDB_NAME:-}
 WANDB_PROJECT=${WANDB_PROJECT:-}
+RESUME_WANDB_ID=${RESUME_WANDB_ID:-}
+WANDB_PREFIX=${WANDB_PREFIX:-final}
+WANDB_STEP=${WANDB_STEP:-}
+
+if [ -n "$RESUME_WANDB_ID" ] && [ -z "${WANDB_API_KEY:-}" ]; then
+    echo "RESUME_WANDB_ID is set but WANDB_API_KEY is empty — cannot log into the run." >&2
+    exit 1
+fi
 
 if [ -n "$CKPT_DIR" ]; then
     MODEL_SHORT=$(echo "$(basename "$(dirname "$CKPT_DIR")")_$(basename "$CKPT_DIR")" | tr -d '()')
@@ -99,7 +117,7 @@ if [ ! -f "$VENV_DIR/bin/activate" ]; then
     python -m venv --system-site-packages "$VENV_DIR"
 fi
 source "$VENV_DIR/bin/activate"
-pip install --quiet "lm-eval==0.4.9" "huggingface_hub"
+pip install --quiet "lm-eval==0.4.9" "huggingface_hub" wandb
 
 # ---------- run ----------
 cd "$PROJECT_DIR"
@@ -114,8 +132,10 @@ if [ -n "$TASKS" ]; then
 fi
 # W&B: off by default (--no_wandb). WANDB=1 logs results + per-sample tables +
 # compression ratios; run names get an "eval-" prefix inside eval_harness.py.
+# RESUME_WANDB_ID instead keeps the harness at --no_wandb and backfills the
+# results JSON into the existing run after the eval (see below).
 WANDB_ARGS="--no_wandb"
-if [ "$WANDB" != "0" ]; then
+if [ -z "$RESUME_WANDB_ID" ] && [ "$WANDB" != "0" ]; then
     WANDB_ARGS=""
     if [ -n "$WANDB_NAME" ]; then
         WANDB_ARGS="--wandb_name $WANDB_NAME"
@@ -134,6 +154,7 @@ echo "  PRESET:      $PRESET"
 echo "  TASKS:       ${TASKS:-<preset default>}"
 echo "  LIMIT:       ${LIMIT:-<full>}"
 echo "  WANDB:       $WANDB${WANDB_NAME:+ (name: eval-$WANDB_NAME)}${WANDB_PROJECT:+ (project: $WANDB_PROJECT)}"
+echo "  RESUME_ID:   ${RESUME_WANDB_ID:-<none>}${RESUME_WANDB_ID:+ (prefix: $WANDB_PREFIX${WANDB_STEP:+, step: $WANDB_STEP})}"
 echo "  LOGFILE:     $LOGFILE"
 echo "  OUTPUT_JSON: $OUTPUT_JSON"
 echo "======================================="
@@ -158,6 +179,16 @@ else
         $WANDB_ARGS \
         $LIMIT_ARG \
         $TASKS_ARG
+fi
+
+if [ -n "$RESUME_WANDB_ID" ]; then
+    echo "=== logging results into existing W&B run $RESUME_WANDB_ID under $WANDB_PREFIX/ ==="
+    python scripts/log_results_to_wandb.py \
+        --json "$OUTPUT_JSON" \
+        --resume_id "$RESUME_WANDB_ID" \
+        ${WANDB_PROJECT:+--project "$WANDB_PROJECT"} \
+        --prefix "$WANDB_PREFIX" \
+        ${WANDB_STEP:+--step "$WANDB_STEP"}
 fi
 
 } 2>&1 | tee "$LOGFILE"

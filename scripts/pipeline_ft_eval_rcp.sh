@@ -23,8 +23,9 @@
 #                  at x = smoke/step (1 GPU)
 #   3. final eval  last checkpoint: full 'default' preset (with all sample tables
 #                  -> W&B) + wikitext perplexity (logged under final/)
-#   4. notes       append final-ckpt path, RCP log paths, and the ready-made
-#                  command for the remaining 3-corpora perplexity to the W&B run
+#   4. notes       append final-ckpt path, RCP log paths, and a copy-paste-ready
+#                  runai command for the remaining perplexity corpora that logs
+#                  into this same W&B run (eval_ckpt_rcp.sh RESUME_WANDB_ID)
 #
 # Env vars:
 #   RUN_NAME=...      (required) also the W&B run name — make it exhaustive
@@ -203,6 +204,16 @@ fi
 
 # ---------- phase 4: pin every artifact path in the W&B run notes ----------
 echo "=== phase 4/4: append artifact paths to W&B notes ==="
+# Run:AI job name for the follow-up perplexity job: lowercase, no dots, <50 chars.
+PPL_JOB_NAME=$(printf 'ppl-%s' "$RUN_NAME" | tr '[:upper:]' '[:lower:]' \
+    | sed -e 's/[^a-z0-9-]/-/g' | cut -c1-49 | sed -e 's/-*$//')
+if [ -n "$PPL_JSON" ]; then
+    PPL_TASKS="zip2zip_pile,zip2zip_mc4,zip2zip_dc4"
+    PPL_INTRO="To complete the FULL 4-corpora perplexity (adds Pile/mC4/dC4, ~15h, 1 GPU),"
+else
+    PPL_TASKS="wikitext,zip2zip_pile,zip2zip_mc4,zip2zip_dc4"
+    PPL_INTRO="To run the FULL 4-corpora perplexity (wikitext+Pile+mC4+dC4, 1 GPU),"
+fi
 NOTES="pipeline: $(basename "$0") @ commit $(git rev-parse --short HEAD)
 final checkpoint: $FINAL_CKPT
 pipeline log (RCP): $PIPELINE_LOG
@@ -210,8 +221,23 @@ final MC results: $MC_JSON
 final MC eval log (all samples printed): $MC_LOG${PPL_JSON:+
 wikitext ppl results: $PPL_JSON}
 smoke results: $EVAL_LOG_DIR/results_${RUN_NAME}_step*_smoke_${TS}.json
-To complete the FULL 4-corpora perplexity (adds Pile/mC4/dC4, ~15h, 1 GPU):
-  runai submit --name eval-${RUN_NAME}-ppl --image ghcr.io/jkminder/dlab-runai-images/pytorch:master --gpu 1 --cpu 8 --memory 64Gi --pvc dlab-scratch:/mnt --large-shm --node-pools default --environment CKPT_DIR='$FINAL_CKPT' --environment TOKENIZER=$TOKENIZER --environment PRESET=perplexity --environment WANDB=1 --environment WANDB_API_KEY=<key> --environment WANDB_PROJECT=$WANDB_PROJECT --environment WANDB_NAME=perpl-$RUN_NAME -- bash $PROJECT_DIR/scripts/eval_ckpt_rcp.sh"
+$PPL_INTRO
+paste in a shell where WANDB_API_KEY is set — the results land in THIS W&B run
+under final/, next to the other evals:
+
+runai submit --name $PPL_JOB_NAME \\
+  --image ghcr.io/jkminder/dlab-runai-images/pytorch:master \\
+  --gpu 1 --cpu 8 --memory 64Gi \\
+  --pvc dlab-scratch:/mnt --large-shm --node-pools default \\
+  --environment CKPT_DIR='$FINAL_CKPT' \\
+  --environment TOKENIZER=$TOKENIZER \\
+  --environment PRESET=perplexity \\
+  --environment TASKS=$PPL_TASKS \\
+  --environment RESUME_WANDB_ID=$WANDB_ID \\
+  --environment WANDB_STEP=$STEPS \\
+  --environment WANDB_PROJECT=$WANDB_PROJECT \\
+  --environment WANDB_API_KEY=\$WANDB_API_KEY \\
+  -- bash $PROJECT_DIR/scripts/eval_ckpt_rcp.sh"
 python scripts/log_results_to_wandb.py \
     --resume_id "$WANDB_ID" --project "$WANDB_PROJECT" \
     --append_notes "$NOTES"
