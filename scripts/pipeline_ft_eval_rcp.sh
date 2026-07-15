@@ -221,9 +221,9 @@ final MC results: $MC_JSON
 final MC eval log (all samples printed): $MC_LOG${PPL_JSON:+
 wikitext ppl results: $PPL_JSON}
 smoke results: $EVAL_LOG_DIR/results_${RUN_NAME}_step*_smoke_${TS}.json
-$PPL_INTRO
+[pending] $PPL_INTRO
 paste in a shell where WANDB_API_KEY is set — the results land in THIS W&B run
-under final/, next to the other evals:
+under final/, and this block gets replaced by the result paths once the job runs:
 
 runai submit --name $PPL_JOB_NAME \\
   --image ghcr.io/jkminder/dlab-runai-images/pytorch:master \\
@@ -237,7 +237,8 @@ runai submit --name $PPL_JOB_NAME \\
   --environment WANDB_STEP=$STEPS \\
   --environment WANDB_PROJECT=$WANDB_PROJECT \\
   --environment WANDB_API_KEY=\$WANDB_API_KEY \\
-  -- bash $PROJECT_DIR/scripts/eval_ckpt_rcp.sh"
+  -- bash $PROJECT_DIR/scripts/eval_ckpt_rcp.sh
+[/pending]"
 python scripts/log_results_to_wandb.py \
     --resume_id "$WANDB_ID" --project "$WANDB_PROJECT" \
     --append_notes "$NOTES"

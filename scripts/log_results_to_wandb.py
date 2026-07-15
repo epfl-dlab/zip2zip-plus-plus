@@ -66,6 +66,10 @@ def main():
                    help="Namespace metrics as <prefix>/<task>/<metric> (e.g. 'smoke', 'final')")
     p.add_argument("--append_notes", default=None,
                    help="With --resume_id: text appended to the run's notes")
+    p.add_argument("--resolve_pending", action="store_true",
+                   help="With --resume_id: remove the '[pending] ... [/pending]' block "
+                        "from the run's notes (the pipeline's ready-made follow-up "
+                        "command) — pass it when that follow-up job has now run.")
     p.add_argument("--notes", default="", help="Run notes (e.g. RCP log/JSON paths)")
     p.add_argument("--log", default=None,
                    help="Matching eval_*.log; its printed sample blocks are "
@@ -79,6 +83,8 @@ def main():
         raise SystemExit("Pass exactly one of --name (new run) or --resume_id (existing run).")
     if args.step is not None and not args.prefix:
         raise SystemExit("--step requires --prefix (metrics need their own x-axis namespace).")
+    if args.resolve_pending and not args.resume_id:
+        raise SystemExit("--resolve_pending requires --resume_id.")
 
     flat, compression, data = {}, {}, {}
     if args.json:
@@ -90,17 +96,19 @@ def main():
         for k, v in compression.items():
             if k.endswith("_ratio"):
                 flat[f"eval/{k}"] = v
-    elif not args.append_notes:
-        raise SystemExit("Nothing to do: pass --json and/or --append_notes.")
+    elif not args.append_notes and not args.resolve_pending:
+        raise SystemExit("Nothing to do: pass --json, --append_notes and/or --resolve_pending.")
 
     if args.prefix:
         flat = {f"{args.prefix}/{k}": v for k, v in flat.items()}
 
     import wandb
 
+    run = None
     if args.resume_id:
-        run = wandb.init(entity=args.entity, project=args.project,
-                         id=args.resume_id, resume="must")
+        if flat or args.log:
+            run = wandb.init(entity=args.entity, project=args.project,
+                             id=args.resume_id, resume="must")
     else:
         notes = args.notes or ""
         if args.json:
@@ -145,11 +153,30 @@ def main():
         else:
             print(f"warning: no sample blocks found in {args.log}")
 
-    if args.append_notes:
-        run.notes = ((run.notes or "") + "\n" + args.append_notes).strip()
+    if run is not None:
+        print(f"logged {len(flat)} metrics to W&B run: {getattr(run, 'url', None) or run.id}")
+        run.finish()
 
-    print(f"logged {len(flat)} metrics to W&B run: {getattr(run, 'url', None) or run.id}")
-    run.finish()
+    if args.resume_id and (args.append_notes or args.resolve_pending):
+        # Notes via the public API, after finish(): Api.run.notes is the
+        # authoritative server-side value, unlike the resumed run object's.
+        apirun = wandb.Api().run(f"{args.entity}/{args.project}/{args.resume_id}")
+        notes = apirun.notes or ""
+        if args.resolve_pending:
+            kept, skipping = [], False
+            for line in notes.splitlines():
+                if not skipping and "[pending]" in line:
+                    skipping = True
+                elif skipping and "[/pending]" in line:
+                    skipping = False
+                elif not skipping:
+                    kept.append(line)
+            notes = "\n".join(kept)
+        if args.append_notes:
+            notes = (notes.rstrip() + "\n" + args.append_notes).strip()
+        apirun.notes = notes
+        apirun.update()
+        print(f"notes updated on run {args.resume_id}")
 
 
 if __name__ == "__main__":

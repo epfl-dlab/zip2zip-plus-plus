@@ -55,7 +55,10 @@
 #                   eval run. Used by the ready-made perplexity command that
 #                   pipeline_ft_eval_rcp.sh appends to its W&B notes, so the
 #                   remaining corpora land next to the run's other evals.
-#                   Forces --no_wandb on the harness; requires WANDB_API_KEY.
+#                   Also appends the results JSON + log paths to the run notes,
+#                   and (perplexity preset) replaces the notes' [pending]
+#                   command block. Forces --no_wandb on the harness; requires
+#                   WANDB_API_KEY.
 #   WANDB_PREFIX=final  With RESUME_WANDB_ID: metrics namespaced <prefix>/<task>/<metric>
 #   WANDB_STEP=...  With RESUME_WANDB_ID: checkpoint step, logged on the
 #                   '<prefix>/step' x-axis so it lines up with the pipeline's
@@ -183,12 +186,21 @@ fi
 
 if [ -n "$RESUME_WANDB_ID" ]; then
     echo "=== logging results into existing W&B run $RESUME_WANDB_ID under $WANDB_PREFIX/ ==="
+    # A perplexity run completes the pipeline's follow-up: drop the [pending]
+    # command block from the run notes (no-op if the notes don't have one).
+    RESOLVE_PENDING=""
+    if [ "$PRESET" = "perplexity" ]; then
+        RESOLVE_PENDING="--resolve_pending"
+    fi
     python scripts/log_results_to_wandb.py \
         --json "$OUTPUT_JSON" \
         --resume_id "$RESUME_WANDB_ID" \
         ${WANDB_PROJECT:+--project "$WANDB_PROJECT"} \
         --prefix "$WANDB_PREFIX" \
-        ${WANDB_STEP:+--step "$WANDB_STEP"}
+        ${WANDB_STEP:+--step "$WANDB_STEP"} \
+        $RESOLVE_PENDING \
+        --append_notes "$PRESET${TASKS:+ [$TASKS]} eval results: $OUTPUT_JSON
+$PRESET eval log (RCP): $LOGFILE"
 fi
 
 } 2>&1 | tee "$LOGFILE"
