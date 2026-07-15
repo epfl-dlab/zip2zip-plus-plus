@@ -83,7 +83,7 @@ PYTHON=$PROJECT_DIR/.venv/bin/python
 # ---------- config (defaults = faithful released recipe; override via env) ----------
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L | wc -l | tr -d ' ')}
 
-DATA_DIR=${DATA_DIR:-$SCRATCH/datasets/phi-1B-sft-8shards}
+DATA_DIR=${DATA_DIR:-$SCRATCH/datasets/phi-1B-sft-8shards-eosfix}
 OUTPUT_BASE=${OUTPUT_BASE:-$SCRATCH/zip2zip-outputs}
 RUN_NAME=${RUN_NAME:-repro-Phi35-v0.1-fthf}
 OUTPUT_DIR=${OUTPUT_DIR:-${OUTPUT_BASE}/${RUN_NAME}}
