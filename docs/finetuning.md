@@ -124,6 +124,7 @@ Single source of truth for where things live on the cluster (`$SCRATCH =
 | What | Path | Notes |
 |---|---|---|
 | Phi SFT data (current) | `$SCRATCH/datasets/phi-1B-sft-8shards-eosfix` | EOS in loss (`b12efc0`); use for all new finetunes |
+| Phi SFT data (mathchat, v0.3) | `$SCRATCH/datasets/phi-1B-sft-8shards-mathchat` | eosfix + math docs re-rendered as multi-turn chat via exact NuminaMath problem matching; experimental until v0.3 validates |
 | Phi SFT data (legacy) | *deleted 2026-07-15* | was `phi-1B-sft-8shards` (EOS masked out); v0.1-repro trained on it — superseded by eosfix after v0.2 validated |
 | Llama SFT data | `$SCRATCH/datasets/zip2zip-1B-sft-8shards` | For a future Llama-3.2-1B reproduction; do not delete |
 | Checkpoints | `$SCRATCH/zip2zip-outputs/<RUN_NAME>/step_N` | `train.py` suffixes `(N)` on name collision — always pick a fresh `RUN_NAME`; the verified baseline is `andrea-z2z-phi35-4B-repro-1BData-v0.1-Zip2zipCore(1)/step_8000` |
