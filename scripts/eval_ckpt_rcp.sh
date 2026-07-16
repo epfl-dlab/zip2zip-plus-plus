@@ -93,6 +93,8 @@ LIMIT=${LIMIT:-}
 TASKS=${TASKS:-}
 # EVAL_MODE=base for MAX_CODEBOOK_SIZE=0 control checkpoints (base-mode-only).
 EVAL_MODE=${EVAL_MODE:-}
+# DISABLE_DIGIT_IDS=1: diagnostic — digits never LZW-merge into hypertokens.
+DISABLE_DIGIT_IDS=${DISABLE_DIGIT_IDS:-}
 WANDB=${WANDB:-0}
 WANDB_NAME=${WANDB_NAME:-}
 WANDB_PROJECT=${WANDB_PROJECT:-}
@@ -172,6 +174,7 @@ if [ -n "$CKPT_DIR" ]; then
         --resume_wandb_id none \
         --output_path "$OUTPUT_JSON" \
         ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
+        ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
         $WANDB_ARGS \
         $LIMIT_ARG \
         $TASKS_ARG
@@ -183,6 +186,7 @@ else
         --resume_wandb_id none \
         --output_path "$OUTPUT_JSON" \
         ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
+        ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
         $WANDB_ARGS \
         $LIMIT_ARG \
         $TASKS_ARG

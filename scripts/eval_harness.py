@@ -109,6 +109,9 @@ def main():
                         "(matches training distribution). 'base': vanilla LM scoring.")
     p.add_argument("--no_hyper_causal_mask", action="store_true",
                    help="Disable hyper_causal_mask in the model forward.")
+    p.add_argument("--disable_digit_ids", action="store_true",
+                   help="Diagnostic: add digit tokens to disabled_ids so numbers "
+                        "are never LZW-merged into hypertokens (compressed mode).")
     p.add_argument("--include_path", default=None,
                    help="Directory of custom task YAMLs. "
                         "Defaults to scripts/lm_eval_tasks/ next to this script.")
@@ -154,6 +157,7 @@ def main():
         eval_mode=args.eval_mode,
         batch_size=args.batch_size,
         hyper_causal_mask=not args.no_hyper_causal_mask,
+        disable_digit_ids=args.disable_digit_ids,
     )
 
     if preset_info:

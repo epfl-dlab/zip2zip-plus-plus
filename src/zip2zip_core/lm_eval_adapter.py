@@ -165,6 +165,7 @@ class Zip2ZipLM(LM):
         eval_mode: str = "compressed",
         batch_size: int | str = 1,
         hyper_causal_mask: bool = True,
+        disable_digit_ids: bool = False,
     ):
         super().__init__()
         if not torch.cuda.is_available() and device.startswith("cuda"):
@@ -217,6 +218,17 @@ class Zip2ZipLM(LM):
             disabled_ids = sorted(
                 i for i in (special | added) if 0 <= i < self.cfg.vocab_size
             )
+        if disable_digit_ids:
+            # Diagnostic: keep digits out of LZW merges so multi-digit numbers
+            # stay digit-by-digit base tokens instead of composite hypertokens.
+            digit_pieces = {str(d) for d in range(10)} | {f"▁{d}" for d in range(10)}
+            digit_ids = sorted(
+                i for piece, i in self.tokenizer.get_vocab().items()
+                if piece in digit_pieces and 0 <= i < self.cfg.vocab_size
+            )
+            print(f"[zip2zip-lm-eval] digit ids disabled for LZW "
+                  f"({len(digit_ids)}): {digit_ids}")
+            disabled_ids = sorted(set(disabled_ids) | set(digit_ids))
         self._disabled_ids = disabled_ids
         print(f"[zip2zip-lm-eval] disabled_ids ({len(disabled_ids)}): {disabled_ids[:16]}"
               f"{'...' if len(disabled_ids) > 16 else ''}")
