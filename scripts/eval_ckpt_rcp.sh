@@ -91,6 +91,8 @@ TOKENIZER=${TOKENIZER:-meta-llama/Meta-Llama-3-8B}
 PRESET=${PRESET:-default_base}
 LIMIT=${LIMIT:-}
 TASKS=${TASKS:-}
+# EVAL_MODE=base for MAX_CODEBOOK_SIZE=0 control checkpoints (base-mode-only).
+EVAL_MODE=${EVAL_MODE:-}
 WANDB=${WANDB:-0}
 WANDB_NAME=${WANDB_NAME:-}
 WANDB_PROJECT=${WANDB_PROJECT:-}
@@ -169,6 +171,7 @@ if [ -n "$CKPT_DIR" ]; then
         --preset "$PRESET" \
         --resume_wandb_id none \
         --output_path "$OUTPUT_JSON" \
+        ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
         $WANDB_ARGS \
         $LIMIT_ARG \
         $TASKS_ARG
@@ -179,6 +182,7 @@ else
         --preset "$PRESET" \
         --resume_wandb_id none \
         --output_path "$OUTPUT_JSON" \
+        ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
         $WANDB_ARGS \
         $LIMIT_ARG \
         $TASKS_ARG
