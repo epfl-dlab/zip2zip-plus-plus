@@ -142,6 +142,20 @@ pip install --quiet "lm-eval==0.4.9" "zip2zip-compression>=0.3.3" wandb
 
 cd "$PROJECT_DIR"
 
+# Audit: the results JSON must record the eval mode we asked for. Catches
+# plumbing regressions where a control run (EVAL_MODE=base) silently falls
+# back to the preset's compressed mode. No-op when EVAL_MODE is unset.
+audit_eval_mode() {
+    [ -z "${EVAL_MODE:-}" ] && return 0
+    python - "$1" "$EVAL_MODE" <<'PY'
+import json, sys
+path, want = sys.argv[1], sys.argv[2]
+got = json.load(open(path))["args"]["eval_mode"]
+assert got == want, f"eval-mode audit FAILED: {path} recorded {got!r}, expected {want!r}"
+print(f"[pipeline] eval-mode audit OK: {path} -> {got}")
+PY
+}
+
 # ---------- phase 2: smoke evals on intermediate checkpoints ----------
 echo "=== phase 2/4: smoke evals (every $SMOKE_EVERY steps, limit $SMOKE_LIMIT) ==="
 step=$SMOKE_EVERY
@@ -159,6 +173,7 @@ while [ "$step" -le "$STEPS" ]; do
             ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
             --no_wandb --resume_wandb_id none \
             --output_path "$SMOKE_JSON"
+        audit_eval_mode "$SMOKE_JSON"
         python scripts/log_results_to_wandb.py \
             --json "$SMOKE_JSON" \
             --resume_id "$WANDB_ID" --project "$WANDB_PROJECT" \
@@ -181,6 +196,7 @@ python scripts/eval_harness.py \
     ${FINAL_LIMIT:+--limit "$FINAL_LIMIT"} \
     ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
     --output_path "$MC_JSON" 2>&1 | tee "$MC_LOG"
+audit_eval_mode "$MC_JSON"
 
 # lm-eval's logger above writes the MC metrics as top-level summary keys and
 # uploads the per-sample tables; ALSO log them under final/ so every final
@@ -202,6 +218,7 @@ if [ "$SKIP_FULL_PPL" = "0" ]; then
         ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
         --no_wandb --resume_wandb_id none \
         --output_path "$PPL_JSON"
+    audit_eval_mode "$PPL_JSON"
     python scripts/log_results_to_wandb.py \
         --json "$PPL_JSON" \
         --resume_id "$WANDB_ID" --project "$WANDB_PROJECT" \

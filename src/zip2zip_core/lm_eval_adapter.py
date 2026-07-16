@@ -222,6 +222,16 @@ class Zip2ZipLM(LM):
               f"{'...' if len(disabled_ids) > 16 else ''}")
         self._max_length = int(max_length)
         self.eval_mode = eval_mode
+        if self.cfg.max_codebook_size == 0 and eval_mode != "base":
+            # Not fatal on THIS path: the compressor is rebuilt from meta.pt with
+            # max_codebook_size=0, so compressed mode degenerates to identity.
+            # But the convention for control checkpoints is base-mode-only —
+            # any path that does NOT read meta.pt (exports, manual configs)
+            # would feed the random, never-trained hyper-encoder into the
+            # softmax and silently corrupt inference.
+            print("[zip2zip-lm-eval] WARNING: checkpoint was trained with "
+                  "max_codebook_size=0 (uncompressed control) but eval_mode="
+                  f"{eval_mode!r}. Use --eval_mode base for control checkpoints.")
         self._batch_size = int(batch_size)
         self.hyper_causal_mask = bool(hyper_causal_mask)
 
