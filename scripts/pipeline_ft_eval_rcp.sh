@@ -119,6 +119,11 @@ if [ ! -f "$PROJECT_DIR/scripts/lm_eval_tasks/gsm8k_boxed.yaml" ]; then
     echo "FATAL: gsm8k_boxed.yaml missing — pull the latest finetuning-andrea."
     exit 1
 fi
+if [ "${MAX_CODEBOOK_SIZE:-4096}" = "0" ] && [ "${EVAL_MODE:-}" != "base" ]; then
+    echo "FATAL: MAX_CODEBOOK_SIZE=0 trains an uncompressed control checkpoint,"
+    echo "which is base-mode-only at eval — set EVAL_MODE=base."
+    exit 1
+fi
 
 # ---------- phase 1: train (the launcher owns its env/venv/flags) ----------
 echo "=== phase 1/4: training ==="
