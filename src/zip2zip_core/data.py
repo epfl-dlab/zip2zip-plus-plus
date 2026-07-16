@@ -151,6 +151,13 @@ class Zip2ZipDataset(IterableDataset, Stateful):
 
     def _codebook_to_tensor(self, codebook) -> torch.LongTensor:
         cb_dict = codebook.to_dict()
+        if self.max_codebook_size == 0:
+            # Keep the (rows, max_subtokens) shape even with zero rows — a bare
+            # LongTensor([]) is 1-D and only collates by torch's legacy
+            # empty-1D cat special case.
+            return torch.full(
+                (0, self.max_subtokens), self.pad_token_id, dtype=torch.long
+            )
         cb_list = []
         for i in range(self.max_codebook_size):
             hyper_id = self.initial_vocab_size + i

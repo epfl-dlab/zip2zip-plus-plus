@@ -93,6 +93,11 @@ TOKENIZER=${TOKENIZER:-microsoft/Phi-3.5-mini-instruct}
 MODEL_CONFIG=${MODEL_CONFIG:-Phi3.5-mini}
 MAX_SUBTOKENS=${MAX_SUBTOKENS:-4}
 MAX_ACTIVE_CODEBOOK_SIZE=${MAX_ACTIVE_CODEBOOK_SIZE:-2048}
+# MAX_CODEBOOK_SIZE=0 disables compression entirely (the LZW encoder becomes an
+# exact identity and the hyper path never executes): this is the
+# continual-pretraining control. Checkpoints trained with 0 are base-mode-only
+# at eval (they contain a random, never-trained hyper-encoder).
+MAX_CODEBOOK_SIZE=${MAX_CODEBOOK_SIZE:-4096}
 
 # Released run: 8000 steps x 32,768 tokens/step = ~262M tokens.
 STEPS=${STEPS:-8000}
@@ -271,6 +276,7 @@ fi
     --encoder_intermediate_size "$ENCODER_INTERMEDIATE_SIZE" \
     --hyper_encoder_type "$HYPER_ENCODER_TYPE" \
     --max_active_codebook_size "$MAX_ACTIVE_CODEBOOK_SIZE" \
+    --max_codebook_size "$MAX_CODEBOOK_SIZE" \
     --steps "$STEPS" \
     --max_tokens "$MAX_TOKENS" \
     --seq_len "$SEQ_LEN" \

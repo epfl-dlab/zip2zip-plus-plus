@@ -37,6 +37,9 @@
 #   TOKENIZER=microsoft/Phi-3.5-mini-instruct
 #   WANDB_PROJECT=zip2zip-core
 #   SKIP_FULL_PPL=0   set 1 to also skip the wikitext perplexity in phase 3
+#   EVAL_MODE=        force eval_harness --eval_mode for all evals; set to
+#                     'base' for MAX_CODEBOOK_SIZE=0 control runs (their
+#                     checkpoints are base-mode-only). Empty = preset default.
 #   FINAL_LIMIT=      per-task sample limit for the FINAL eval (default: full).
 #                     Only for pipeline rehearsals — never for real numbers.
 # Anything else the finetune launcher reads (LR, SEQ_LEN, ...) passes through.
@@ -153,6 +156,7 @@ while [ "$step" -le "$STEPS" ]; do
             --preset default \
             --tasks "$SMOKE_TASKS" \
             --limit "$SMOKE_LIMIT" \
+            ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
             --no_wandb --resume_wandb_id none \
             --output_path "$SMOKE_JSON"
         python scripts/log_results_to_wandb.py \
@@ -175,6 +179,7 @@ python scripts/eval_harness.py \
     --preset default \
     --resume_wandb_id "$WANDB_ID" --wandb_project "$WANDB_PROJECT" \
     ${FINAL_LIMIT:+--limit "$FINAL_LIMIT"} \
+    ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
     --output_path "$MC_JSON" 2>&1 | tee "$MC_LOG"
 
 # lm-eval's logger above writes the MC metrics as top-level summary keys and
@@ -194,6 +199,7 @@ if [ "$SKIP_FULL_PPL" = "0" ]; then
         --preset perplexity \
         --tasks wikitext \
         ${FINAL_LIMIT:+--limit "$FINAL_LIMIT"} \
+        ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
         --no_wandb --resume_wandb_id none \
         --output_path "$PPL_JSON"
     python scripts/log_results_to_wandb.py \

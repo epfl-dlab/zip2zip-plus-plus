@@ -116,6 +116,28 @@ CSCS-SLURM counterpart (same `train.py` flags, different job launcher).
 `scripts/tokenize_sft_phi_rcp.sh` prepares the required Phi-tokenized `epfl-dlab/zip2zip-1B`
 shards on RCP; sanity-checks the max token ID to catch accidentally-Llama-tokenized data.
 
+## Continual-pretraining control (uncompressed baseline)
+
+The fair baseline for a zip2zip finetune is the same recipe with compression
+disabled (the paper's "Cont. pretrain" row), not the raw base model. Run it with
+`MAX_CODEBOOK_SIZE=0` and everything else identical: the LZW encoder becomes an
+exact identity (insertion is gated on `next_id < initial_vocab_size +
+max_codebook_size`), the hyper path never executes (all-pad codebook fails the
+`(codebook != pad).any()` gate), logits reduce to the base vocab, and training
+is mathematically plain CLM with LoRA as the only trained parameters.
+
+Caveats to state when comparing:
+- **Budget**: steps are matched, base tokens are not — the treatment run covers
+  ~C× more base tokens per window (C ≈ 1.4). Steps-matched is the convention;
+  add a token-matched arm (`STEPS ≈ 8000×C`) only if the control looks weak.
+- **Chunk coverage**: the control trains on the first `seq_len+1` base tokens of
+  every `2*seq_len` chunk; the treatment covers more per chunk and silently
+  drops chunks that compress ≥2×.
+- **Eval**: control checkpoints are **base-mode-only** (they carry a random,
+  never-trained hyper-encoder). Pass `EVAL_MODE=base` to the pipeline (or
+  `--eval_mode base` to eval_harness). Audit `eval_args.eval_mode` in results
+  JSONs. gen/input compression health lines read ~1.0 for these runs by design.
+
 ## Canonical RCP locations and run conventions
 
 Single source of truth for where things live on the cluster (`$SCRATCH =
