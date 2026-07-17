@@ -530,6 +530,9 @@ def main():
     parser.add_argument("--hyper_encoder_type", type=str, default="flat", choices=["flat", "hierarchical", "fast_hierarchical"])
     parser.add_argument("--encoder_n_layers", type=int, default=None)
     parser.add_argument("--max_active_codebook_size", type=int, default=4096)
+    parser.add_argument("--disable_digit_ids", action="store_true",
+                        help="Add digit tokens to the LZW disabled_ids so numbers are "
+                             "never merged into hypertokens during training.")
     parser.add_argument("--seq_len", type=int, default=4096)
     parser.add_argument("--local_batch_size", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
@@ -843,6 +846,18 @@ def main():
     disabled_ids = sorted(
         i for i in (_special_ids | _added_ids) if 0 <= i < config.vocab_size
     )
+    if args.disable_digit_ids:
+        # Keep digits out of LZW merges: multi-digit numbers stay digit-by-digit
+        # base tokens instead of composite hypertokens. Must match the eval-side
+        # rule in lm_eval_adapter (disable_digit_ids).
+        _digit_pieces = {str(d) for d in range(10)} | {f"▁{d}" for d in range(10)}
+        _digit_ids = sorted(
+            i for piece, i in _dl_tok.get_vocab().items()
+            if piece in _digit_pieces and 0 <= i < config.vocab_size
+        )
+        if rank == 0:
+            print(f"[data] digit ids disabled for LZW ({len(_digit_ids)}): {_digit_ids}")
+        disabled_ids = sorted(set(disabled_ids) | set(_digit_ids))
     if rank == 0:
         print(f"[data] initial_vocab_size={config.vocab_size} "
               f"pad_token_id={config.pad_token_id} "

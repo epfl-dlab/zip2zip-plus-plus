@@ -98,6 +98,13 @@ MAX_ACTIVE_CODEBOOK_SIZE=${MAX_ACTIVE_CODEBOOK_SIZE:-2048}
 # continual-pretraining control. Checkpoints trained with 0 are base-mode-only
 # at eval (they contain a random, never-trained hyper-encoder).
 MAX_CODEBOOK_SIZE=${MAX_CODEBOOK_SIZE:-4096}
+# DISABLE_DIGIT_IDS=1: digits never LZW-merge into hypertokens during training.
+# Evaluate such checkpoints with the matching eval-side flag.
+DISABLE_DIGIT_IDS=${DISABLE_DIGIT_IDS:-}
+DIGIT_FLAG=""
+if [ -n "$DISABLE_DIGIT_IDS" ] && [ "$DISABLE_DIGIT_IDS" != "0" ]; then
+    DIGIT_FLAG="--disable_digit_ids"
+fi
 
 # Released run: 8000 steps x 32,768 tokens/step = ~262M tokens.
 STEPS=${STEPS:-8000}
@@ -291,6 +298,7 @@ fi
     --save_freq "$SAVE_FREQ" \
     --log_freq "$LOG_FREQ" \
     --no_remap_codebook --hyper_causal_mask \
+    $DIGIT_FLAG \
     $HF_REPO_FLAG \
     $AC_FLAG \
     $DISABLE_VARLEN_FLAG \
