@@ -279,7 +279,9 @@ runai submit --name $PPL_JOB_NAME \\
   --environment CKPT_DIR='$FINAL_CKPT' \\
   --environment TOKENIZER=$TOKENIZER \\
   --environment PRESET=perplexity \\
-  --environment TASKS=$PPL_TASKS \\
+  --environment TASKS=$PPL_TASKS \\${DISABLE_DIGIT_IDS:+
+  --environment DISABLE_DIGIT_IDS=1 \\}${EVAL_MODE:+
+  --environment EVAL_MODE=$EVAL_MODE \\}
   --environment RESUME_WANDB_ID=$WANDB_ID \\
   --environment WANDB_STEP=$STEPS \\
   --environment WANDB_PROJECT=$WANDB_PROJECT \\
