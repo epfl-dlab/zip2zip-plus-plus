@@ -281,6 +281,24 @@ class Zip2ZipDataset(IterableDataset, Stateful):
 
                     compressed = compressed[: self.seq_len + 1]
 
+                    # A window with ZERO hypertokens makes this rank skip the
+                    # hyper-encoder forward (model gate: (codebook != pad).any())
+                    # while other ranks run it — the FSDP collectives then
+                    # deadlock until the NCCL watchdog aborts the job (observed
+                    # in the first digitsafe run: rare all-number windows have
+                    # no LZW merges once digits are disabled). Skip such windows
+                    # when compression is on; the uncompressed control
+                    # (max_codebook_size=0) skips the hyper path on ALL ranks
+                    # uniformly, which is safe, so it must keep every window.
+                    if self.max_codebook_size > 0 and not any(
+                        t >= self.initial_vocab_size for t in compressed
+                    ):
+                        self._debug_log(
+                            f"lm skip zero-hypertoken window shard_idx={shard_idx} "
+                            f"offset={offset - self.base_chunk_len}"
+                        )
+                        continue
+
                     # Count base tokens represented by compressed sequence
                     cb_dict = codebook.to_dict()
                     n_base_tokens = sum(
