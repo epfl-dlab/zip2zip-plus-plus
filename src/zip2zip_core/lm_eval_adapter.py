@@ -228,9 +228,14 @@ class Zip2ZipLM(LM):
             disabled_ids = sorted(
                 i for i in (special | added) if 0 <= i < self.cfg.vocab_size
             )
-        if (self.train_args or {}).get("disable_digit_ids") and not disable_digit_ids:
+        if (
+            eval_mode == "compressed"
+            and (self.train_args or {}).get("disable_digit_ids")
+            and not disable_digit_ids
+        ):
             # Canonical since the digitsafe run validated: eval follows the
-            # checkpoint's training distribution automatically.
+            # checkpoint's training distribution automatically. Irrelevant in
+            # base mode, where the compressor is never invoked.
             print("[zip2zip-lm-eval] checkpoint was trained with digit-protected "
                   "LZW (meta.pt) — auto-enabling digit protection for this eval.")
             disable_digit_ids = True
