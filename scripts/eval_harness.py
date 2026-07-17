@@ -112,6 +112,9 @@ def main():
     p.add_argument("--disable_digit_ids", action="store_true",
                    help="Diagnostic: add digit tokens to disabled_ids so numbers "
                         "are never LZW-merged into hypertokens (compressed mode).")
+    p.add_argument("--disable_mathsym_ids", action="store_true",
+                   help="Diagnostic: also keep math operators/symbols (=+-*/%%$^<>) "
+                        "out of LZW merges — triage for extending the protected set.")
     p.add_argument("--include_path", default=None,
                    help="Directory of custom task YAMLs. "
                         "Defaults to scripts/lm_eval_tasks/ next to this script.")
@@ -158,11 +161,13 @@ def main():
         batch_size=args.batch_size,
         hyper_causal_mask=not args.no_hyper_causal_mask,
         disable_digit_ids=args.disable_digit_ids,
+        disable_mathsym_ids=args.disable_mathsym_ids,
     )
     # The adapter auto-enables digit protection for checkpoints trained with it
     # and auto-switches control checkpoints (max_codebook_size=0) to base mode —
     # reflect the effective settings so the results JSON records what actually ran.
     args.disable_digit_ids = lm.disable_digit_ids
+    args.disable_mathsym_ids = lm.disable_mathsym_ids
     args.eval_mode = lm.eval_mode
 
     if preset_info:

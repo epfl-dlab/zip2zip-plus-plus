@@ -166,6 +166,7 @@ class Zip2ZipLM(LM):
         batch_size: int | str = 1,
         hyper_causal_mask: bool = True,
         disable_digit_ids: bool = False,
+        disable_mathsym_ids: bool = False,
     ):
         super().__init__()
         if not torch.cuda.is_available() and device.startswith("cuda"):
@@ -249,6 +250,20 @@ class Zip2ZipLM(LM):
                   f"({len(digit_ids)}): {digit_ids}")
             disabled_ids = sorted(set(disabled_ids) | set(digit_ids))
         self.disable_digit_ids = bool(disable_digit_ids)
+        if disable_mathsym_ids:
+            # Diagnostic (triage for extending the protected set beyond digits):
+            # keep math operators/symbols out of LZW merges. "." is deliberately
+            # absent — decimals are already protected transitively when digits
+            # are disabled (a merge needs an adjacent pair).
+            sym_pieces = set("=+-*/%$^<>") | {f"▁{c}" for c in "=+-*/%$^<>"}
+            sym_ids = sorted(
+                i for piece, i in self.tokenizer.get_vocab().items()
+                if piece in sym_pieces and 0 <= i < self.cfg.vocab_size
+            )
+            print(f"[zip2zip-lm-eval] math-symbol ids disabled for LZW "
+                  f"({len(sym_ids)}): {sym_ids}")
+            disabled_ids = sorted(set(disabled_ids) | set(sym_ids))
+        self.disable_mathsym_ids = bool(disable_mathsym_ids)
         self._disabled_ids = disabled_ids
         print(f"[zip2zip-lm-eval] disabled_ids ({len(disabled_ids)}): {disabled_ids[:16]}"
               f"{'...' if len(disabled_ids) > 16 else ''}")

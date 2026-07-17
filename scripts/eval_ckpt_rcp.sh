@@ -97,6 +97,9 @@ EVAL_MODE=${EVAL_MODE:-}
 # "0" is normalized to off ("" ) so it cannot half-trigger the :+ passthrough.
 DISABLE_DIGIT_IDS=${DISABLE_DIGIT_IDS:-}
 [ "$DISABLE_DIGIT_IDS" = "0" ] && DISABLE_DIGIT_IDS=""
+# DISABLE_MATHSYM_IDS=1: triage — also protect math operators/symbols.
+DISABLE_MATHSYM_IDS=${DISABLE_MATHSYM_IDS:-}
+[ "$DISABLE_MATHSYM_IDS" = "0" ] && DISABLE_MATHSYM_IDS=""
 WANDB=${WANDB:-0}
 WANDB_NAME=${WANDB_NAME:-}
 WANDB_PROJECT=${WANDB_PROJECT:-}
@@ -177,6 +180,7 @@ if [ -n "$CKPT_DIR" ]; then
         --output_path "$OUTPUT_JSON" \
         ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
         ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
+        ${DISABLE_MATHSYM_IDS:+--disable_mathsym_ids} \
         $WANDB_ARGS \
         $LIMIT_ARG \
         $TASKS_ARG
@@ -189,6 +193,7 @@ else
         --output_path "$OUTPUT_JSON" \
         ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
         ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
+        ${DISABLE_MATHSYM_IDS:+--disable_mathsym_ids} \
         $WANDB_ARGS \
         $LIMIT_ARG \
         $TASKS_ARG
@@ -197,10 +202,10 @@ fi
 # Same audit as the pipeline: the results JSON must record the flags we asked
 # for — a silently dropped flag fails loudly instead of producing numbers from
 # the wrong distribution.
-if [ -n "${EVAL_MODE:-}" ] || [ -n "${DISABLE_DIGIT_IDS:-}" ]; then
-    python - "$OUTPUT_JSON" "${EVAL_MODE:-}" "${DISABLE_DIGIT_IDS:-}" <<'PY'
+if [ -n "${EVAL_MODE:-}" ] || [ -n "${DISABLE_DIGIT_IDS:-}" ] || [ -n "${DISABLE_MATHSYM_IDS:-}" ]; then
+    python - "$OUTPUT_JSON" "${EVAL_MODE:-}" "${DISABLE_DIGIT_IDS:-}" "${DISABLE_MATHSYM_IDS:-}" <<'PY'
 import json, sys
-path, want_mode, want_digits = sys.argv[1], sys.argv[2], sys.argv[3]
+path, want_mode, want_digits, want_syms = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 args = json.load(open(path))["args"]
 if want_mode:
     got = args["eval_mode"]
@@ -208,6 +213,9 @@ if want_mode:
 if want_digits:
     got = args.get("disable_digit_ids")
     assert got is True, f"digit-flag audit FAILED: {path} recorded disable_digit_ids={got!r}, expected True"
+if want_syms:
+    got = args.get("disable_mathsym_ids")
+    assert got is True, f"mathsym-flag audit FAILED: {path} recorded disable_mathsym_ids={got!r}, expected True"
 print(f"[eval_ckpt] eval-flags audit OK: {path}")
 PY
 fi
