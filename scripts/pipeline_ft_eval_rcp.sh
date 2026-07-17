@@ -128,6 +128,12 @@ if [ "${MAX_CODEBOOK_SIZE:-4096}" = "0" ] && [ "${EVAL_MODE:-}" != "base" ]; the
     echo "which is base-mode-only at eval — set EVAL_MODE=base."
     exit 1
 fi
+if [ "${DISABLE_DIGIT_IDS:-}" = "0" ]; then
+    echo "FATAL: DISABLE_DIGIT_IDS=0 is ambiguous — the training launcher would"
+    echo "treat it as OFF while the eval passthrough would treat it as ON,"
+    echo "splitting train/eval distributions. Leave it unset/empty to disable."
+    exit 1
+fi
 
 # ---------- phase 1: train (the launcher owns its env/venv/flags) ----------
 echo "=== phase 1/4: training ==="
@@ -151,17 +157,23 @@ pip install --quiet "lm-eval==0.4.9" "zip2zip-compression>=0.3.3" wandb
 
 cd "$PROJECT_DIR"
 
-# Audit: the results JSON must record the eval mode we asked for. Catches
-# plumbing regressions where a control run (EVAL_MODE=base) silently falls
-# back to the preset's compressed mode. No-op when EVAL_MODE is unset.
+# Audit: the results JSON must record the eval flags we asked for. Catches
+# plumbing regressions where a control run (EVAL_MODE=base) or a digit-protected
+# run (DISABLE_DIGIT_IDS=1) silently falls back to defaults. No-op when neither
+# env is set.
 audit_eval_mode() {
-    [ -z "${EVAL_MODE:-}" ] && return 0
-    python - "$1" "$EVAL_MODE" <<'PY'
+    [ -z "${EVAL_MODE:-}" ] && [ -z "${DISABLE_DIGIT_IDS:-}" ] && return 0
+    python - "$1" "${EVAL_MODE:-}" "${DISABLE_DIGIT_IDS:-}" <<'PY'
 import json, sys
-path, want = sys.argv[1], sys.argv[2]
-got = json.load(open(path))["args"]["eval_mode"]
-assert got == want, f"eval-mode audit FAILED: {path} recorded {got!r}, expected {want!r}"
-print(f"[pipeline] eval-mode audit OK: {path} -> {got}")
+path, want_mode, want_digits = sys.argv[1], sys.argv[2], sys.argv[3]
+args = json.load(open(path))["args"]
+if want_mode:
+    got = args["eval_mode"]
+    assert got == want_mode, f"eval-mode audit FAILED: {path} recorded {got!r}, expected {want_mode!r}"
+if want_digits:
+    got = args.get("disable_digit_ids")
+    assert got is True, f"digit-flag audit FAILED: {path} recorded disable_digit_ids={got!r}, expected True"
+print(f"[pipeline] eval-flags audit OK: {path}")
 PY
 }
 

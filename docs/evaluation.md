@@ -134,6 +134,12 @@ folded LoRA into 224 linear layers          # decoder weights actually loaded
 Casting complex values to real              # would mean RoPE destroyed at load
 ```
 
+For digit-protected evals (`--disable_digit_ids` / `DISABLE_DIGIT_IDS=1`, matching
+checkpoints trained with the same flag) the first line reads `disabled_ids (24)`
+instead, preceded by `digit ids disabled for LZW (10): [...]` — that pair is the
+expected health signature, not a bug. The adapter warns if a digit-protected
+checkpoint (per meta.pt) is evaluated without the flag.
+
 Generation-mode runs should show `gen_compression_ratio ≈ 1.4` (a healthy model
 emits hyper-tokens; ~1.0 means it never does). Before any full eval of a new
 checkpoint, run the 15-minute sanity gate `scripts/diagnose_ckpt_rcp.sh` (train-style

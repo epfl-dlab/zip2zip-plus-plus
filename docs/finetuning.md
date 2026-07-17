@@ -138,6 +138,23 @@ Caveats to state when comparing:
   `--eval_mode base` to eval_harness). Audit `eval_args.eval_mode` in results
   JSONs. gen/input compression health lines read ~1.0 for these runs by design.
 
+## Digit-protected compression (experimental until the digitsafe run validates)
+
+Multi-digit numbers are LZW-merged into hypertokens by default (only chat
+specials are in `disabled_ids`), and this measurably destroys arithmetic: on
+GSM8K, adding just the 10 digit tokens to `disabled_ids` at eval recovered ~80%
+of the inference-time compression cost (0.356 → 0.458 on a checkpoint trained
+WITHOUT protection; base-mode ceiling 0.483). `DISABLE_DIGIT_IDS=1` on the
+pipeline applies the protection to BOTH training and every eval — one lever, so
+train and eval always share the same distribution (`train.py --disable_digit_ids`
++ eval passthroughs; per-eval flag audit; setting the env to literal `0` is a
+preflight error). NOT the default: all flags default off so existing checkpoints
+and the frozen baselines evaluate bit-identically. If the digitsafe run
+validates, the plan is (a) document `DISABLE_DIGIT_IDS=1` as part of the
+canonical recipe here, and (b) have the eval adapter auto-enable digit
+protection when meta.pt records it, so eval always follows the checkpoint's
+training distribution without a human lever.
+
 ## Canonical RCP locations and run conventions
 
 Single source of truth for where things live on the cluster (`$SCRATCH =

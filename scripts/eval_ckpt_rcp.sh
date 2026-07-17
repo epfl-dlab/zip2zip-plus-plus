@@ -94,7 +94,9 @@ TASKS=${TASKS:-}
 # EVAL_MODE=base for MAX_CODEBOOK_SIZE=0 control checkpoints (base-mode-only).
 EVAL_MODE=${EVAL_MODE:-}
 # DISABLE_DIGIT_IDS=1: diagnostic — digits never LZW-merge into hypertokens.
+# "0" is normalized to off ("" ) so it cannot half-trigger the :+ passthrough.
 DISABLE_DIGIT_IDS=${DISABLE_DIGIT_IDS:-}
+[ "$DISABLE_DIGIT_IDS" = "0" ] && DISABLE_DIGIT_IDS=""
 WANDB=${WANDB:-0}
 WANDB_NAME=${WANDB_NAME:-}
 WANDB_PROJECT=${WANDB_PROJECT:-}
