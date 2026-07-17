@@ -160,9 +160,10 @@ def main():
         disable_digit_ids=args.disable_digit_ids,
     )
     # The adapter auto-enables digit protection for checkpoints trained with it
-    # (meta.pt) — reflect the effective setting so the results JSON records
-    # what actually ran.
+    # and auto-switches control checkpoints (max_codebook_size=0) to base mode —
+    # reflect the effective settings so the results JSON records what actually ran.
     args.disable_digit_ids = lm.disable_digit_ids
+    args.eval_mode = lm.eval_mode
 
     if preset_info:
         print(f"[eval_harness] preset: {preset_info[0]} — {preset_info[1]}")
