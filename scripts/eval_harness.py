@@ -159,6 +159,10 @@ def main():
         hyper_causal_mask=not args.no_hyper_causal_mask,
         disable_digit_ids=args.disable_digit_ids,
     )
+    # The adapter auto-enables digit protection for checkpoints trained with it
+    # (meta.pt) — reflect the effective setting so the results JSON records
+    # what actually ran.
+    args.disable_digit_ids = lm.disable_digit_ids
 
     if preset_info:
         print(f"[eval_harness] preset: {preset_info[0]} — {preset_info[1]}")

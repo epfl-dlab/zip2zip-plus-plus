@@ -138,22 +138,26 @@ Caveats to state when comparing:
   `--eval_mode base` to eval_harness). Audit `eval_args.eval_mode` in results
   JSONs. gen/input compression health lines read ~1.0 for these runs by design.
 
-## Digit-protected compression (experimental until the digitsafe run validates)
+## Digit-protected compression (canonical since v0.4-digitsafe)
 
 Multi-digit numbers are LZW-merged into hypertokens by default (only chat
-specials are in `disabled_ids`), and this measurably destroys arithmetic: on
-GSM8K, adding just the 10 digit tokens to `disabled_ids` at eval recovered ~80%
-of the inference-time compression cost (0.356 → 0.458 on a checkpoint trained
-WITHOUT protection; base-mode ceiling 0.483). `DISABLE_DIGIT_IDS=1` on the
-pipeline applies the protection to BOTH training and every eval — one lever, so
-train and eval always share the same distribution (`train.py --disable_digit_ids`
-+ eval passthroughs; per-eval flag audit; setting the env to literal `0` is a
-preflight error). NOT the default: all flags default off so existing checkpoints
-and the frozen baselines evaluate bit-identically. If the digitsafe run
-validates, the plan is (a) document `DISABLE_DIGIT_IDS=1` as part of the
-canonical recipe here, and (b) have the eval adapter auto-enable digit
-protection when meta.pt records it, so eval always follows the checkpoint's
-training distribution without a human lever.
+specials are in `disabled_ids`), and this measurably destroys arithmetic. The
+v0.4-digitsafe run (2026-07-17) validated train-time protection: with the 10
+digit tokens in `disabled_ids` for training AND eval, GSM8K flexible went
+0.356 → 0.610 (+25pt, ~2/3 of zip2zip's entire math deficit vs the
+uncompressed control at 0.742), with MC flat (WinoGrande −3.4pt the only move
+beyond ~1pt), wiki byte-ppl +0.9%, and essentially no compression loss on
+natural text (MC input ratio 1.077 vs 1.079; wikitext window 1.169 vs 1.209).
+
+**Canonical recipe: pass `DISABLE_DIGIT_IDS=1` on every new finetune.** One
+lever applies the protection to BOTH training and every eval
+(`train.py --disable_digit_ids` + eval passthroughs; per-eval flag audit;
+setting the env to literal `0` is a preflight error). It is deliberately NOT a
+code default so pre-digitsafe checkpoints and the frozen baselines evaluate
+bit-identically; the eval adapter auto-enables digit protection when a
+checkpoint's meta.pt records it, so evals always follow the checkpoint's
+training distribution even if the flag is forgotten (results JSON records the
+effective value).
 
 ## Canonical RCP locations and run conventions
 
@@ -171,7 +175,8 @@ Single source of truth for where things live on the cluster (`$SCRATCH =
 | Train / tokenize logs | `$SCRATCH/logs/train/`, `$SCRATCH/logs/tokenize/` | |
 
 Standard run sequence for a new finetune: `tokenize_sft_phi_rcp.sh` (only if the
-data recipe changed) → **`pipeline_ft_eval_rcp.sh`** — one Run:AI job that trains,
+data recipe changed) → **`pipeline_ft_eval_rcp.sh`** with `DISABLE_DIGIT_IDS=1`
+(canonical since v0.4-digitsafe, see above) — one Run:AI job that trains,
 smoke-evals every 1000-step checkpoint (arc_easy/hellaswag/winogrande/gsm8k_boxed
 @ 200 samples, curves at `smoke/step` in W&B), runs the full `default` preset +
 wikitext perplexity on the final checkpoint (all sample tables in W&B), and appends

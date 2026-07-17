@@ -44,6 +44,7 @@
 #                     (finetune launcher) and every eval — one lever so the
 #                     model trains and evals in the same digit-protected
 #                     distribution. Leave empty to disable (never set to 0).
+#                     CANONICAL since v0.4-digitsafe: pass 1 on new finetunes.
 #   FINAL_LIMIT=      per-task sample limit for the FINAL eval (default: full).
 #                     Only for pipeline rehearsals — never for real numbers.
 # Anything else the finetune launcher reads (LR, SEQ_LEN, ...) passes through.

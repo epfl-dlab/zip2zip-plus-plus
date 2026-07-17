@@ -219,10 +219,11 @@ class Zip2ZipLM(LM):
                 i for i in (special | added) if 0 <= i < self.cfg.vocab_size
             )
         if (self.train_args or {}).get("disable_digit_ids") and not disable_digit_ids:
-            print("[zip2zip-lm-eval] WARNING: checkpoint was trained with digit-"
-                  "protected LZW (disable_digit_ids in meta.pt) but this eval does "
-                  "not pass --disable_digit_ids — compressed-mode scoring will merge "
-                  "digits the model never saw merged.")
+            # Canonical since the digitsafe run validated: eval follows the
+            # checkpoint's training distribution automatically.
+            print("[zip2zip-lm-eval] checkpoint was trained with digit-protected "
+                  "LZW (meta.pt) — auto-enabling digit protection for this eval.")
+            disable_digit_ids = True
         if disable_digit_ids and not (self.train_args or {}).get("disable_digit_ids"):
             print("[zip2zip-lm-eval] note: digit-protected eval of a checkpoint "
                   "trained WITHOUT digit protection — fine as a diagnostic, but the "
@@ -238,6 +239,7 @@ class Zip2ZipLM(LM):
             print(f"[zip2zip-lm-eval] digit ids disabled for LZW "
                   f"({len(digit_ids)}): {digit_ids}")
             disabled_ids = sorted(set(disabled_ids) | set(digit_ids))
+        self.disable_digit_ids = bool(disable_digit_ids)
         self._disabled_ids = disabled_ids
         print(f"[zip2zip-lm-eval] disabled_ids ({len(disabled_ids)}): {disabled_ids[:16]}"
               f"{'...' if len(disabled_ids) > 16 else ''}")
