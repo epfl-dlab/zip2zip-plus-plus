@@ -349,6 +349,43 @@ def _clean_state_dict(model_state):
     return cleaned
 
 
+def validate_resume_args(resume_dir, args):
+    """Fail fast when a resume would silently change the training distribution.
+
+    Compression semantics must never change inside one checkpoint lineage:
+    a resume that drops --disable_digit_ids (or changes the codebook size or
+    tokenizer) would continue the run on a different data distribution with no
+    error anywhere. Curriculum phases legitimately change max_subtokens /
+    seq_len / data_dir, so those only print a note. Deliberate changes to the
+    hard set require --allow_resume_mismatch.
+    """
+    meta_path = os.path.join(resume_dir, "meta.pt")
+    if not os.path.exists(meta_path):
+        return
+    prev = torch.load(meta_path, map_location="cpu", weights_only=False).get("args", {}) or {}
+    hard = ("disable_digit_ids", "max_codebook_size", "tokenizer")
+    soft = ("max_subtokens", "seq_len", "data_dir")
+    mismatches = [
+        (k, prev[k], getattr(args, k))
+        for k in hard
+        if k in prev and prev[k] != getattr(args, k)
+    ]
+    if mismatches and not args.allow_resume_mismatch:
+        raise ValueError(
+            f"resume args differ from {meta_path} on distribution-critical settings "
+            f"{mismatches} (recorded, requested) — resuming would silently change the "
+            "training distribution mid-lineage. Pass the recorded values, or "
+            "--allow_resume_mismatch for a deliberate change."
+        )
+    if dist.get_rank() == 0:
+        for k, old, new in mismatches:
+            print(f"[resume] OVERRIDE: {k} changes from {old!r} to {new!r} (--allow_resume_mismatch)")
+        for k in soft:
+            if k in prev and prev[k] != getattr(args, k):
+                print(f"[resume] note: {k} changes from {prev[k]!r} to {getattr(args, k)!r} "
+                      f"(legitimate for curriculum phases; verify it is intended)")
+
+
 def load_checkpoint(model, optimizer, resume_dir, device, random_weights=False):
     """Load model and optimizer state from a local directory.
 
@@ -557,6 +594,10 @@ def main():
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--log_freq", type=int, default=10)
     parser.add_argument("--save_freq", type=int, default=1000)
+    parser.add_argument("--allow_resume_mismatch", action="store_true",
+                        help="Permit resuming with distribution-critical args (digit "
+                             "protection, codebook size, tokenizer) that differ from "
+                             "the checkpoint's meta.pt. Off = hard error.")
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Local checkpoint dir, or 'latest' to auto-find latest step_* in output_dir")
     parser.add_argument("--resume_from_hf", type=str, default=None,
@@ -814,6 +855,7 @@ def main():
         resume_dir_list = [resume_dir]
         dist.broadcast_object_list(resume_dir_list, src=0)
         resume_dir = resume_dir_list[0]
+        validate_resume_args(resume_dir, args)
         start_step = load_checkpoint(model, optimizer if not args.eval else None, resume_dir, device)
     elif args.resume_from:
         resume_dir = args.resume_from
@@ -821,6 +863,7 @@ def main():
             resume_dir = _resolve_latest_checkpoint(args.output_dir)
             if rank == 0:
                 print(f"Auto-resolved latest checkpoint: {resume_dir}")
+        validate_resume_args(resume_dir, args)
         start_step = load_checkpoint(model, optimizer if not args.eval else None, resume_dir, device, random_weights=args.random_weights)
 
     if args.reset_step and start_step != 0:

@@ -194,6 +194,24 @@ else
         $TASKS_ARG
 fi
 
+# Same audit as the pipeline: the results JSON must record the flags we asked
+# for — a silently dropped flag fails loudly instead of producing numbers from
+# the wrong distribution.
+if [ -n "${EVAL_MODE:-}" ] || [ -n "${DISABLE_DIGIT_IDS:-}" ]; then
+    python - "$OUTPUT_JSON" "${EVAL_MODE:-}" "${DISABLE_DIGIT_IDS:-}" <<'PY'
+import json, sys
+path, want_mode, want_digits = sys.argv[1], sys.argv[2], sys.argv[3]
+args = json.load(open(path))["args"]
+if want_mode:
+    got = args["eval_mode"]
+    assert got == want_mode, f"eval-mode audit FAILED: {path} recorded {got!r}, expected {want_mode!r}"
+if want_digits:
+    got = args.get("disable_digit_ids")
+    assert got is True, f"digit-flag audit FAILED: {path} recorded disable_digit_ids={got!r}, expected True"
+print(f"[eval_ckpt] eval-flags audit OK: {path}")
+PY
+fi
+
 if [ -n "$RESUME_WANDB_ID" ]; then
     echo "=== logging results into existing W&B run $RESUME_WANDB_ID under $WANDB_PREFIX/ ==="
     # A perplexity run completes the pipeline's follow-up: drop the [pending]

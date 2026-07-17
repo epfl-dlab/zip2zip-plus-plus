@@ -223,6 +223,10 @@ class Zip2ZipLM(LM):
                   "protected LZW (disable_digit_ids in meta.pt) but this eval does "
                   "not pass --disable_digit_ids — compressed-mode scoring will merge "
                   "digits the model never saw merged.")
+        if disable_digit_ids and not (self.train_args or {}).get("disable_digit_ids"):
+            print("[zip2zip-lm-eval] note: digit-protected eval of a checkpoint "
+                  "trained WITHOUT digit protection — fine as a diagnostic, but the "
+                  "numbers are not comparable to this checkpoint's as-trained evals.")
         if disable_digit_ids:
             # Diagnostic: keep digits out of LZW merges so multi-digit numbers
             # stay digit-by-digit base tokens instead of composite hypertokens.
