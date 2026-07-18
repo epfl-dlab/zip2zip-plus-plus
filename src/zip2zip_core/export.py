@@ -104,27 +104,24 @@ def _infer_encoder_config(sd: dict) -> dict:
     )
 
 
-def _split_state_dict(sd: dict) -> tuple[dict, dict]:
-    """Split into (decoder_sd, encoder_sd)."""
-    # This generic exporter writes tie_encoders=True and drops hyper_output.*,
-    # so exporting an UNTIED checkpoint here would silently produce a tied model
-    # scoring with the wrong encoder. Refuse rather than corrupt; untied export
-    # is handled by scripts/zip2zip_hf/export_phi.py.
-    if any(k.startswith("hyper_output.") for k in sd):
-        raise NotImplementedError(
-            "checkpoint has an untied output encoder (hyper_output.*); the generic "
-            "export path only supports tied models. Use scripts/zip2zip_hf/export_phi.py."
-        )
-    decoder, encoder = {}, {}
-    skip_prefixes = ("token_type_head.", "hyper_output.")
+def _split_state_dict(sd: dict) -> tuple[dict, dict, dict]:
+    """Split into (decoder_sd, input_encoder_sd, output_encoder_sd).
+
+    output_encoder_sd is non-empty only for untied checkpoints (hyper_output.*);
+    the caller writes output_encoder.* and sets tie_encoders=False accordingly,
+    matching the ext/zip2zip runtime which loads input_encoder.*/output_encoder.*.
+    """
+    decoder, input_enc, output_enc = {}, {}, {}
     for k, v in sd.items():
         if k.startswith("hyper_encoder."):
-            encoder[k[len("hyper_encoder."):]] = v
-        elif any(k.startswith(p) for p in skip_prefixes):
+            input_enc[k[len("hyper_encoder."):]] = v
+        elif k.startswith("hyper_output."):
+            output_enc[k[len("hyper_output."):]] = v
+        elif k.startswith("token_type_head."):
             pass  # not used by ext/zip2zip
         else:
             decoder[k] = v
-    return decoder, encoder
+    return decoder, input_enc, output_enc
 
 
 def _make_llama_config(model_config_name: str | None, sd: dict):
@@ -203,7 +200,8 @@ def export(
         print(f"  Merging LoRA adapters with scaling=alpha/rank={lora_scaling:g}")
     sd = _merge_lora_weights(sd, lora_scaling)
 
-    decoder_sd, encoder_sd = _split_state_dict(sd)
+    decoder_sd, encoder_sd, output_encoder_sd = _split_state_dict(sd)
+    untied = bool(output_encoder_sd)
     enc_info = _infer_encoder_config(sd)
 
     vocab_size = sd["tok_embeddings.weight"].shape[0]
@@ -234,8 +232,15 @@ def export(
     # ---- Save encoders.safetensors -------------------------------------
     encoders_out = os.path.join(output_dir, "encoders.safetensors")
     print(f"Saving {encoders_out} ...")
-    # Wrap as input_encoder.*; tie_encoders=True so no output_encoder needed
+    # input_encoder.* always; output_encoder.* only when untied (tie_encoders
+    # is then False and the ext runtime scores logits with the output encoder).
     enc_prefixed = {f"input_encoder.{k}": v.contiguous() for k, v in encoder_sd.items()}
+    if untied:
+        enc_prefixed.update(
+            {f"output_encoder.{k}": v.contiguous() for k, v in output_encoder_sd.items()}
+        )
+    print(f"  tie_encoders={not untied} (input_encoder + "
+          f"{'output_encoder' if untied else 'no output_encoder'})")
     save_file(enc_prefixed, encoders_out)
 
     # ---- Build zip2zip_config.json -------------------------------------
@@ -264,7 +269,7 @@ def export(
             "num_heads": n_heads,
             "causal": causal,
             "residual": residual,
-            "tie_encoders": True,
+            "tie_encoders": not untied,
             "position_encoding": None,
         },
         "compression": {

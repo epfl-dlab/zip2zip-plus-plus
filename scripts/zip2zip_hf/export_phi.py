@@ -100,7 +100,8 @@ def main():
     print(f"Loading {model_pt} ...")
     sd = torch.load(model_pt, map_location="cpu", weights_only=True)
     sd = _merge_lora_weights(sd, _lora_scaling_from_meta(args.ckpt_dir))
-    decoder_sd, encoder_sd = _split_state_dict(sd)
+    decoder_sd, encoder_sd, output_encoder_sd = _split_state_dict(sd)
+    untied = bool(output_encoder_sd)
     enc_info = _infer_encoder_config(sd)
 
     # ---- decoder -> HF-Llama (correct RoPE permute) -> fuse to Phi3 ----
@@ -112,10 +113,14 @@ def main():
               os.path.join(args.output_dir, "model.safetensors"))
     print(f"  saved model.safetensors ({len(phi3_sd)} tensors, Phi3ForCausalLM)")
 
-    # ---- encoder -> encoders.safetensors (input_encoder.*, tie_encoders=True) ----
+    # ---- encoder -> encoders.safetensors (input_encoder.* always; output_encoder.* when untied) ----
     enc_prefixed = {f"input_encoder.{k}": v.contiguous() for k, v in encoder_sd.items()}
+    if untied:
+        enc_prefixed.update(
+            {f"output_encoder.{k}": v.contiguous() for k, v in output_encoder_sd.items()}
+        )
     save_file(enc_prefixed, os.path.join(args.output_dir, "encoders.safetensors"))
-    print(f"  saved encoders.safetensors ({len(enc_prefixed)} tensors)")
+    print(f"  saved encoders.safetensors ({len(enc_prefixed)} tensors, tie_encoders={not untied})")
 
     # ---- Phi3 config.json ----
     phi3_config = Phi3Config(
@@ -163,7 +168,7 @@ def main():
             "num_heads": n_heads,
             "causal": False,
             "residual": True,
-            "tie_encoders": True,
+            "tie_encoders": not untied,
             "position_encoding": None,
         },
         "compression": {
