@@ -121,6 +121,13 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
         v = train_args.get(key)
         if v is not None:
             overrides[key] = v
+    # Architecture flag with inverted polarity: the checkpoint records the arg
+    # --untied_hyper_encoder; the config field is tie_hyper_encoder. Rebuild the
+    # untied model structurally so the second encoder's weights have a home
+    # (miss this and the model is tied while the checkpoint is untied).
+    if train_args.get("untied_hyper_encoder"):
+        overrides["tie_hyper_encoder"] = False
+        print("[zip2zip-lm-eval] untied hyper-encoder: building separate output encoder")
     if overrides:
         cfg = dataclasses.replace(cfg, **overrides)
 
@@ -146,6 +153,16 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
         print(f"[zip2zip-lm-eval] missing keys ({len(missing)}): {missing[:5]}")
     if unexpected:
         print(f"[zip2zip-lm-eval] unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+
+    # The load is strict=False (LoRA folding leaves benign gaps), so a config that
+    # is tied while the checkpoint is untied would SILENTLY leave the output
+    # encoder at random init. Hard-fail if the output encoder never got weights.
+    if not cfg.tie_hyper_encoder and any(k.startswith("hyper_output") for k in missing):
+        raise RuntimeError(
+            "untied checkpoint is missing hyper_output.* weights after load — the "
+            "output encoder would score with random weights. Check the checkpoint "
+            "and the untied_hyper_encoder flag in its meta.pt."
+        )
 
     model.eval()
     return model, cfg, train_args

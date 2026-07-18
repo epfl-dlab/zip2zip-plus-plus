@@ -106,6 +106,15 @@ def _infer_encoder_config(sd: dict) -> dict:
 
 def _split_state_dict(sd: dict) -> tuple[dict, dict]:
     """Split into (decoder_sd, encoder_sd)."""
+    # This generic exporter writes tie_encoders=True and drops hyper_output.*,
+    # so exporting an UNTIED checkpoint here would silently produce a tied model
+    # scoring with the wrong encoder. Refuse rather than corrupt; untied export
+    # is handled by scripts/zip2zip_hf/export_phi.py.
+    if any(k.startswith("hyper_output.") for k in sd):
+        raise NotImplementedError(
+            "checkpoint has an untied output encoder (hyper_output.*); the generic "
+            "export path only supports tied models. Use scripts/zip2zip_hf/export_phi.py."
+        )
     decoder, encoder = {}, {}
     skip_prefixes = ("token_type_head.", "hyper_output.")
     for k, v in sd.items():

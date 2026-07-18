@@ -15,7 +15,9 @@
 #   learnable positions; active codebook 2048
 #
 # Known accepted deviations from the released run (not bit-identical):
-#   - single hyper-encoder vs released untied input/output encoder pair
+#   - hyper-encoder: single (tied) by default; UNTIED_HYPER_ENCODER=1 builds the
+#     released model's separate input/output encoder pair (input reads
+#     tok_embeddings, output reads lm_head)
 #   - hyper boundary at vocab_size 32064 vs 32011 (disabled_ids auto-derive to
 #     the released [0,1,2,32000..32010] set, so compression behavior matches)
 #   - packed token stream + on-the-fly LZW vs ozz per-doc padded samples with
@@ -104,6 +106,14 @@ DISABLE_DIGIT_IDS=${DISABLE_DIGIT_IDS:-}
 DIGIT_FLAG=""
 if [ -n "$DISABLE_DIGIT_IDS" ] && [ "$DISABLE_DIGIT_IDS" != "0" ]; then
     DIGIT_FLAG="--disable_digit_ids"
+fi
+# UNTIED_HYPER_ENCODER=1: separate output-role hyper-encoder (matches the
+# released model). Eval auto-configures from the checkpoint meta.pt — no
+# eval-side env needed.
+UNTIED_HYPER_ENCODER=${UNTIED_HYPER_ENCODER:-}
+UNTIED_FLAG=""
+if [ -n "$UNTIED_HYPER_ENCODER" ] && [ "$UNTIED_HYPER_ENCODER" != "0" ]; then
+    UNTIED_FLAG="--untied_hyper_encoder"
 fi
 
 # Released run: 8000 steps x 32,768 tokens/step = ~262M tokens.
@@ -260,6 +270,7 @@ echo "NUM_GPUS=$NUM_GPUS  MODEL=$MODEL_CONFIG  MAX_SUBTOKENS=$MAX_SUBTOKENS"
 echo "INIT_FROM_HF=$INIT_FROM_HF  TOKENIZER=$TOKENIZER"
 echo "FREEZE_DECODER=$FREEZE_DECODER  LORA_RANK=$LORA_RANK  LORA_ALPHA=$LORA_ALPHA"
 echo "ENCODER: type=$HYPER_ENCODER_TYPE dim=$ENCODER_DIM layers=$ENCODER_N_LAYERS heads=$ENCODER_N_HEADS inter=$ENCODER_INTERMEDIATE_SIZE"
+echo "DIGIT_FLAG='$DIGIT_FLAG'  UNTIED_FLAG='$UNTIED_FLAG'"
 echo "CODEBOOK(active)=$MAX_ACTIVE_CODEBOOK_SIZE  LR=$LR->$MIN_LR warmup=$WARMUP_STEPS wd=$WEIGHT_DECAY beta2=$ADAM_BETA2"
 echo "SEQ_LEN=$SEQ_LEN  GRAD_ACCUM=$GRAD_ACCUM  TOKENS/STEP=$TOKENS_PER_STEP (released: 32768)"
 echo "STEPS=$STEPS  MAX_TOKENS=$MAX_TOKENS"
@@ -299,6 +310,7 @@ fi
     --log_freq "$LOG_FREQ" \
     --no_remap_codebook --hyper_causal_mask \
     $DIGIT_FLAG \
+    $UNTIED_FLAG \
     $HF_REPO_FLAG \
     $AC_FLAG \
     $DISABLE_VARLEN_FLAG \

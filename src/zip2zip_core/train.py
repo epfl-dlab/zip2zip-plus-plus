@@ -92,6 +92,8 @@ def apply_fsdp(model, world_size):
     if model.tok_embeddings is not None:
         fully_shard(model.tok_embeddings, mesh=mesh)
     fully_shard(model.hyper_encoder, mesh=mesh)
+    if getattr(model, "hyper_output", None) is not None:
+        fully_shard(model.hyper_output, mesh=mesh)
     for block in model.layers.values():
         fully_shard(block, mesh=mesh)
     if model.norm is not None and model.output is not None:
@@ -363,7 +365,7 @@ def validate_resume_args(resume_dir, args):
     if not os.path.exists(meta_path):
         return
     prev = torch.load(meta_path, map_location="cpu", weights_only=False).get("args", {}) or {}
-    hard = ("disable_digit_ids", "max_codebook_size", "tokenizer")
+    hard = ("disable_digit_ids", "max_codebook_size", "tokenizer", "untied_hyper_encoder")
     soft = ("max_subtokens", "seq_len", "data_dir")
     mismatches = [
         (k, prev[k], getattr(args, k))
@@ -419,18 +421,20 @@ def load_checkpoint(model, optimizer, resume_dir, device, random_weights=False):
 
         # Handle pos_embed size mismatch from curriculum phase transitions. Read the
         # current (global) shape from the sharded param without gathering weights.
-        pos_key = "hyper_encoder.pos_embed.weight"
+        # Both encoders carry a pos_embed when untied.
+        named_params = dict(_unwrap_model(model).named_parameters())
         curriculum_transition = False
-        if pos_key in model_state:
-            current_pos = dict(_unwrap_model(model).named_parameters())[pos_key]
-            saved_pos = model_state[pos_key]
-            if saved_pos.shape[0] < current_pos.shape[0]:
-                padded = torch.zeros((current_pos.shape[0], saved_pos.shape[1]), dtype=saved_pos.dtype)
-                padded[:saved_pos.shape[0]] = saved_pos
-                model_state[pos_key] = padded
-                curriculum_transition = True
-                if dist.get_rank() == 0:
-                    print(f"Padded pos_embed from {saved_pos.shape[0]} to {current_pos.shape[0]} positions")
+        for pos_key in ("hyper_encoder.pos_embed.weight", "hyper_output.pos_embed.weight"):
+            if pos_key in model_state and pos_key in named_params:
+                current_pos = named_params[pos_key]
+                saved_pos = model_state[pos_key]
+                if saved_pos.shape[0] < current_pos.shape[0]:
+                    padded = torch.zeros((current_pos.shape[0], saved_pos.shape[1]), dtype=saved_pos.dtype)
+                    padded[:saved_pos.shape[0]] = saved_pos
+                    model_state[pos_key] = padded
+                    curriculum_transition = True
+                    if dist.get_rank() == 0:
+                        print(f"Padded {pos_key} from {saved_pos.shape[0]} to {current_pos.shape[0]} positions")
 
         # Scatter the full state dict onto the FSDP-sharded model.
         set_model_state_dict(model, model_state, options=set_opts)
@@ -570,6 +574,10 @@ def main():
     parser.add_argument("--disable_digit_ids", action="store_true",
                         help="Add digit tokens to the LZW disabled_ids so numbers are "
                              "never merged into hypertokens during training.")
+    parser.add_argument("--untied_hyper_encoder", action="store_true",
+                        help="Use a separate output-role hyper-encoder (reading lm_head "
+                             "rows) instead of reusing the input hyper-encoder for logits. "
+                             "Matches the released model. Default off = tied (legacy).")
     parser.add_argument("--seq_len", type=int, default=4096)
     parser.add_argument("--local_batch_size", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
@@ -755,6 +763,9 @@ def main():
         max_subtokens=args.max_subtokens,
         hyper_encoder_type=args.hyper_encoder_type,
         token_type_loss_weight=args.token_type_loss_weight,
+        # Inverted at the arg boundary: --untied_hyper_encoder (default off) maps
+        # to tie_hyper_encoder=False. The adapter applies the same inversion.
+        tie_hyper_encoder=not args.untied_hyper_encoder,
         rope=dataclasses.replace(config.rope, max_seq_len=args.seq_len),
     )
     if args.encoder_dim is not None:
@@ -773,6 +784,8 @@ def main():
         print("[activation_checkpoint] gradient checkpointing enabled on transformer layers")
     if args.disable_varlen:
         model.hyper_encoder.disable_varlen = True
+        if getattr(model, "hyper_output", None) is not None:
+            model.hyper_output.disable_varlen = True
     if args.no_encoder_residual:
         model.encoder_residual = False
     with torch.no_grad():

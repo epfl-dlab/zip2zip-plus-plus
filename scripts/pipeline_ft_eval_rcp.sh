@@ -45,6 +45,10 @@
 #                     model trains and evals in the same digit-protected
 #                     distribution. Leave empty to disable (never set to 0).
 #                     CANONICAL since v0.4-digitsafe: pass 1 on new finetunes.
+#   UNTIED_HYPER_ENCODER= set 1 for a separate output-role hyper-encoder
+#                     (matches the released model). Inherited by the train
+#                     launcher only; evals auto-configure from the checkpoint
+#                     meta.pt (no eval passthrough), so no "0" ambiguity.
 #   FINAL_LIMIT=      per-task sample limit for the FINAL eval (default: full).
 #                     Only for pipeline rehearsals — never for real numbers.
 # Anything else the finetune launcher reads (LR, SEQ_LEN, ...) passes through.

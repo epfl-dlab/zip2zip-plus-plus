@@ -541,6 +541,11 @@ class Zip2ZipLlama3Model(Decoder):
         encoder_intermediate_size: int | None = None
         encoder_causal: bool = False
         tie_word_embeddings: bool = True
+        # Tie the hyper-encoder across the input-embedding and output-logit roles.
+        # True (default) = one shared hyper-encoder (legacy behavior); False =
+        # a second output-role encoder reading lm_head rows (matches the released
+        # model). Checkpoints saved without this field load as tied.
+        tie_hyper_encoder: bool = True
         hyper_encoder_type: str = "flat"
         reconstruction_loss_weight: float = 0.0
         token_type_loss_weight: float = (
@@ -586,12 +591,20 @@ class Zip2ZipLlama3Model(Decoder):
         else:
             self.token_type_head = None
 
-        # Pre-allocated hyper embedding buffer for incremental inference.
+        # Pre-allocated hyper embedding buffers for incremental inference.
         # Reset to None between sequences via reset_inference_cache().
         self._hyper_embeds_buf: torch.Tensor | None = None  # (B, max_codebook_size, dim)
         self._hyper_embeds_used: torch.Tensor | None = None  # (B, max_codebook_size) bool
+        # Output-role buffer, only used when untied (mirrors _hyper_embeds_buf,
+        # encoded from lm_head rows instead of tok_embeddings rows).
+        self._hyper_out_embeds_buf: torch.Tensor | None = None
 
-        # Hyper-encoder for computing hypertoken embeddings
+        # Hyper-encoder(s) for computing hypertoken embeddings. Tied: one encoder
+        # serves both the input-embedding and output-logit roles. Untied: a second
+        # encoder (self.hyper_output) produces the output-logit vectors from
+        # lm_head rows. The 'hyper_output' prefix is intentional — freeze/LoRA,
+        # the hyper-LR optimizer group, and HF missing-key classification already
+        # key on it.
         encoder_dim = config.encoder_dim or config.dim
         hyper_encoder_kwargs = dict(
             dim=encoder_dim,
@@ -602,16 +615,22 @@ class Zip2ZipLlama3Model(Decoder):
             causal=config.encoder_causal,
             model_dim=config.dim,
         )
-        if config.hyper_encoder_type == "flat":
-            self.hyper_encoder = HyperEncoder(**hyper_encoder_kwargs)
-        elif config.hyper_encoder_type == "hierarchical":
-            self.hyper_encoder = HierarchicalHyperEncoder(**hyper_encoder_kwargs)
-        elif config.hyper_encoder_type == "fast_hierarchical":
-            self.hyper_encoder = FastHierarchicalHyperEncoder(**hyper_encoder_kwargs)
+        self.hyper_encoder = self._build_hyper_encoder(hyper_encoder_kwargs)
+        if config.tie_hyper_encoder:
+            self.hyper_output = None
         else:
-            raise ValueError(
-                f"Unsupported hyper_encoder_type: {config.hyper_encoder_type!r}"
-            )
+            self.hyper_output = self._build_hyper_encoder(hyper_encoder_kwargs)
+
+    def _build_hyper_encoder(self, hyper_encoder_kwargs: dict):
+        htype = self.zip2zip_config.hyper_encoder_type
+        if htype == "flat":
+            return HyperEncoder(**hyper_encoder_kwargs)
+        elif htype == "hierarchical":
+            return HierarchicalHyperEncoder(**hyper_encoder_kwargs)
+        elif htype == "fast_hierarchical":
+            return FastHierarchicalHyperEncoder(**hyper_encoder_kwargs)
+        else:
+            raise ValueError(f"Unsupported hyper_encoder_type: {htype!r}")
 
     def init_weights(self, **kwargs):
         super().init_weights(**kwargs)
@@ -624,34 +643,42 @@ class Zip2ZipLlama3Model(Decoder):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
-        # Initialize hyper-encoder
-        if hasattr(self.hyper_encoder, 'init_weights'):
-            self.hyper_encoder.init_weights()
+        # Initialize hyper-encoder(s) — same treatment for the tied encoder and,
+        # when untied, the output-role encoder (single-variable: untied differs
+        # from tied only in having a second encoder, not in init scheme).
+        self._init_hyper_encoder(self.hyper_encoder)
+        if self.hyper_output is not None:
+            self._init_hyper_encoder(self.hyper_output)
+
+    def _init_hyper_encoder(self, encoder) -> None:
+        if hasattr(encoder, 'init_weights'):
+            encoder.init_weights()
         else:
-            for name, p in self.hyper_encoder.named_parameters():
+            for name, p in encoder.named_parameters():
                 if p.dim() > 1:
                     nn.init.xavier_uniform_(p)
                 elif "bias" in name:
                     nn.init.zeros_(p)
 
-            for module in self.hyper_encoder.modules():
+            for module in encoder.modules():
                 if isinstance(module, (nn.LayerNorm,)):
                     module.reset_parameters()
 
         # Zero-init encoder output so initial hyper embedding ≈ first base token
         if getattr(self, 'encoder_residual', True):
-            for name, module in self.hyper_encoder.named_modules():
+            for name, module in encoder.named_modules():
                 if name.endswith('proj_out') and isinstance(module, nn.Linear):
                     nn.init.zeros_(module.weight)
 
     def reset_inference_cache(self) -> None:
-        """Reset hyper embedding buffer. Call between sequences during inference."""
+        """Reset hyper embedding buffers. Call between sequences during inference."""
         self._hyper_embeds_buf = None
         self._hyper_embeds_used = None
+        self._hyper_out_embeds_buf = None
 
     def _embed_tokens_train(
         self, tokens: torch.Tensor, codebook: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed tokens during training: encode full codebook, mix base + hyper embeddings.
 
         Args:
@@ -660,13 +687,24 @@ class Zip2ZipLlama3Model(Decoder):
 
         Returns:
             h: (B, T, dim) token embeddings
-            hyper_embeds: (B, K, dim) encoded codebook entries
+            hyper_embeds: (B, K, dim) input-role codebook embeddings (mixed into h)
+            hyper_out_embeds: (B, K, dim) output-role embeddings scored in the
+                logits (same tensor as hyper_embeds when tied)
         """
         vocab_size = self.zip2zip_config.vocab_size
 
         hyper_embeds = self._encode_codebook_with_weights(
             codebook, self.tok_embeddings.weight
         )  # (B, K, dim)
+        # Output role: untied re-encodes the same entries from lm_head rows with
+        # the second encoder; tied reuses the input tensor. Runs unconditionally
+        # inside the rank-uniform gate at forward() — never behind hyper_mask.any().
+        if self.hyper_output is not None:
+            hyper_out_embeds = self._encode_codebook_with_weights(
+                codebook, self.output.weight, encoder=self.hyper_output
+            )
+        else:
+            hyper_out_embeds = hyper_embeds
 
         base_ids = tokens.clamp(max=vocab_size - 1)
         h = self.tok_embeddings(base_ids)  # (B, T, dim)
@@ -680,14 +718,14 @@ class Zip2ZipLlama3Model(Decoder):
                 hyper_mask.unsqueeze(-1), hyper_embeds[batch_idx, hyper_ids], h
             )
 
-        return h, hyper_embeds
+        return h, hyper_embeds, hyper_out_embeds
 
     def _embed_tokens_inference(
         self,
         tokens: torch.Tensor,
         codebook_updates: torch.Tensor,
         codebook_updates_indices: list[list[int]],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed tokens during inference: incrementally update embedding buffer.
 
         Args:
@@ -697,13 +735,16 @@ class Zip2ZipLlama3Model(Decoder):
 
         Returns:
             h: (B, T, dim) token embeddings
-            hyper_embeds: (B, max_codebook_size, dim) full embedding buffer
+            hyper_embeds: (B, max_codebook_size, dim) input-role buffer (mixed into h)
+            hyper_out_embeds: (B, max_codebook_size, dim) output-role buffer scored
+                in the logits (same buffer as hyper_embeds when tied)
         """
         vocab_size = self.zip2zip_config.vocab_size
         bs = tokens.size(0)
         max_cb = self.zip2zip_config.max_codebook_size
+        untied = self.hyper_output is not None
 
-        # Lazy-allocate the full-size buffer on first inference step
+        # Lazy-allocate the full-size buffer(s) on first inference step
         if self._hyper_embeds_buf is None:
             weight = self.tok_embeddings.weight
             self._hyper_embeds_buf = torch.zeros(
@@ -713,12 +754,21 @@ class Zip2ZipLlama3Model(Decoder):
             self._hyper_embeds_used = torch.zeros(
                 bs, max_cb, dtype=torch.bool, device=weight.device,
             )
+            if untied:
+                self._hyper_out_embeds_buf = torch.zeros_like(self._hyper_embeds_buf)
 
         # Scatter new entries into their exact buffer positions (per batch item)
         if any(len(ui) > 0 for ui in codebook_updates_indices):
             new_embeds = self._encode_codebook_with_weights(
                 codebook_updates, self.tok_embeddings.weight
             )  # (B, max_updates, dim)
+            new_out_embeds = (
+                self._encode_codebook_with_weights(
+                    codebook_updates, self.output.weight, encoder=self.hyper_output
+                )
+                if untied
+                else None
+            )
             # The hyper-encoder's padded attention path can upcast to fp32;
             # index_put refuses mismatched dtypes, so cast to the buffer's.
             for i, ui in enumerate(codebook_updates_indices):
@@ -727,8 +777,13 @@ class Zip2ZipLlama3Model(Decoder):
                         self._hyper_embeds_buf.dtype
                     )
                     self._hyper_embeds_used[i, ui] = True
+                    if untied:
+                        self._hyper_out_embeds_buf[i, ui] = new_out_embeds[
+                            i, : len(ui)
+                        ].to(self._hyper_out_embeds_buf.dtype)
 
         hyper_embeds = self._hyper_embeds_buf  # (B, max_codebook_size, dim)
+        hyper_out_embeds = self._hyper_out_embeds_buf if untied else hyper_embeds
 
         base_ids = tokens.clamp(max=vocab_size - 1)
         h = self.tok_embeddings(base_ids)  # (B, T, dim)
@@ -742,20 +797,24 @@ class Zip2ZipLlama3Model(Decoder):
                 hyper_mask.unsqueeze(-1), hyper_embeds[batch_idx, hyper_ids], h
             )
 
-        return h, hyper_embeds
+        return h, hyper_embeds, hyper_out_embeds
 
     def _encode_codebook_with_weights(
-        self, codebook: torch.Tensor, weight_matrix: torch.Tensor
+        self, codebook: torch.Tensor, weight_matrix: torch.Tensor, encoder=None
     ) -> torch.Tensor:
         """Compute encoded representations for codebook entries using given weight matrix.
 
         Args:
             codebook: (B, max_codebook_size, max_subtokens) base token IDs
             weight_matrix: (vocab_size, dim) weight matrix to look up base tokens from
+            encoder: hyper-encoder module to run (default: self.hyper_encoder).
+                The untied output role passes self.hyper_output.
 
         Returns:
             (B, max_codebook_size, dim) encoded representations
         """
+        if encoder is None:
+            encoder = self.hyper_encoder
         B, H, S = codebook.shape
 
         # Create mask for valid (non-pad) tokens
@@ -780,7 +839,7 @@ class Zip2ZipLlama3Model(Decoder):
 
         # Encode: residual from first token + learned delta
         with torch.profiler.record_function("hyper_encoder.core"):
-            encoder_out = self.hyper_encoder(cb_embeds_flat, mask_flat)
+            encoder_out = encoder(cb_embeds_flat, mask_flat)
             if getattr(self, 'encoder_residual', True):
                 first_token_embed = cb_embeds_flat[:, 0, :]  # (B*H, dim)
                 encoded = first_token_embed + encoder_out
@@ -821,14 +880,15 @@ class Zip2ZipLlama3Model(Decoder):
         # === Embedding ===
         with torch.profiler.record_function("hyper_encoder"):
             if codebook is not None and (codebook != self.zip2zip_config.pad_token_id).any():
-                h, hyper_embeds = self._embed_tokens_train(tokens, codebook)
+                h, hyper_embeds, hyper_out_embeds = self._embed_tokens_train(tokens, codebook)
             elif codebook_updates is not None and codebook_updates_indices is not None:
-                h, hyper_embeds = self._embed_tokens_inference(
+                h, hyper_embeds, hyper_out_embeds = self._embed_tokens_inference(
                     tokens, codebook_updates, codebook_updates_indices
                 )
             else:
                 h = self.tok_embeddings(tokens)
                 hyper_embeds = None
+                hyper_out_embeds = None
 
         # === Transformer layers ===
         use_ac = getattr(self, "gradient_checkpointing", False) and self.training
@@ -857,7 +917,9 @@ class Zip2ZipLlama3Model(Decoder):
 
         with torch.profiler.record_function("hyper_lm_head"):
             if hyper_embeds is not None:
-                hyper_logits = torch.bmm(h, hyper_embeds.transpose(1, 2))  # (B, T, K)
+                # Untied: score against the output-role embeddings (lm_head rows);
+                # tied: hyper_out_embeds is the same tensor as hyper_embeds.
+                hyper_logits = torch.bmm(h, hyper_out_embeds.transpose(1, 2))  # (B, T, K)
 
                 if codebook is not None:
                     # --- Training: pad mask + optional hyper causal mask ---

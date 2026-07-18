@@ -109,8 +109,13 @@ before that commit have the old masks — re-tokenize before training new models
 verified against the released run's config and HF checkpoint metadata — max_subtokens=4,
 seq_len=2048, 32,768 tokens/optimizer-step, 8000 steps, frozen decoder + LoRA r=32/α=32,
 hyper-encoder 3072-dim/2-layer/32-head. See the script header for accepted deviations
-(single tied hyper-encoder, packed-stream compression, assistant-turn loss masking) that
-keep it from being bit-identical. `scripts/finetune_phi35_from_hf_instruct.sbatch` is the
+(packed-stream compression, assistant-turn loss masking) that keep it from being
+bit-identical. The hyper-encoder is tied by default (one encoder for the input-embedding
+and output-logit roles); `UNTIED_HYPER_ENCODER=1` builds the released model's separate
+pair (input reads `tok_embeddings`, output reads `lm_head`) — the only architectural
+deviation that is togglable. Untied checkpoints are experimental until v0.5 validates and
+can only be exported via `scripts/zip2zip_hf/export_phi.py` (the generic `export.py`
+hard-errors on them). `scripts/finetune_phi35_from_hf_instruct.sbatch` is the
 CSCS-SLURM counterpart (same `train.py` flags, different job launcher).
 
 `scripts/tokenize_sft_phi_rcp.sh` prepares the required Phi-tokenized `epfl-dlab/zip2zip-1B`
