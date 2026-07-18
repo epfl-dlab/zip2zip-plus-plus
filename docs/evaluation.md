@@ -143,6 +143,12 @@ checkpoint's meta.pt records it (and logs that it did), so a forgotten flag
 cannot silently evaluate a digitsafe checkpoint in the wrong distribution; the
 results JSON records the effective setting.
 
+For an untied-hyper-encoder checkpoint (`UNTIED_HYPER_ENCODER=1`, experimental)
+the adapter additionally logs `untied hyper-encoder: building separate output
+encoder` — same self-healing pattern: it rebuilds the untied model from the
+checkpoint's meta.pt and hard-fails if the `hyper_output.*` weights are missing,
+so an untied checkpoint can never be silently scored as tied.
+
 Generation-mode runs should show `gen_compression_ratio ≈ 1.4` (a healthy model
 emits hyper-tokens; ~1.0 means it never does). Before any full eval of a new
 checkpoint, run the 15-minute sanity gate `scripts/diagnose_ckpt_rcp.sh` (train-style
