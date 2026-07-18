@@ -110,13 +110,12 @@ verified against the released run's config and HF checkpoint metadata — max_su
 seq_len=2048, 32,768 tokens/optimizer-step, 8000 steps, frozen decoder + LoRA r=32/α=32,
 hyper-encoder 3072-dim/2-layer/32-head. See the script header for accepted deviations
 (packed-stream compression, assistant-turn loss masking) that keep it from being
-bit-identical. The hyper-encoder is tied by default (one encoder for the input-embedding
-and output-logit roles); `UNTIED_HYPER_ENCODER=1` builds the released model's separate
-pair (input reads `tok_embeddings`, output reads `lm_head`) — the only architectural
-deviation that is togglable. Untied checkpoints are experimental until v0.5 validates and
-export to the released `ext/zip2zip` HF format via either `export.py` or
-`scripts/zip2zip_hf/export_phi.py` — both write `output_encoder.*` and
-`tie_encoders=False` for untied checkpoints. `scripts/finetune_phi35_from_hf_instruct.sbatch` is the
+bit-identical. The hyper-encoder can be tied (one encoder for both the input-embedding
+and output-logit roles) or untied (`UNTIED_HYPER_ENCODER=1` builds the released model's
+separate pair: input reads `tok_embeddings`, output reads `lm_head`) — canonical since
+v0.5 (see below). Untied checkpoints export to the released `ext/zip2zip` HF format via
+either `export.py` or `scripts/zip2zip_hf/export_phi.py` — both write `output_encoder.*`
+and `tie_encoders=False` for untied checkpoints. `scripts/finetune_phi35_from_hf_instruct.sbatch` is the
 CSCS-SLURM counterpart (same `train.py` flags, different job launcher).
 
 `scripts/tokenize_sft_phi_rcp.sh` prepares the required Phi-tokenized `epfl-dlab/zip2zip-1B`
@@ -164,6 +163,27 @@ bit-identically; the eval adapter auto-enables digit protection when a
 checkpoint's meta.pt records it, so evals always follow the checkpoint's
 training distribution even if the flag is forgotten (results JSON records the
 effective value).
+
+## Untied hyper-encoder (canonical since v0.5)
+
+The released model uses two hyper-encoders — one embedding hypertokens on the
+input side (from `tok_embeddings`), one scoring them on the output side (from
+`lm_head`); zip2zip-core originally tied them into one, which a diagnostic showed
+forces a single vector to straddle two geometries. The v0.5-untied run
+(2026-07-18, on top of v0.4-digitsafe) validated untying: every MC task moved up
+toward the uncompressed control (ARC-c acc_norm .540 → .561, now past the
+released model's .551; HellaSwag .702 → .725 at ~5σ; WinoGrande recovered
+.713 → .743), wiki byte-ppl improved 1.711 → 1.686, and GSM8K flexible edged
+0.610 → 0.623 (the remaining math gap to the control is a separate problem, not
+tied/untied). Nothing regressed beyond noise.
+
+**Canonical recipe: pass `UNTIED_HYPER_ENCODER=1` on every new finetune** (with
+`DISABLE_DIGIT_IDS=1`). The launcher inherits it into training; the eval adapter
+auto-configures untied from the checkpoint's meta.pt (logs `untied hyper-encoder:
+building separate output encoder` and hard-fails if the `hyper_output.*` weights
+are missing), so there is no eval passthrough or `0`-ambiguity. Like digit
+protection it is deliberately NOT a code default (`tie_hyper_encoder=True`), so
+the frozen tied baselines (v0.1–v0.4) keep loading and evaluating bit-identically.
 
 ## Canonical RCP locations and run conventions
 
