@@ -185,6 +185,21 @@ are missing), so there is no eval passthrough or `0`-ambiguity. Like digit
 protection it is deliberately NOT a code default (`tie_hyper_encoder=True`), so
 the frozen tied baselines (v0.1–v0.4) keep loading and evaluating bit-identically.
 
+## Phased warm-start (experimental, v0.6)
+
+Every treatment run starts with a large loss/grad-norm transient (~loss 150,
+grad_norm ~4500 for the first ~100 steps) as the random hyper-encoder is trained
+from scratch — a candidate cause of early LoRA damage. `WARMSTART_STEPS=N` (train
+arg `--warmstart_steps`) freezes the decoder-LoRA for the first N optimizer steps
+(its grads are nulled after backward+grad-sync, before clip/step, so AdamW skips
+it — no update, no momentum) while the hyper-encoder(s) train alone; at step N the
+LoRA unfreezes. `requires_grad` never changes, so FSDP's grad reduction stays
+rank-uniform (no deadlock class). Training-only — eval is unaffected (the
+checkpoint is a normal untied+digit model), so no eval passthrough. Default 0 =
+off (v0.5 behavior). Log signature: `[warmstart] decoder-LoRA frozen for first N
+steps` then `[warmstart] step N: unfreezing decoder-LoRA`. Experimental until v0.6
+validates against v0.5-8k at the same budget.
+
 ## Canonical RCP locations and run conventions
 
 Single source of truth for where things live on the cluster (`$SCRATCH =

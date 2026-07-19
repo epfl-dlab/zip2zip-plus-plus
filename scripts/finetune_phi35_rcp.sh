@@ -115,6 +115,13 @@ UNTIED_FLAG=""
 if [ -n "$UNTIED_HYPER_ENCODER" ] && [ "$UNTIED_HYPER_ENCODER" != "0" ]; then
     UNTIED_FLAG="--untied_hyper_encoder"
 fi
+# WARMSTART_STEPS=N: freeze decoder-LoRA for the first N steps (hyper-encoder
+# only), then unfreeze. Training-only; eval unaffected. Empty/0 = off.
+WARMSTART_STEPS=${WARMSTART_STEPS:-}
+WARMSTART_FLAG=""
+if [ -n "$WARMSTART_STEPS" ] && [ "$WARMSTART_STEPS" != "0" ]; then
+    WARMSTART_FLAG="--warmstart_steps $WARMSTART_STEPS"
+fi
 
 # Released run: 8000 steps x 32,768 tokens/step = ~262M tokens.
 STEPS=${STEPS:-8000}
@@ -270,7 +277,7 @@ echo "NUM_GPUS=$NUM_GPUS  MODEL=$MODEL_CONFIG  MAX_SUBTOKENS=$MAX_SUBTOKENS"
 echo "INIT_FROM_HF=$INIT_FROM_HF  TOKENIZER=$TOKENIZER"
 echo "FREEZE_DECODER=$FREEZE_DECODER  LORA_RANK=$LORA_RANK  LORA_ALPHA=$LORA_ALPHA"
 echo "ENCODER: type=$HYPER_ENCODER_TYPE dim=$ENCODER_DIM layers=$ENCODER_N_LAYERS heads=$ENCODER_N_HEADS inter=$ENCODER_INTERMEDIATE_SIZE"
-echo "DIGIT_FLAG='$DIGIT_FLAG'  UNTIED_FLAG='$UNTIED_FLAG'"
+echo "DIGIT_FLAG='$DIGIT_FLAG'  UNTIED_FLAG='$UNTIED_FLAG'  WARMSTART_FLAG='$WARMSTART_FLAG'"
 echo "CODEBOOK(active)=$MAX_ACTIVE_CODEBOOK_SIZE  LR=$LR->$MIN_LR warmup=$WARMUP_STEPS wd=$WEIGHT_DECAY beta2=$ADAM_BETA2"
 echo "SEQ_LEN=$SEQ_LEN  GRAD_ACCUM=$GRAD_ACCUM  TOKENS/STEP=$TOKENS_PER_STEP (released: 32768)"
 echo "STEPS=$STEPS  MAX_TOKENS=$MAX_TOKENS"
@@ -311,6 +318,7 @@ fi
     --no_remap_codebook --hyper_causal_mask \
     $DIGIT_FLAG \
     $UNTIED_FLAG \
+    $WARMSTART_FLAG \
     $HF_REPO_FLAG \
     $AC_FLAG \
     $DISABLE_VARLEN_FLAG \

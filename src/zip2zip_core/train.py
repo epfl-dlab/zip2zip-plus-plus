@@ -589,6 +589,10 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=None,
                         help="Stop after processing this many global training tokens. Overrides --steps as stop criterion.")
     parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--warmstart_steps", type=int, default=0,
+                        help="Phased warm-start: for the first N optimizer steps, freeze "
+                             "the decoder-LoRA (null its grads) so only the hyper-encoder(s) "
+                             "train and stabilize before the LoRA adapts to them. 0 = off.")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--min_lr", type=float, default=3e-5)
     parser.add_argument("--hyper_lr", type=float, default=None,
@@ -1326,6 +1330,22 @@ def main():
                     if hyper_mask_cls.any():
                         accum_hyper_type_acc += (type_preds[hyper_mask_cls] == 1).float().mean().item() / args.gradient_accumulation_steps
                     accum_hyper_ratio += hyper_mask_cls.float().mean().item() / args.gradient_accumulation_steps
+
+        # Phased warm-start: for the first --warmstart_steps optimizer steps, null
+        # the decoder-LoRA grads AFTER backward+grad-sync but BEFORE clip/step, so
+        # AdamW skips them (no update, no momentum accumulation) while the hyper-
+        # encoder(s) train alone and stabilize. requires_grad stays True on every
+        # param, so FSDP's reduce-scatter fires uniformly on all ranks every step
+        # (no rank-divergence). Nulling before clip means the hyper grads are
+        # clipped on their own norm, exactly as if the LoRA weren't there.
+        if args.warmstart_steps and step <= args.warmstart_steps:
+            for p in optimizer.param_groups[0]["params"]:
+                p.grad = None
+            if rank == 0 and step == 1:
+                print(f"[warmstart] decoder-LoRA frozen for first {args.warmstart_steps} "
+                      f"steps; hyper-encoder(s) training alone")
+        elif args.warmstart_steps and rank == 0 and step == args.warmstart_steps + 1:
+            print(f"[warmstart] step {step}: unfreezing decoder-LoRA (full training)")
 
         # Clip + step directly on the FSDP-sharded fp32 params.
         debug_enabled = step <= args.debug_first_steps
