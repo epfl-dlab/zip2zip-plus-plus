@@ -366,7 +366,7 @@ def validate_resume_args(resume_dir, args):
         return
     prev = torch.load(meta_path, map_location="cpu", weights_only=False).get("args", {}) or {}
     hard = ("disable_digit_ids", "max_codebook_size", "tokenizer", "untied_hyper_encoder")
-    soft = ("max_subtokens", "seq_len", "data_dir")
+    soft = ("max_subtokens", "seq_len", "data_dir", "warmstart_steps")
     mismatches = [
         (k, prev[k], getattr(args, k))
         for k in hard
@@ -1157,6 +1157,12 @@ def main():
         else:
             print(f"Stopping by step budget: steps={args.steps:,}")
         print(f"Starting training from step {start_step + 1}...")
+        if args.warmstart_steps:
+            print(f"[warmstart] enabled: decoder-LoRA frozen for first {args.warmstart_steps} steps")
+            if args.warmstart_steps >= args.warmup_steps:
+                print(f"[warmstart] WARNING: warmstart_steps ({args.warmstart_steps}) >= "
+                      f"warmup_steps ({args.warmup_steps}) — LoRA will unfreeze onto an "
+                      f"already-decaying LR and skip its warmup. Prefer warmstart_steps < warmup_steps.")
 
     model.train()
     data_iter = iter(dataloader)
