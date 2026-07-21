@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,19 +36,14 @@ sys.path.insert(0, os.path.join(_ROOT, "ext", "torchtitan"))
 import torch
 
 from zip2zip_core.configs import zip2zip_llama_configs
+from zip2zip_core.disabled_ids import compute_disabled_ids
 from zip2zip_core.export import (
     _split_state_dict, _infer_encoder_config, _merge_lora_weights, _lora_scaling_from_meta,
-    refuse_base_token_positions,
+    _disable_digit_ids_from_meta, _resolve_encoder_n_heads, refuse_base_token_positions,
 )
 
 PHI_TOKENIZER = "microsoft/Phi-3.5-mini-instruct"
 MODEL_CONFIG = "Phi3.5-mini"
-
-
-def _phi_disabled_ids(tok, vocab_size: int) -> list[int]:
-    special = set(tok.all_special_ids or [])
-    added = set(tok.get_added_vocab().values())
-    return sorted(i for i in (special | added) if 0 <= i < vocab_size)
 
 
 def _fuse_llama_to_phi3(hf_llama_sd: dict, n_layers: int) -> dict:
@@ -80,6 +76,15 @@ def main():
     p.add_argument("--ckpt_dir", required=True)
     p.add_argument("--output_dir", required=True)
     p.add_argument("--max_codebook_size", type=int, default=4096)
+    p.add_argument("--encoder_n_heads", type=int, default=None,
+                   help="Number of encoder attention heads. Default: resolved from "
+                        "meta.pt's train args, falling back to hidden_size // 64 "
+                        "only if meta.pt is missing or lacks encoder_n_heads.")
+    p.add_argument("--disable_digit_ids", action="store_true", default=None,
+                   help="Digits were protected from LZW merges during training. "
+                        "Default: auto-detected from meta.pt's --disable_digit_ids.")
+    p.add_argument("--no_disable_digit_ids", dest="disable_digit_ids", action="store_false",
+                   help="Force digit protection off even if meta.pt recorded it on.")
     args = p.parse_args()
 
     from transformers import AutoTokenizer, Phi3Config
@@ -92,9 +97,17 @@ def main():
     n_layers = cfg.n_layers
     vocab_size = cfg.vocab_size
     tok = AutoTokenizer.from_pretrained(PHI_TOKENIZER)
-    disabled_ids = _phi_disabled_ids(tok, vocab_size)
+
+    disable_digit_ids = args.disable_digit_ids
+    if disable_digit_ids is None:
+        disable_digit_ids = _disable_digit_ids_from_meta(args.ckpt_dir)
+        if disable_digit_ids:
+            print("  checkpoint was trained with digit-protected LZW (meta.pt) "
+                  "— auto-enabling digit protection for export")
+    disabled_ids = compute_disabled_ids(tok, vocab_size, disable_digit_ids=disable_digit_ids)
     print(f"Phi3 export: vocab={vocab_size}, layers={n_layers}, "
-          f"heads={attn.n_heads}/{attn.n_kv_heads}, disabled_ids={disabled_ids}")
+          f"heads={attn.n_heads}/{attn.n_kv_heads}, disable_digit_ids={disable_digit_ids}, "
+          f"disabled_ids={disabled_ids}")
 
     # ---- load + split checkpoint ----
     refuse_base_token_positions(args.ckpt_dir)
@@ -158,7 +171,7 @@ def main():
     print("  saved Phi tokenizer")
 
     # ---- zip2zip_config.json (self-contained base + training-time compression) ----
-    n_heads = enc_info["hidden_size"] // 64
+    n_heads = _resolve_encoder_n_heads(args.ckpt_dir, enc_info["hidden_size"], args.encoder_n_heads)
     z = {
         "base_model_name_or_path": os.path.abspath(args.output_dir),
         "encoder_type": "res_latent_attn",
@@ -184,6 +197,13 @@ def main():
         json.dump(z, f, indent=2)
     print(f"  wrote zip2zip_config.json (initial_vocab_size={vocab_size}, "
           f"max_subtokens={enc_info['max_subtokens']})")
+
+    # Carry meta.pt along so check_export_consistency.py has train_args to
+    # compare against -- without this it silently "passes" with nothing checked.
+    meta_src = os.path.join(args.ckpt_dir, "meta.pt")
+    if os.path.exists(meta_src):
+        shutil.copy(meta_src, os.path.join(args.output_dir, "meta.pt"))
+        print("  copied meta.pt (for check_export_consistency.py)")
 
     print("\nDone. Self-contained Phi3 zip2zip dir:", os.path.abspath(args.output_dir))
     print("Load with:  Zip2ZipModel.from_pretrained('%s')" % os.path.abspath(args.output_dir))

@@ -991,25 +991,18 @@ def main():
     # Special-token ids the LZW compressor must never merge into the codebook,
     # derived from the active tokenizer so this is correct for Llama, Phi, etc.
     # (For Llama-3.1 this reproduces the reserved 128000-128255 range.)
+    # Single source of truth in zip2zip_core.disabled_ids -- eval (lm_eval_adapter)
+    # and HF export (export_phi.py / export.py) must derive the exact same set.
     from transformers import AutoTokenizer
+    from zip2zip_core.disabled_ids import compute_disabled_ids, digit_ids as _digit_ids_fn
+
     _dl_tok = AutoTokenizer.from_pretrained(args.tokenizer)
-    _special_ids = set(_dl_tok.all_special_ids or [])
-    _added_ids = set(_dl_tok.get_added_vocab().values())
-    disabled_ids = sorted(
-        i for i in (_special_ids | _added_ids) if 0 <= i < config.vocab_size
+    disabled_ids = compute_disabled_ids(
+        _dl_tok, config.vocab_size, disable_digit_ids=args.disable_digit_ids
     )
-    if args.disable_digit_ids:
-        # Keep digits out of LZW merges: multi-digit numbers stay digit-by-digit
-        # base tokens instead of composite hypertokens. Must match the eval-side
-        # rule in lm_eval_adapter (disable_digit_ids).
-        _digit_pieces = {str(d) for d in range(10)} | {f"▁{d}" for d in range(10)}
-        _digit_ids = sorted(
-            i for piece, i in _dl_tok.get_vocab().items()
-            if piece in _digit_pieces and 0 <= i < config.vocab_size
-        )
-        if rank == 0:
-            print(f"[data] digit ids disabled for LZW ({len(_digit_ids)}): {_digit_ids}")
-        disabled_ids = sorted(set(disabled_ids) | set(_digit_ids))
+    if args.disable_digit_ids and rank == 0:
+        _digit_ids = sorted(_digit_ids_fn(_dl_tok, config.vocab_size))
+        print(f"[data] digit ids disabled for LZW ({len(_digit_ids)}): {_digit_ids}")
     if rank == 0:
         print(f"[data] initial_vocab_size={config.vocab_size} "
               f"pad_token_id={config.pad_token_id} "

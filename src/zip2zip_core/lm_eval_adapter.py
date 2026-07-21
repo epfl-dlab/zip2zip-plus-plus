@@ -36,6 +36,7 @@ from zip2zip_compression import (
 
 from zip2zip_core.configs import zip2zip_llama_configs
 from zip2zip_core.data import online_codebook_counts, online_unavailable_targets
+from zip2zip_core.disabled_ids import base_disabled_ids, digit_ids
 from zip2zip_core.model import Zip2ZipLlama3Model, restore_encoder_residual
 
 from lm_eval.api.model import LM
@@ -255,12 +256,9 @@ class Zip2ZipLM(LM):
             # for Phi-3.5, all_special_ids alone is {unk,bos,eos} and misses the
             # chat tokens <|user|>/<|assistant|>/<|end|> (32001-32010), which the
             # compressor would then merge into hyper-tokens the model never saw
-            # in training — collapsing every chat-templated eval.
-            special = set(self.tokenizer.all_special_ids or [])
-            added = set(self.tokenizer.get_added_vocab().values())
-            disabled_ids = sorted(
-                i for i in (special | added) if 0 <= i < self.cfg.vocab_size
-            )
+            # in training — collapsing every chat-templated eval. Sourced from
+            # zip2zip_core.disabled_ids so train/eval/export can't drift apart.
+            disabled_ids = sorted(base_disabled_ids(self.tokenizer, self.cfg.vocab_size))
         if (
             eval_mode == "compressed"
             and (self.train_args or {}).get("disable_digit_ids")
@@ -279,14 +277,10 @@ class Zip2ZipLM(LM):
         if disable_digit_ids:
             # Diagnostic: keep digits out of LZW merges so multi-digit numbers
             # stay digit-by-digit base tokens instead of composite hypertokens.
-            digit_pieces = {str(d) for d in range(10)} | {f"▁{d}" for d in range(10)}
-            digit_ids = sorted(
-                i for piece, i in self.tokenizer.get_vocab().items()
-                if piece in digit_pieces and 0 <= i < self.cfg.vocab_size
-            )
+            digit_id_set = digit_ids(self.tokenizer, self.cfg.vocab_size)
             print(f"[zip2zip-lm-eval] digit ids disabled for LZW "
-                  f"({len(digit_ids)}): {digit_ids}")
-            disabled_ids = sorted(set(disabled_ids) | set(digit_ids))
+                  f"({len(digit_id_set)}): {sorted(digit_id_set)}")
+            disabled_ids = sorted(set(disabled_ids) | digit_id_set)
         self.disable_digit_ids = bool(disable_digit_ids)
         if disable_mathsym_ids:
             # Diagnostic (triage for extending the protected set beyond digits):

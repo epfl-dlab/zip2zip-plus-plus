@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 
 import torch
+
+from zip2zip_core.disabled_ids import compute_disabled_ids
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +86,19 @@ def refuse_base_token_positions(ckpt_dir: str) -> None:
             "would silently compute wrong attention geometry. Evaluate it "
             "through the in-core adapter instead."
         )
+
+
+def _disable_digit_ids_from_meta(ckpt_dir: str) -> bool:
+    """Read whether TRAINING protected digits from LZW merges (meta.pt's
+    --disable_digit_ids). Exported disabled_ids must match this or the export
+    silently merges digits the model never saw as hyper-tokens in training —
+    the same mismatch class as the chat-token bug, for digits instead."""
+    meta_pt = os.path.join(ckpt_dir, "meta.pt")
+    if not os.path.exists(meta_pt):
+        return False
+    meta = torch.load(meta_pt, map_location="cpu", weights_only=False)
+    train_args = meta.get("args", {}) if isinstance(meta, dict) else {}
+    return bool(train_args.get("disable_digit_ids"))
 
 
 def _resolve_encoder_n_heads(ckpt_dir: str, hidden_size: int, explicit: int | None) -> int:
@@ -231,6 +247,7 @@ def export(
     encoder_n_heads: int | None = None,
     max_codebook_size: int = 4096,
     disabled_ids: list[int] | None = None,
+    disable_digit_ids: bool | None = None,
     residual: bool = True,
     causal: bool = False,
 ):
@@ -244,7 +261,13 @@ def export(
         encoder_n_heads: Number of encoder attention heads. Resolved from meta.pt train
             args if None, falling back to hidden_size // 64 only as a last resort.
         max_codebook_size: Max codebook size (default 4096)
-        disabled_ids: Token IDs to disable for LZW. Loaded from tokenizer if None.
+        disabled_ids: Explicit token IDs to disable for LZW. If None (the normal
+            case), derived from the base_model tokenizer via
+            zip2zip_core.disabled_ids, honoring disable_digit_ids.
+        disable_digit_ids: Whether digits were protected from LZW merges during
+            training. If None, auto-detected from meta.pt's --disable_digit_ids
+            (self-healing, same pattern as lm_eval_adapter.py) — passing an
+            explicit disabled_ids list skips this entirely.
         residual: Use residual connection in encoder (default True)
         causal: Use causal masking in encoder (default False)
     """
@@ -309,10 +332,17 @@ def export(
     if disabled_ids is not None:
         initial_vocab_size = vocab_size
     else:
+        if disable_digit_ids is None:
+            disable_digit_ids = _disable_digit_ids_from_meta(ckpt_dir)
+            if disable_digit_ids:
+                print("  checkpoint was trained with digit-protected LZW (meta.pt) "
+                      "— auto-enabling digit protection for export")
         print(f"Loading tokenizer from {base_model} to compute disabled_ids ...")
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(base_model)
-        disabled_ids = list(tok.get_added_vocab().values())
+        disabled_ids = compute_disabled_ids(
+            tok, len(tok), disable_digit_ids=disable_digit_ids
+        )
         initial_vocab_size = len(tok)
         print(f"  initial_vocab_size={initial_vocab_size}, disabled_ids count={len(disabled_ids)}")
         print(f"Saving tokenizer to {output_dir} ...")
@@ -344,6 +374,13 @@ def export(
     print(f"Saving {config_out} ...")
     with open(config_out, "w") as f:
         json.dump(config, f, indent=2)
+
+    # Carry meta.pt along so check_export_consistency.py has train_args to
+    # compare against -- without this it silently "passes" with nothing checked.
+    meta_src = os.path.join(ckpt_dir, "meta.pt")
+    if os.path.exists(meta_src):
+        shutil.copy(meta_src, os.path.join(output_dir, "meta.pt"))
+        print(f"  copied meta.pt (for check_export_consistency.py)")
 
     print("\nDone. Output:")
     for fn in ("zip2zip_config.json", "model.safetensors", "encoders.safetensors"):
