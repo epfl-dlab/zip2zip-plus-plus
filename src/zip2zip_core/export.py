@@ -85,6 +85,43 @@ def refuse_base_token_positions(ckpt_dir: str) -> None:
         )
 
 
+def _resolve_encoder_n_heads(ckpt_dir: str, hidden_size: int, explicit: int | None) -> int:
+    """Determine the encoder head count that TRAINING actually used.
+
+    Priority:
+      1. `explicit` — the caller's --encoder_n_heads override
+      2. meta.pt train args (`encoder_n_heads`, the value train.py was invoked with)
+      3. hidden_size // 64 (legacy guess — last resort)
+
+    Guessing hidden_size // 64 unconditionally is WRONG whenever head_dim != 64.
+    E.g. Phi-3.5-mini trains the encoder with encoder_dim=3072, encoder_n_heads=32
+    -> head_dim=96, but //64 yields 48, so the exported encoder would reshape QKV
+    into 48x64 instead of 32x96 and compute a different attention at inference.
+    """
+    n_heads, source = None, None
+    if explicit is not None:
+        n_heads, source = explicit, "explicit --encoder_n_heads"
+    else:
+        meta_pt = os.path.join(ckpt_dir, "meta.pt")
+        if os.path.exists(meta_pt):
+            meta = torch.load(meta_pt, map_location="cpu", weights_only=False)
+            train_args = meta.get("args", {}) if isinstance(meta, dict) else {}
+            val = train_args.get("encoder_n_heads")
+            if isinstance(val, int) and val > 0:
+                n_heads, source = val, "meta.pt train args"
+        if n_heads is None:
+            n_heads, source = hidden_size // 64, "hidden_size // 64 (legacy fallback)"
+
+    if n_heads <= 0 or hidden_size % n_heads != 0:
+        raise ValueError(
+            f"Resolved encoder num_heads={n_heads} (from {source}) does not divide "
+            f"encoder hidden_size={hidden_size}. Pass a correct --encoder_n_heads or "
+            f"check meta.pt."
+        )
+    print(f"  encoder num_heads={n_heads} (head_dim={hidden_size // n_heads}, from {source})")
+    return n_heads
+
+
 def _infer_llama_heads(sd: dict) -> tuple[int, int]:
     """Infer (n_heads, n_kv_heads) from wq/wk weight shapes."""
     wq = sd["layers.0.attention.wq.weight"]  # (n_heads * head_dim, dim)
@@ -204,7 +241,8 @@ def export(
         output_dir: Destination directory for ext/zip2zip format
         base_model: HuggingFace base model name (e.g. meta-llama/Llama-3.2-1B-Instruct)
         model_config: zip2zip-core model config key (e.g. '1B'). Auto-detected if None.
-        encoder_n_heads: Number of encoder attention heads. Inferred as hidden_size // 64 if None.
+        encoder_n_heads: Number of encoder attention heads. Resolved from meta.pt train
+            args if None, falling back to hidden_size // 64 only as a last resort.
         max_codebook_size: Max codebook size (default 4096)
         disabled_ids: Token IDs to disable for LZW. Loaded from tokenizer if None.
         residual: Use residual connection in encoder (default True)
@@ -266,7 +304,7 @@ def export(
     save_file(enc_prefixed, encoders_out)
 
     # ---- Build zip2zip_config.json -------------------------------------
-    n_heads = encoder_n_heads or (enc_info["hidden_size"] // 64)
+    n_heads = _resolve_encoder_n_heads(ckpt_dir, enc_info["hidden_size"], encoder_n_heads)
 
     if disabled_ids is not None:
         initial_vocab_size = vocab_size

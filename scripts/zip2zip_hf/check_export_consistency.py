@@ -77,6 +77,17 @@ def main() -> int:
             f"encoder.residual mismatch: exported={got_residual} expected_from_train_args={expected_residual}"
         )
 
+    # hidden_size // 64 is only a valid guess when head_dim == 64; catch the case
+    # where export resolved a different head count than training actually used
+    # (e.g. Phi-3.5-mini: encoder_n_heads=32, head_dim=96, //64 would silently give 48).
+    expected_n_heads = train_args.get("encoder_n_heads")
+    if isinstance(expected_n_heads, int) and expected_n_heads > 0:
+        got_n_heads = enc_cfg.get("num_heads")
+        if got_n_heads != expected_n_heads:
+            mismatches.append(
+                f"encoder.num_heads mismatch: exported={got_n_heads} expected_from_train_args={expected_n_heads}"
+            )
+
     if "max_subtokens" in train_args:
         got_max_subtokens = cfg.get("compression", {}).get("max_subtokens")
         if got_max_subtokens != train_args["max_subtokens"]:
@@ -94,8 +105,10 @@ def main() -> int:
             )
 
     print(f"[check_export_consistency] source={source}")
-    print(f"  encoder.causal   : exported={got_causal} expected={expected_causal}")
-    print(f"  encoder.residual : exported={got_residual} expected={expected_residual}")
+    print(f"  encoder.causal    : exported={got_causal} expected={expected_causal}")
+    print(f"  encoder.residual  : exported={got_residual} expected={expected_residual}")
+    if isinstance(expected_n_heads, int) and expected_n_heads > 0:
+        print(f"  encoder.num_heads : exported={enc_cfg.get('num_heads')} expected={expected_n_heads}")
 
     if mismatches:
         print("\n❌ Found mismatches:")
