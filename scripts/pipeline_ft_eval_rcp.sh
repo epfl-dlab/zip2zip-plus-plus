@@ -29,7 +29,7 @@
 #
 # Env vars:
 #   RUN_NAME=...      (required) also the W&B run name — make it exhaustive
-#   DATA_DIR=...      (default: $SCRATCH/datasets/phi-1B-sft-8shards-eosfix)
+#   DATA_DIR=...      (default: $Z2Z_SCRATCH/datasets/phi-1B-sft-8shards-eosfix)
 #   STEPS=8000        total steps (forwarded to the finetune launcher)
 #   SMOKE_EVERY=1000  smoke-eval cadence in steps
 #   SMOKE_LIMIT=200   per-task sample limit for smoke evals
@@ -64,14 +64,14 @@
 #       --environment FINAL_LIMIT=8 ...
 set -euo pipefail
 
-SCRATCH=${SCRATCH:-/dlabscratch1/gentilin}
-export HF_HOME=${HF_HOME:-$SCRATCH/.cache/huggingface}
+Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/gentilin}
+export HF_HOME=${HF_HOME:-$Z2Z_SCRATCH/.cache/huggingface}
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
-PROJECT_DIR=$SCRATCH/code/zip2zip-core
+PROJECT_DIR=$Z2Z_SCRATCH/code/zip2zip-core
 RUN_NAME=${RUN_NAME:?Must set RUN_NAME (also becomes the W&B run name)}
-export DATA_DIR=${DATA_DIR:-$SCRATCH/datasets/phi-1B-sft-8shards-eosfix}
+export DATA_DIR=${DATA_DIR:-$Z2Z_SCRATCH/datasets/phi-1B-sft-8shards-eosfix}
 export STEPS=${STEPS:-8000}
 SMOKE_EVERY=${SMOKE_EVERY:-1000}
 SMOKE_LIMIT=${SMOKE_LIMIT:-200}
@@ -81,10 +81,10 @@ export WANDB_PROJECT=${WANDB_PROJECT:-zip2zip-core}
 SKIP_FULL_PPL=${SKIP_FULL_PPL:-0}
 FINAL_LIMIT=${FINAL_LIMIT:-}
 
-OUTPUT_BASE=${OUTPUT_BASE:-$SCRATCH/zip2zip-outputs}
+OUTPUT_BASE=${OUTPUT_BASE:-$Z2Z_SCRATCH/zip2zip-outputs}
 OUTPUT_DIR=$OUTPUT_BASE/$RUN_NAME
-EVAL_LOG_DIR=$SCRATCH/logs/eval
-PIPE_LOG_DIR=$SCRATCH/logs/pipeline
+EVAL_LOG_DIR=$Z2Z_SCRATCH/logs/eval
+PIPE_LOG_DIR=$Z2Z_SCRATCH/logs/pipeline
 mkdir -p "$EVAL_LOG_DIR" "$PIPE_LOG_DIR"
 TS=$(date +%Y%m%d_%H%M%S)
 PIPELINE_LOG="$PIPE_LOG_DIR/pipeline_${RUN_NAME}_${TS}.log"
@@ -157,7 +157,7 @@ if [ ! -f "$FINAL_CKPT/model.pt" ]; then
 fi
 
 # ---------- eval env (same venv as eval_ckpt_rcp.sh) ----------
-VENV_DIR=$SCRATCH/.venvs/lm-eval
+VENV_DIR=$Z2Z_SCRATCH/.venvs/lm-eval
 if [ ! -f "$VENV_DIR/bin/activate" ]; then
     python -m venv --system-site-packages "$VENV_DIR"
 fi

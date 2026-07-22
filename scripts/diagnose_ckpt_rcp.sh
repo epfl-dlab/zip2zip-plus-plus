@@ -14,24 +14,24 @@
 #
 # Env vars:
 #   CKPT_DIR=...    (required) step_N checkpoint dir
-#   DATA_DIR=...    training shards (default: $SCRATCH/datasets/phi-1B-sft-8shards)
+#   DATA_DIR=...    training shards (default: $Z2Z_SCRATCH/datasets/phi-1B-sft-8shards)
 #   TOKENIZER=...   default microsoft/Phi-3.5-mini-instruct
 #   N_CHUNKS=8      number of 4096-base-token chunks to score
 #   START_FRAC=0.5  where in shard 0 to sample
 set -euo pipefail
 
-SCRATCH=${SCRATCH:-/dlabscratch1/gentilin}
-export HF_HOME=$SCRATCH/.cache/huggingface
+Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/gentilin}
+export HF_HOME=$Z2Z_SCRATCH/.cache/huggingface
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
-PROJECT_DIR=$SCRATCH/code/zip2zip-core
-LOG_DIR=$SCRATCH/logs/eval
+PROJECT_DIR=$Z2Z_SCRATCH/code/zip2zip-core
+LOG_DIR=$Z2Z_SCRATCH/logs/eval
 mkdir -p "$LOG_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 CKPT_DIR=${CKPT_DIR:?Must set CKPT_DIR}
-DATA_DIR=${DATA_DIR:-$SCRATCH/datasets/phi-1B-sft-8shards}
+DATA_DIR=${DATA_DIR:-$Z2Z_SCRATCH/datasets/phi-1B-sft-8shards}
 TOKENIZER=${TOKENIZER:-microsoft/Phi-3.5-mini-instruct}
 N_CHUNKS=${N_CHUNKS:-8}
 START_FRAC=${START_FRAC:-0.5}
@@ -40,7 +40,7 @@ CKPT_SHORT=$(echo "$(basename "$(dirname "$CKPT_DIR")")_$(basename "$CKPT_DIR")"
 LOGFILE="$LOG_DIR/diagnose_${CKPT_SHORT}_${TIMESTAMP}.log"
 
 # Same venv as eval_ckpt_rcp.sh (torch from system site-packages + lm-eval).
-VENV_DIR=$SCRATCH/.venvs/lm-eval
+VENV_DIR=$Z2Z_SCRATCH/.venvs/lm-eval
 if [ ! -f "$VENV_DIR/bin/activate" ]; then
     python -m venv --system-site-packages "$VENV_DIR"
 fi

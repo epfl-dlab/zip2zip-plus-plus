@@ -17,21 +17,21 @@
 #
 set -euo pipefail
 
-SCRATCH=${SCRATCH:-/dlabscratch1/gentilin}
-export HF_HOME=${HF_HOME:-$SCRATCH/.cache/huggingface}
+Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/gentilin}
+export HF_HOME=${HF_HOME:-$Z2Z_SCRATCH/.cache/huggingface}
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
-export OUTPUT_DIR=${OUTPUT_DIR:-$SCRATCH/datasets/phi-1B-sft-8shards}
+export OUTPUT_DIR=${OUTPUT_DIR:-$Z2Z_SCRATCH/datasets/phi-1B-sft-8shards}
 
-PROJECT_DIR=${PROJECT_DIR:-$SCRATCH/code/zip2zip-core}
-LOG_DIR=$SCRATCH/logs/tokenize
+PROJECT_DIR=${PROJECT_DIR:-$Z2Z_SCRATCH/code/zip2zip-core}
+LOG_DIR=$Z2Z_SCRATCH/logs/tokenize
 mkdir -p "$LOG_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOGFILE="$LOG_DIR/tokenize_phi_sft_${TIMESTAMP}.log"
 
 # ---------- venv (lightweight: only needs datasets/transformers/numpy) ----------
-VENV_DIR=$SCRATCH/.venvs/tokenize
+VENV_DIR=$Z2Z_SCRATCH/.venvs/tokenize
 if [ ! -f "$VENV_DIR/bin/activate" ]; then
     echo "[tokenize] Creating venv at $VENV_DIR..."
     python -m venv --system-site-packages "$VENV_DIR"

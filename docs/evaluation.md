@@ -80,7 +80,7 @@ override preset values.
 
 ## RCP cluster wrappers (Run:AI)
 
-Three `runai submit`-ready wrappers, all under `scripts/`, sharing the `SCRATCH` env var
+Three `runai submit`-ready wrappers, all under `scripts/`, sharing the `Z2Z_SCRATCH` env var
 (default `/dlabscratch1/gentilin`, override per-user) for cache/log/output paths:
 
 - **`eval_ckpt_rcp.sh`** — evaluates a zip2zip *training checkpoint* (`model.pt` + `meta.pt`)
@@ -93,7 +93,7 @@ Three `runai submit`-ready wrappers, all under `scripts/`, sharing the `SCRATCH`
   `microsoft/Phi-3.5-mini-instruct` to confirm task/fewshot settings match the paper's
   Table 3 "Base" row before trusting any zip2zip-adapter numbers.
 
-All three write JSON results + a `tee`'d log to `$SCRATCH/logs/eval`, with the model name
+All three write JSON results + a `tee`'d log to `$Z2Z_SCRATCH/logs/eval`, with the model name
 (and task name, if `TASKS` is set) baked into the output filename for traceability.
 `eval_ckpt_rcp.sh` can additionally log to W&B (results, per-sample tables, compression
 ratios): set `WANDB=1` + `WANDB_NAME`/`WANDB_PROJECT`, and pass `WANDB_API_KEY` into the

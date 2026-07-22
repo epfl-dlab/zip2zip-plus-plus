@@ -43,7 +43,7 @@
 #   PRESET=...      Eval preset (default: default_base)
 #   LIMIT=20        Per-task sample limit for smoke tests
 #   TASKS=gsm8k     Comma-separated task override (default: preset's tasks)
-#   SCRATCH=...     Your PVC scratch dir (default: /dlabscratch1/gentilin)
+#   Z2Z_SCRATCH=...     Your PVC scratch dir (default: /dlabscratch1/gentilin)
 #   WANDB=1         Log results/samples/compression to W&B (default: off, JSON+log
 #                   only). Requires WANDB_API_KEY in the job env. Entity is
 #                   hardcoded to epfl-dlab in src/zip2zip_core/project.py.
@@ -66,13 +66,13 @@
 #
 set -euo pipefail
 
-SCRATCH=${SCRATCH:-/dlabscratch1/gentilin}
-export HF_HOME=$SCRATCH/.cache/huggingface
+Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/gentilin}
+export HF_HOME=$Z2Z_SCRATCH/.cache/huggingface
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
-PROJECT_DIR=$SCRATCH/code/zip2zip-core
-LOG_DIR=$SCRATCH/logs/eval
+PROJECT_DIR=$Z2Z_SCRATCH/code/zip2zip-core
+LOG_DIR=$Z2Z_SCRATCH/logs/eval
 mkdir -p "$LOG_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
@@ -123,7 +123,7 @@ LOGFILE="$LOG_DIR/eval_${MODEL_SHORT}_${PRESET}${TASKS_SUFFIX}_${TIMESTAMP}.log"
 OUTPUT_JSON="$LOG_DIR/results_${MODEL_SHORT}_${PRESET}${TASKS_SUFFIX}_${TIMESTAMP}.json"
 
 # ---------- venv ----------
-VENV_DIR=$SCRATCH/.venvs/lm-eval
+VENV_DIR=$Z2Z_SCRATCH/.venvs/lm-eval
 if [ ! -f "$VENV_DIR/bin/activate" ]; then
     echo "[eval_ckpt] Creating venv at $VENV_DIR..."
     python -m venv --system-site-packages "$VENV_DIR"

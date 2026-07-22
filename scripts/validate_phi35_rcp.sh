@@ -33,7 +33,7 @@
 #   LIMIT=20        Run only 20 samples per task (quick smoke test)
 #   LIMIT=          Full evaluation (default)
 #   HF_HOME=...     HuggingFace cache dir (default: /dlabscratch1/gentilin/.cache/huggingface)
-#   SCRATCH=...     Your PVC scratch dir (default: /dlabscratch1/gentilin)
+#   Z2Z_SCRATCH=...     Your PVC scratch dir (default: /dlabscratch1/gentilin)
 #
 # ── Expected results (paper Table 3, Phi-3.5-4B Base, 2-shot) ───────────
 #
@@ -43,21 +43,21 @@
 set -euo pipefail
 
 # ---------- paths ----------
-SCRATCH=${SCRATCH:-/dlabscratch1/gentilin}
-export HF_HOME=${HF_HOME:-$SCRATCH/.cache/huggingface}
+Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/gentilin}
+export HF_HOME=${HF_HOME:-$Z2Z_SCRATCH/.cache/huggingface}
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 PRESET=${PRESET:-default}
 LIMIT=${LIMIT:-}
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-LOG_DIR=$SCRATCH/logs/eval
+LOG_DIR=$Z2Z_SCRATCH/logs/eval
 mkdir -p "$LOG_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOGFILE="$LOG_DIR/validate_phi35_${PRESET}_${TIMESTAMP}.log"
 
 # ---------- persistent venv on scratch (survives across jobs) ----------
-VENV_DIR=$SCRATCH/.venvs/lm-eval
+VENV_DIR=$Z2Z_SCRATCH/.venvs/lm-eval
 if [ ! -f "$VENV_DIR/bin/activate" ]; then
     echo "[validate] Creating venv at $VENV_DIR (first run only)..."
     python -m venv --system-site-packages "$VENV_DIR"

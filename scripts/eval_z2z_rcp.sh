@@ -30,22 +30,22 @@
 #   LIMIT=20        Per-task sample limit for smoke tests
 #   LIMIT=          Full evaluation (default)
 #   TASKS=gsm8k     Comma-separated task override (default: preset's task list)
-#   SCRATCH=...     Your PVC scratch dir (default: /dlabscratch1/gentilin)
+#   Z2Z_SCRATCH=...     Your PVC scratch dir (default: /dlabscratch1/gentilin)
 #
 set -euo pipefail
 
-SCRATCH=${SCRATCH:-/dlabscratch1/gentilin}
-export HF_HOME=$SCRATCH/.cache/huggingface
+Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/gentilin}
+export HF_HOME=$Z2Z_SCRATCH/.cache/huggingface
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
-PROJECT_DIR=$SCRATCH/code/zip2zip-core
-LOG_DIR=$SCRATCH/logs/eval
+PROJECT_DIR=$Z2Z_SCRATCH/code/zip2zip-core
+LOG_DIR=$Z2Z_SCRATCH/logs/eval
 mkdir -p "$LOG_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # ---------- venv ----------
-VENV_DIR=$SCRATCH/.venvs/lm-eval
+VENV_DIR=$Z2Z_SCRATCH/.venvs/lm-eval
 if [ ! -f "$VENV_DIR/bin/activate" ]; then
     echo "[eval_z2z] Creating venv at $VENV_DIR..."
     python -m venv --system-site-packages "$VENV_DIR"

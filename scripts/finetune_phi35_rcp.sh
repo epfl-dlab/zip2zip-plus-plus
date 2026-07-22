@@ -55,14 +55,14 @@
 #
 set -euo pipefail
 
-SCRATCH=${SCRATCH:-/dlabscratch1/gentilin}
-export HF_HOME=${HF_HOME:-$SCRATCH/.cache/huggingface}
+Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/gentilin}
+export HF_HOME=${HF_HOME:-$Z2Z_SCRATCH/.cache/huggingface}
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-PROJECT_DIR=${PROJECT_DIR:-$SCRATCH/code/zip2zip-core}
-LOG_DIR=$SCRATCH/logs/train
+PROJECT_DIR=${PROJECT_DIR:-$Z2Z_SCRATCH/code/zip2zip-core}
+LOG_DIR=$Z2Z_SCRATCH/logs/train
 mkdir -p "$LOG_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
@@ -85,8 +85,8 @@ PYTHON=$PROJECT_DIR/.venv/bin/python
 # ---------- config (defaults = faithful released recipe; override via env) ----------
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L | wc -l | tr -d ' ')}
 
-DATA_DIR=${DATA_DIR:-$SCRATCH/datasets/phi-1B-sft-8shards-eosfix}
-OUTPUT_BASE=${OUTPUT_BASE:-$SCRATCH/zip2zip-outputs}
+DATA_DIR=${DATA_DIR:-$Z2Z_SCRATCH/datasets/phi-1B-sft-8shards-eosfix}
+OUTPUT_BASE=${OUTPUT_BASE:-$Z2Z_SCRATCH/zip2zip-outputs}
 RUN_NAME=${RUN_NAME:-repro-Phi35-v0.1-fthf}
 OUTPUT_DIR=${OUTPUT_DIR:-${OUTPUT_BASE}/${RUN_NAME}}
 
