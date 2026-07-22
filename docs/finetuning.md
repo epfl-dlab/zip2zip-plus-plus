@@ -222,11 +222,13 @@ Properties worth knowing before launching:
   params), and both encoders run over the full active codebook every step;
   expect a tens-of-percent wall-clock increase and watch step-0 memory (the
   output encoder rides the root FSDP unit).
-- **Plumbing is complete end-to-end.** The launcher records the effective
-  depth in meta.pt, the eval adapter rebuilds the 4-layer encoders from it
-  automatically (no eval flag), and resuming with a different
-  `--encoder_n_layers` than the checkpoint's is a hard error
-  (`validate_resume_args`), like `untied_hyper_encoder`.
+- **Plumbing is complete end-to-end.** Training records the effective encoder
+  architecture (dim/layers/heads/intermediate) in meta.pt, the eval adapter and
+  `scripts/inference.py` rebuild the 4-layer encoders from it automatically (no
+  eval flag), and resuming with different encoder args than the checkpoint's is
+  a hard error (`validate_resume_args`), like `untied_hyper_encoder` — except
+  legacy metas that record None for them, where the strict checkpoint load is
+  the backstop.
 
 Launch = the v0.5 canonical command plus one env var:
 

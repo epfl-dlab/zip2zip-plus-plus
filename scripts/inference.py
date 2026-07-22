@@ -39,6 +39,15 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
     meta = torch.load(f"{ckpt_dir}/meta.pt", map_location="cpu", weights_only=False)
     args = meta["args"]
     cfg = zip2zip_llama_configs[args["model_config"]]
+    # Encoder architecture overrides recorded in meta.pt (None in legacy metas
+    # means the config default; deeper/wider checkpoints crash the strict load
+    # without these, e.g. the v0.6.1 4-layer encoder).
+    enc_overrides = {
+        k: args[k]
+        for k in ("encoder_dim", "encoder_n_layers", "encoder_n_heads",
+                  "encoder_intermediate_size")
+        if args.get(k) is not None
+    }
     cfg = dataclasses.replace(
         cfg,
         max_subtokens=args["max_subtokens"],
@@ -46,6 +55,7 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
         # untied checkpoints carry a second hyper_output encoder; without this the
         # strict load below fails on unexpected hyper_output.* keys.
         tie_hyper_encoder=not args.get("untied_hyper_encoder", False),
+        **enc_overrides,
     )
     model = Zip2ZipLlama3Model(cfg).to(device)
     sd = torch.load(f"{ckpt_dir}/model.pt", map_location=device, weights_only=True)

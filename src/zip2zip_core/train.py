@@ -366,15 +366,18 @@ def validate_resume_args(resume_dir, args):
         return
     prev = torch.load(meta_path, map_location="cpu", weights_only=False).get("args", {}) or {}
     hard = ("disable_digit_ids", "max_codebook_size", "tokenizer",
-            "untied_hyper_encoder", "encoder_n_layers")
+            "untied_hyper_encoder", "encoder_dim", "encoder_n_layers",
+            "encoder_n_heads", "encoder_intermediate_size")
     soft = ("max_subtokens", "seq_len", "data_dir", "warmstart_steps")
-    # prev[k] is None when an old meta.pt predates recording the effective value
-    # (encoder_n_layers left at argparse default) — unknown, not a conflict; the
-    # strict DCP load is the backstop for real architecture mismatches.
+    # Legacy metas record None for the encoder_* args (they predate the
+    # effective-value resolution at startup): unknown is not a conflict there,
+    # and the strict checkpoint load backstops real architecture mismatches.
+    # For every other hard key a recorded None IS a difference worth stopping on.
     mismatches = [
         (k, prev[k], getattr(args, k))
         for k in hard
-        if k in prev and prev[k] is not None and prev[k] != getattr(args, k)
+        if k in prev and prev[k] != getattr(args, k)
+        and not (k.startswith("encoder_") and prev[k] is None)
     ]
     if mismatches and not args.allow_resume_mismatch:
         raise ValueError(
@@ -696,6 +699,16 @@ def main():
     if args.min_hyper_lr is None:
         args.min_hyper_lr = args.min_lr
 
+    # Resolve the encoder architecture args to their EFFECTIVE values (None ->
+    # the model config's default) before anything records vars(args): the stdout
+    # config dump, wandb.init, and meta.pt then all agree, the eval adapter
+    # rebuilds from concrete values, and validate_resume_args compares them.
+    _cfg_defaults = zip2zip_llama_configs[args.model_config]
+    for _f in ("encoder_dim", "encoder_n_layers", "encoder_n_heads",
+               "encoder_intermediate_size"):
+        if getattr(args, _f) is None:
+            setattr(args, _f, getattr(_cfg_defaults, _f))
+
     # Initialize distributed. Generous timeout so the first step's torch.compile
     # (which can take minutes and skews across ranks at large scale) doesn't trip
     # the NCCL watchdog before the first collective completes.
@@ -785,10 +798,6 @@ def main():
     if args.encoder_n_layers is not None:
         replace_kwargs["encoder_n_layers"] = args.encoder_n_layers
     config = dataclasses.replace(config, **replace_kwargs)
-    # Record the EFFECTIVE encoder depth back into args (None -> config default)
-    # so meta.pt always carries the resolved int: the eval adapter rebuilds from
-    # it and validate_resume_args compares it against resume flags.
-    args.encoder_n_layers = config.encoder_n_layers
 
     model = config.build()
     model.gradient_checkpointing = args.activation_checkpoint
