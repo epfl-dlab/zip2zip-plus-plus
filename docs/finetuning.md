@@ -185,7 +185,7 @@ are missing), so there is no eval passthrough or `0`-ambiguity. Like digit
 protection it is deliberately NOT a code default (`tie_hyper_encoder=True`), so
 the frozen tied baselines (v0.1–v0.4) keep loading and evaluating bit-identically.
 
-## Phased warm-start (experimental, v0.6)
+## Phased warm-start (v0.6 — negative result, do not use)
 
 Every treatment run starts with a large loss/grad-norm transient (~loss 150,
 grad_norm ~4500 for the first ~100 steps) as the random hyper-encoder is trained
@@ -197,8 +197,46 @@ LoRA unfreezes. `requires_grad` never changes, so FSDP's grad reduction stays
 rank-uniform (no deadlock class). Training-only — eval is unaffected (the
 checkpoint is a normal untied+digit model), so no eval passthrough. Default 0 =
 off (v0.5 behavior). Log signature: `[warmstart] decoder-LoRA frozen for first N
-steps` then `[warmstart] step N: unfreezing decoder-LoRA`. Experimental until v0.6
-validates against v0.5-8k at the same budget.
+steps` then `[warmstart] step N: unfreezing decoder-LoRA`. The v0.6 run
+(2026-07-20, N=200, same budget as v0.5-8k) REFUTED the premise: GSM8K flexible
+dropped 0.623 → 0.557 with everything else flat — letting the hyper-encoder
+settle alone yields a math-inferior joint minimum. Keep `WARMSTART_STEPS` unset;
+the code stays as a default-off negative-result artifact.
+
+## Deeper hyper-encoder (v0.6.1)
+
+Next lever on the residual GSM8K gap to the uncompressed control (v0.5 flexible
+.623 vs control .742). The base-mode decomposition splits that gap into an
+input-compression term and a trained-weights term of similar size, and encoder
+architecture is the proven axis for the compression side (tied → untied was
++1.4pt GSM8K plus MC/ppl gains). v0.6.1 deepens both flat untied encoders from
+2 layers to 4: `ENCODER_N_LAYERS=4` (train arg `--encoder_n_layers`, config
+field `encoder_n_layers`, default 2 = v0.5 exactly).
+
+Properties worth knowing before launching:
+
+- **Compression-specific by construction.** The control has
+  `max_codebook_size=0`, so the hyper path never runs and encoder depth cannot
+  move the control — this knob can only close the gap, never lift the ceiling.
+- **Cost.** The trainable untied encoder pair roughly doubles (~453M → ~906M
+  params), and both encoders run over the full active codebook every step;
+  expect a tens-of-percent wall-clock increase and watch step-0 memory (the
+  output encoder rides the root FSDP unit).
+- **Plumbing is complete end-to-end.** The launcher records the effective
+  depth in meta.pt, the eval adapter rebuilds the 4-layer encoders from it
+  automatically (no eval flag), and resuming with a different
+  `--encoder_n_layers` than the checkpoint's is a hard error
+  (`validate_resume_args`), like `untied_hyper_encoder`.
+
+Launch = the v0.5 canonical command plus one env var:
+
+```bash
+RUN_NAME=<name> DISABLE_DIGIT_IDS=1 UNTIED_HYPER_ENCODER=1 ENCODER_N_LAYERS=4 \
+  bash scripts/pipeline_ft_eval_rcp.sh
+```
+
+Experimental until it validates against v0.5-8k at the same budget (success =
+GSM8K flexible clearly above .623 with MC/ppl not regressing).
 
 ## Canonical RCP locations and run conventions
 

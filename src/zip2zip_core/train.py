@@ -365,12 +365,16 @@ def validate_resume_args(resume_dir, args):
     if not os.path.exists(meta_path):
         return
     prev = torch.load(meta_path, map_location="cpu", weights_only=False).get("args", {}) or {}
-    hard = ("disable_digit_ids", "max_codebook_size", "tokenizer", "untied_hyper_encoder")
+    hard = ("disable_digit_ids", "max_codebook_size", "tokenizer",
+            "untied_hyper_encoder", "encoder_n_layers")
     soft = ("max_subtokens", "seq_len", "data_dir", "warmstart_steps")
+    # prev[k] is None when an old meta.pt predates recording the effective value
+    # (encoder_n_layers left at argparse default) — unknown, not a conflict; the
+    # strict DCP load is the backstop for real architecture mismatches.
     mismatches = [
         (k, prev[k], getattr(args, k))
         for k in hard
-        if k in prev and prev[k] != getattr(args, k)
+        if k in prev and prev[k] is not None and prev[k] != getattr(args, k)
     ]
     if mismatches and not args.allow_resume_mismatch:
         raise ValueError(
@@ -781,6 +785,10 @@ def main():
     if args.encoder_n_layers is not None:
         replace_kwargs["encoder_n_layers"] = args.encoder_n_layers
     config = dataclasses.replace(config, **replace_kwargs)
+    # Record the EFFECTIVE encoder depth back into args (None -> config default)
+    # so meta.pt always carries the resolved int: the eval adapter rebuilds from
+    # it and validate_resume_args compares it against resume flags.
+    args.encoder_n_layers = config.encoder_n_layers
 
     model = config.build()
     model.gradient_checkpointing = args.activation_checkpoint
