@@ -5,7 +5,7 @@ codebook) so it is fast and CI-friendly; the invariants are dtype/size
 independent. fp32, varlen disabled (flash-attn is CUDA-only).
 
 Runnable both as a script (python tests/test_untied_hyper_encoder.py) and
-under pytest (collection imports the module without executing the checks).
+under pytest. Shared mechanics live in tests/_hyper_common.py.
 
 Invariants proven:
   T1  threading: an untied model whose two encoders are identical AND whose
@@ -24,18 +24,13 @@ Invariants proven:
       OUTPUT encoder and equals the training-path output encoding of the same
       entries; tied path leaves no output buffer.
 """
-import copy
 import dataclasses
-import sys, os
+import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "ext", "torchtitan"))
+from _hyper_common import build_model, make_input, fwd, make_harness, summarize
 
 import torch
 from zip2zip_core.configs import zip2zip_llama_configs
-
-DEV = "cuda" if torch.cuda.is_available() else "cpu"
-torch.manual_seed(0)
 
 
 def small_cfg(untied: bool):
@@ -51,47 +46,9 @@ def small_cfg(untied: bool):
 
 
 def build(untied: bool, seed: int = 0):
-    torch.manual_seed(seed)
     cfg = small_cfg(untied)
-    model = cfg.build()
-    with torch.no_grad():
-        model.init_weights()
-    model = model.to(device=DEV, dtype=torch.float32).eval()
-    # force the CPU/GPU-safe padded attention path (flash-attn varlen is CUDA-only)
-    model.hyper_encoder.disable_varlen = True
-    if getattr(model, "hyper_output", None) is not None:
-        model.hyper_output.disable_varlen = True
-    return model, cfg
+    return build_model(cfg, seed=seed), cfg
 
-
-def make_input(cfg, n_hyper=3, T=16):
-    V = cfg.vocab_size
-    torch.manual_seed(42)
-    # tokens: mostly base, a few hypertokens referencing entries 0..n_hyper-1
-    toks = torch.randint(0, V, (1, T), device=DEV)
-    for i in range(n_hyper):
-        toks[0, 2 + i] = V + i
-    # codebook: n_hyper real entries (2 base subtokens + pad), rest all-pad
-    pad = cfg.pad_token_id
-    K = cfg.max_codebook_size
-    cb = torch.full((1, K, cfg.max_subtokens), pad, device=DEV)
-    for i in range(n_hyper):
-        cb[0, i, 0] = 10 + i
-        cb[0, i, 1] = 20 + i
-    return toks, cb
-
-
-def fwd(model, toks, cb):
-    with torch.no_grad():
-        out = model(toks, codebook=cb, hyper_causal_mask=True)
-    return (out[0] if isinstance(out, tuple) else out).float()
-
-
-results = {}
-
-def check(name, cond, detail=""):
-    results[name] = bool(cond)
-    print(f"[{'PASS' if cond else 'FAIL'}] {name} {detail}")
 
 def maxd(a, b):
     """Max abs diff over finite positions (hyper logits carry -inf pad rows;
@@ -103,7 +60,7 @@ def maxd(a, b):
 
 
 def main():
-    results.clear()
+    results, check = make_harness()
 
     # ---- T1: untied-equiv reduces to tied ----
     mu, cfg = build(untied=True, seed=1)
@@ -147,7 +104,7 @@ def main():
     # ---- T4: all-pad codebook -> base-only logits, no crash, both encoders skip ----
     mu.reset_inference_cache()
     cb_allpad = torch.full_like(cb, cfg.pad_token_id)
-    toks_base = torch.randint(0, V, (1, 16), device=DEV)
+    toks_base = torch.randint(0, V, (1, 16), device=toks.device)
     logits_allpad = fwd(mu, toks_base, cb_allpad)
     check("T4_allpad_base_only_logits", logits_allpad.shape[-1] == V,
           f"shape[-1]={logits_allpad.shape[-1]} == vocab {V}")
@@ -176,7 +133,7 @@ def main():
     # ---- T6: inference path uses OUTPUT encoder for the output buffer ----
     mu.reset_inference_cache()
     K = cfg.max_codebook_size
-    updates = torch.full((1, K, cfg.max_subtokens), cfg.pad_token_id, device=DEV)
+    updates = torch.full((1, K, cfg.max_subtokens), cfg.pad_token_id, device=toks.device)
     for i in range(3):
         updates[0, i, 0] = 10 + i
         updates[0, i, 1] = 20 + i
@@ -202,18 +159,13 @@ def main():
         mt._embed_tokens_inference(toks, updates, idx)
     check("T6_tied_no_output_buffer", mt._hyper_out_embeds_buf is None)
 
-    print("\n==== SUMMARY ====")
-    n_pass = sum(results.values())
-    print(f"{n_pass}/{len(results)} passed")
-    for k, v in results.items():
-        if not v:
-            print(f"  FAILED: {k}")
-    return 0 if n_pass == len(results) else 1
+    return summarize(results)
 
 
 def test_untied_hyper_encoder_invariants():
-    assert main() == 0
+    failed = main()
+    assert not failed, f"failed invariants: {failed}"
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(1 if main() else 0)
