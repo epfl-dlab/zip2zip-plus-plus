@@ -28,6 +28,13 @@ from torchtitan.models.utils import get_dense_model_nparams_and_flops
 from torchtitan.tools.logging import logger
 
 
+def rope_cache_len(seq_len: int, max_subtokens: int, base_token_positions: bool) -> int:
+    """Rows the freqs_cis cache needs: base-space positions can reach
+    seq_len * max_subtokens - 1 in a fully merged window; compressed-index
+    positions never exceed seq_len - 1."""
+    return seq_len * (max_subtokens if base_token_positions else 1)
+
+
 class HyperEncoderLayer(nn.Module):
     """Single transformer layer for the hyper-encoder."""
 
@@ -569,7 +576,12 @@ class Zip2ZipLlama3Model(Decoder):
                 )
             import dataclasses as _dc
 
-            self.rope = _dc.replace(self.rope, max_seq_len=seq_len)
+            self.rope = _dc.replace(
+                self.rope,
+                max_seq_len=rope_cache_len(
+                    seq_len, self.max_subtokens, self.base_token_positions
+                ),
+            )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
@@ -713,7 +725,19 @@ class Zip2ZipLlama3Model(Decoder):
             spans = torch.where(
                 is_hyper, entry_spans.gather(1, entry_ids).clamp(min=1), spans
             )
-        return spans.cumsum(dim=-1) - 1
+        pos = spans.cumsum(dim=-1) - 1
+        cache_rows = self.freqs_cis.shape[0]
+        if int(pos.max()) >= cache_rows:
+            # Fail actionably instead of a CUDA device-side assert in the
+            # freqs_cis gather. Training sizes the cache exactly (rope_cache_len);
+            # this is reachable only when a small-config rope cache meets a long
+            # compressed-space-truncated generation prompt.
+            raise ValueError(
+                f"base_token_positions: max base-space position {int(pos.max())} "
+                f"exceeds the rope cache ({cache_rows} rows). Truncate the prompt "
+                f"in base space or enlarge rope.max_seq_len."
+            )
+        return pos
 
     def _embed_tokens_train(
         self, tokens: torch.Tensor, codebook: torch.Tensor

@@ -37,6 +37,7 @@ import torch
 from zip2zip_core.configs import zip2zip_llama_configs
 from zip2zip_core.export import (
     _split_state_dict, _infer_encoder_config, _merge_lora_weights, _lora_scaling_from_meta,
+    refuse_base_token_positions,
 )
 
 PHI_TOKENIZER = "microsoft/Phi-3.5-mini-instruct"
@@ -96,6 +97,7 @@ def main():
           f"heads={attn.n_heads}/{attn.n_kv_heads}, disabled_ids={disabled_ids}")
 
     # ---- load + split checkpoint ----
+    refuse_base_token_positions(args.ckpt_dir)
     model_pt = os.path.join(args.ckpt_dir, "model.pt")
     print(f"Loading {model_pt} ...")
     sd = torch.load(model_pt, map_location="cpu", weights_only=True)

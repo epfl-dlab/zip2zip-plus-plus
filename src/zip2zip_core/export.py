@@ -64,6 +64,27 @@ def _lora_scaling_from_meta(ckpt_dir: str) -> float:
     return 1.0
 
 
+def refuse_base_token_positions(ckpt_dir: str) -> None:
+    """Hard-fail on exporting a base_token_positions checkpoint.
+
+    The ext/zip2zip HF runtime assigns one RoPE position per compressed token;
+    a checkpoint trained with base-space positions would load fine and silently
+    score with the wrong geometry. Export support is a separate task.
+    """
+    meta_pt = os.path.join(ckpt_dir, "meta.pt")
+    if not os.path.exists(meta_pt):
+        return
+    meta = torch.load(meta_pt, map_location="cpu", weights_only=False)
+    train_args = meta.get("args", {}) if isinstance(meta, dict) else {}
+    if train_args and train_args.get("base_token_positions"):
+        raise NotImplementedError(
+            "this checkpoint was trained with --base_token_positions; the "
+            "ext/zip2zip HF runtime has no base-position path, so an export "
+            "would silently compute wrong attention geometry. Evaluate it "
+            "through the in-core adapter instead."
+        )
+
+
 def _infer_llama_heads(sd: dict) -> tuple[int, int]:
     """Infer (n_heads, n_kv_heads) from wq/wk weight shapes."""
     wq = sd["layers.0.attention.wq.weight"]  # (n_heads * head_dim, dim)
@@ -192,6 +213,7 @@ def export(
     os.makedirs(output_dir, exist_ok=True)
 
     # ---- Load checkpoint -----------------------------------------------
+    refuse_base_token_positions(ckpt_dir)
     model_pt = os.path.join(ckpt_dir, "model.pt")
     print(f"Loading {model_pt} ...")
     sd = torch.load(model_pt, map_location="cpu", weights_only=True)

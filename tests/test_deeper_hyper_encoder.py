@@ -81,7 +81,8 @@ def _resume_args(**over):
     """An args namespace covering every key validate_resume_args touches."""
     base = dict(
         disable_digit_ids=True, max_codebook_size=4096, tokenizer="microsoft/Phi-3.5",
-        untied_hyper_encoder=True, encoder_dim=3072, encoder_n_layers=4,
+        untied_hyper_encoder=True, base_token_positions=False,
+        encoder_dim=3072, encoder_n_layers=4,
         encoder_n_heads=32, encoder_intermediate_size=12288,
         max_subtokens=4, seq_len=2048, data_dir="/data", warmstart_steps=0,
         allow_resume_mismatch=False,

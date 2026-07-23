@@ -40,6 +40,7 @@ import torch.nn.functional as F
 
 from zip2zip_core.configs import zip2zip_llama_configs
 from zip2zip_core.data import build_dataloader
+from zip2zip_core.model import rope_cache_len
 
 torch.set_float32_matmul_precision('high') 
 
@@ -369,15 +370,21 @@ def validate_resume_args(resume_dir, args):
             "untied_hyper_encoder", "base_token_positions", "encoder_dim",
             "encoder_n_layers", "encoder_n_heads", "encoder_intermediate_size")
     soft = ("max_subtokens", "seq_len", "data_dir", "warmstart_steps")
+    # Boolean (store_true) hard flags: a meta.pt written before the flag existed
+    # unambiguously means the behavior was OFF — treat absence as False so that
+    # e.g. resuming a v0.5 lineage with --base_token_positions is caught instead
+    # of silently changing position geometry mid-lineage.
+    bool_hard = ("disable_digit_ids", "untied_hyper_encoder", "base_token_positions")
     # Legacy metas record None for the encoder_* args (they predate the
     # effective-value resolution at startup): unknown is not a conflict there,
     # and the strict checkpoint load backstops real architecture mismatches.
     # For every other hard key a recorded None IS a difference worth stopping on.
     mismatches = [
-        (k, prev[k], getattr(args, k))
+        (k, prev.get(k, False if k in bool_hard else None), getattr(args, k))
         for k in hard
-        if k in prev and prev[k] != getattr(args, k)
-        and not (k.startswith("encoder_") and prev[k] is None)
+        if (k in prev or k in bool_hard)
+        and prev.get(k, False if k in bool_hard else None) != getattr(args, k)
+        and not (k.startswith("encoder_") and prev.get(k) is None)
     ]
     if mismatches and not args.allow_resume_mismatch:
         raise ValueError(
@@ -794,11 +801,11 @@ def main():
         # to tie_hyper_encoder=False. The adapter applies the same inversion.
         tie_hyper_encoder=not args.untied_hyper_encoder,
         base_token_positions=args.base_token_positions,
-        # Base-space positions can reach seq_len * max_subtokens - 1 in a fully
-        # merged window, so the freqs_cis cache must cover that when enabled.
         rope=dataclasses.replace(
             config.rope,
-            max_seq_len=args.seq_len * (args.max_subtokens if args.base_token_positions else 1),
+            max_seq_len=rope_cache_len(
+                args.seq_len, args.max_subtokens, args.base_token_positions
+            ),
         ),
     )
     if args.encoder_dim is not None:
