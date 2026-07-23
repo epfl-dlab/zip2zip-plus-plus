@@ -203,7 +203,7 @@ dropped 0.623 → 0.557 with everything else flat — letting the hyper-encoder
 settle alone yields a math-inferior joint minimum. Keep `WARMSTART_STEPS` unset;
 the code stays as a default-off negative-result artifact.
 
-## Deeper hyper-encoder (v0.6.1)
+## Deeper hyper-encoder (v0.6.1 — negative result, do not use)
 
 Next lever on the residual GSM8K gap to the uncompressed control (v0.5 flexible
 .623 vs control .742). The base-mode decomposition splits that gap into an
@@ -237,8 +237,15 @@ RUN_NAME=<name> DISABLE_DIGIT_IDS=1 UNTIED_HYPER_ENCODER=1 ENCODER_N_LAYERS=4 \
   bash scripts/pipeline_ft_eval_rcp.sh
 ```
 
-Experimental until it validates against v0.5-8k at the same budget (success =
-GSM8K flexible clearly above .623 with MC/ppl not regressing).
+The v0.6.1 run (2026-07-23, same budget as v0.5-8k, single variable = depth)
+came back NEGATIVE: GSM8K flexible 0.623 → 0.597, ARC-c/HellaSwag/OpenBookQA
+each down ~1pt, PIQA/WinoGrande up ~0.6 (noise), wikitext byte-ppl exactly flat
+(1.6857 → 1.6858), train loss slightly BETTER (~1.45 vs 1.51) — the extra
+capacity fit the training distribution without transferring. The known
+compressed-reading corruption ("sprints" → "sells") persists at depth 4, so the
+failure is input-side/positional, not encoder capacity. Keep
+`ENCODER_N_LAYERS` unset (default 2 = v0.5 canonical); the plumbing stays as a
+default-off negative-result artifact.
 
 ## Canonical RCP locations and run conventions
 
