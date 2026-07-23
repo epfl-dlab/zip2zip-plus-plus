@@ -366,8 +366,8 @@ def validate_resume_args(resume_dir, args):
         return
     prev = torch.load(meta_path, map_location="cpu", weights_only=False).get("args", {}) or {}
     hard = ("disable_digit_ids", "max_codebook_size", "tokenizer",
-            "untied_hyper_encoder", "encoder_dim", "encoder_n_layers",
-            "encoder_n_heads", "encoder_intermediate_size")
+            "untied_hyper_encoder", "base_token_positions", "encoder_dim",
+            "encoder_n_layers", "encoder_n_heads", "encoder_intermediate_size")
     soft = ("max_subtokens", "seq_len", "data_dir", "warmstart_steps")
     # Legacy metas record None for the encoder_* args (they predate the
     # effective-value resolution at startup): unknown is not a conflict there,
@@ -585,6 +585,12 @@ def main():
                         help="Use a separate output-role hyper-encoder (reading lm_head "
                              "rows) instead of reusing the input hyper-encoder for logits. "
                              "Matches the released model. Default off = tied (legacy).")
+    parser.add_argument("--base_token_positions", action="store_true",
+                        help="RoPE positions follow the uncompressed stream (each token "
+                             "sits at the base-space index of its last constituent) "
+                             "instead of one position per compressed token, so relative "
+                             "distances keep their pretrained meaning. Default off = "
+                             "compressed-index positions (v0.5 and released behavior).")
     parser.add_argument("--seq_len", type=int, default=4096)
     parser.add_argument("--local_batch_size", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
@@ -787,7 +793,13 @@ def main():
         # Inverted at the arg boundary: --untied_hyper_encoder (default off) maps
         # to tie_hyper_encoder=False. The adapter applies the same inversion.
         tie_hyper_encoder=not args.untied_hyper_encoder,
-        rope=dataclasses.replace(config.rope, max_seq_len=args.seq_len),
+        base_token_positions=args.base_token_positions,
+        # Base-space positions can reach seq_len * max_subtokens - 1 in a fully
+        # merged window, so the freqs_cis cache must cover that when enabled.
+        rope=dataclasses.replace(
+            config.rope,
+            max_seq_len=args.seq_len * (args.max_subtokens if args.base_token_positions else 1),
+        ),
     )
     if args.encoder_dim is not None:
         replace_kwargs["encoder_dim"] = args.encoder_dim
@@ -1174,6 +1186,10 @@ def main():
         else:
             print(f"Stopping by step budget: steps={args.steps:,}")
         print(f"Starting training from step {start_step + 1}...")
+        if args.base_token_positions:
+            print(f"[base_token_positions] enabled: RoPE positions follow the "
+                  f"uncompressed stream (rope cache = seq_len*max_subtokens = "
+                  f"{args.seq_len * args.max_subtokens} positions)")
         if args.warmstart_steps:
             print(f"[warmstart] enabled: decoder-LoRA frozen for first {args.warmstart_steps} steps")
             if args.warmstart_steps >= args.warmup_steps:

@@ -247,6 +247,58 @@ failure is input-side/positional, not encoder capacity. Keep
 `ENCODER_N_LAYERS` unset (default 2 = v0.5 canonical); the plumbing stays as a
 default-off negative-result artifact.
 
+## Base-token RoPE positions (v0.6.2)
+
+Attacks the INPUT term of the GSM8K gap, which the paired base-mode
+decomposition (2026-07-23) showed is the dominant residual: v0.5 compressed
+.630 vs base .695 vs control .742 — 6.5pt lost purely to reading compressed
+input at eval, and it is the *entire* MC gap (base mode matches the control on
+ARC-c/HellaSwag). Three lines of evidence say the damage is positional, not
+merge-content: digit protection helped (v0.4), symbol/LaTeX protection gained
+nothing (triage on v0.4), and the canonical failure ("3 sprints" misread) is
+cross-hypertoken corruption with all content words preserved as base tokens.
+
+Mechanism: today every compressed token takes ONE RoPE slot, so the geometric
+distance between two tokens depends on how much the compressor merged between
+them — the same text yields different position geometry depending on local
+compression ratio, and eval prompts produce merge patterns never seen in
+training. With `BASE_TOKEN_POSITIONS=1` (train arg `--base_token_positions`,
+config `base_token_positions`), every token instead sits at the base-space
+index of its LAST constituent (spans end-anchored, positions =
+cumsum(span)−1): relative distances mean exactly what they meant in
+pretraining, and an uncompressed sequence reduces bit-identically to the
+default `arange`.
+
+Implementation notes:
+
+- Positions are derived inside the model from what it already receives — the
+  full codebook at training/loglikelihood time, or a per-entry span buffer
+  maintained next to the embed buffers during incremental generation. No
+  dataloader or harness changes; train/eval/generation cannot drift.
+- The training rope cache is sized `seq_len * max_subtokens` when the flag is
+  on (a fully merged window ends at base position `seq_len*ms − 1`); eval and
+  inference keep the config's native 131k Phi cache.
+- Base-mode eval is unaffected by construction (uncompressed stream, positions
+  == arange with or without the flag), so the base/compressed decomposition
+  stays directly comparable across v0.5 and v0.6.2.
+- Like `untied_hyper_encoder`: recorded in meta.pt, auto-configured by the
+  eval adapter (log line `base-token RoPE positions: enabled from meta.pt`)
+  and `scripts/inference.py`, resume-guarded as a hard key, deliberately NOT a
+  code default (v0.1–v0.6.1 checkpoints keep evaluating bit-identically).
+- NOT exported/pip-compatible: the ext/zip2zip HF runtime has no custom
+  position path — export support is a separate task if v0.6.2 wins.
+
+Launch = the v0.5 canonical command plus one env var:
+
+```bash
+RUN_NAME=<name> DISABLE_DIGIT_IDS=1 UNTIED_HYPER_ENCODER=1 BASE_TOKEN_POSITIONS=1 \
+  bash scripts/pipeline_ft_eval_rcp.sh
+```
+
+Experimental until it validates against v0.5-8k at the same budget (success =
+GSM8K flexible clearly above .623/.630 with MC/ppl not regressing; the paired
+decomposition should show the input term shrinking from 6.5pt).
+
 ## Canonical RCP locations and run conventions
 
 Single source of truth for where things live on the cluster (`$SCRATCH =

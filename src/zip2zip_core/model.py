@@ -547,6 +547,12 @@ class Zip2ZipLlama3Model(Decoder):
         # model). Checkpoints saved without this field load as tied.
         tie_hyper_encoder: bool = True
         hyper_encoder_type: str = "flat"
+        # RoPE positions follow the UNCOMPRESSED stream: every token sits at the
+        # base-space index of its last constituent (base tokens: their own index;
+        # hypertokens: span end), so relative distances mean the same thing they
+        # meant in pretraining regardless of local compression ratio. Off = one
+        # position per compressed token (v0.5 and released-model behavior).
+        base_token_positions: bool = False
         reconstruction_loss_weight: float = 0.0
         token_type_loss_weight: float = (
             0.0  # weight for base/hyper token type prediction head
@@ -598,6 +604,10 @@ class Zip2ZipLlama3Model(Decoder):
         # Output-role buffer, only used when untied (mirrors _hyper_embeds_buf,
         # encoded from lm_head rows instead of tok_embeddings rows).
         self._hyper_out_embeds_buf: torch.Tensor | None = None
+        # Per-entry base-token span counts (B, max_codebook_size), maintained
+        # alongside the embed buffers so base_token_positions can be computed
+        # in incremental inference where only codebook UPDATES are visible.
+        self._hyper_span_buf: torch.Tensor | None = None
 
         # Hyper-encoder(s) for computing hypertoken embeddings. Tied: one encoder
         # serves both the input-embedding and output-logit roles. Untied: a second
@@ -675,6 +685,35 @@ class Zip2ZipLlama3Model(Decoder):
         self._hyper_embeds_buf = None
         self._hyper_embeds_used = None
         self._hyper_out_embeds_buf = None
+        self._hyper_span_buf = None
+
+    def _base_token_positions(
+        self, tokens: torch.Tensor, codebook: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Base-space (uncompressed-stream) RoPE positions for compressed tokens.
+
+        Each token's span = how many base tokens it stands for (1 for base ids,
+        non-pad subtoken count for hypertokens). A token sits at the base-space
+        index of its LAST constituent: cumsum(spans) - 1. All-base rows reduce
+        exactly to arange(T). Span source: the full codebook (training) or the
+        persistent _hyper_span_buf (incremental inference).
+        """
+        vocab_size = self.zip2zip_config.vocab_size
+        is_hyper = tokens >= vocab_size
+        spans = torch.ones_like(tokens)
+        if is_hyper.any():
+            entry_ids = (tokens - vocab_size).clamp(min=0)
+            if codebook is not None:
+                pad_id = self.zip2zip_config.pad_token_id
+                entry_spans = (codebook != pad_id).sum(dim=-1)  # (B, K)
+            else:
+                entry_spans = self._hyper_span_buf  # (B, K)
+            # clamp_min(1): a degenerate reference to an empty/unwritten entry
+            # must not collapse positions (the compressor never produces one).
+            spans = torch.where(
+                is_hyper, entry_spans.gather(1, entry_ids).clamp(min=1), spans
+            )
+        return spans.cumsum(dim=-1) - 1
 
     def _embed_tokens_train(
         self, tokens: torch.Tensor, codebook: torch.Tensor
@@ -754,6 +793,9 @@ class Zip2ZipLlama3Model(Decoder):
             self._hyper_embeds_used = torch.zeros(
                 bs, max_cb, dtype=torch.bool, device=weight.device,
             )
+            self._hyper_span_buf = torch.zeros(
+                bs, max_cb, dtype=torch.long, device=weight.device,
+            )
             if untied:
                 self._hyper_out_embeds_buf = torch.zeros_like(self._hyper_embeds_buf)
 
@@ -771,12 +813,15 @@ class Zip2ZipLlama3Model(Decoder):
             )
             # The hyper-encoder's padded attention path can upcast to fp32;
             # index_put refuses mismatched dtypes, so cast to the buffer's.
+            pad_id = self.zip2zip_config.pad_token_id
+            update_spans = (codebook_updates != pad_id).sum(dim=-1)  # (B, max_updates)
             for i, ui in enumerate(codebook_updates_indices):
                 if ui:
                     self._hyper_embeds_buf[i, ui] = new_embeds[i, : len(ui)].to(
                         self._hyper_embeds_buf.dtype
                     )
                     self._hyper_embeds_used[i, ui] = True
+                    self._hyper_span_buf[i, ui] = update_spans[i, : len(ui)]
                     if untied:
                         self._hyper_out_embeds_buf[i, ui] = new_out_embeds[
                             i, : len(ui)
@@ -881,11 +926,18 @@ class Zip2ZipLlama3Model(Decoder):
         with torch.profiler.record_function("hyper_encoder"):
             if codebook is not None and (codebook != self.zip2zip_config.pad_token_id).any():
                 h, hyper_embeds, hyper_out_embeds = self._embed_tokens_train(tokens, codebook)
+                if self.zip2zip_config.base_token_positions and positions is None:
+                    positions = self._base_token_positions(tokens, codebook)
             elif codebook_updates is not None and codebook_updates_indices is not None:
                 h, hyper_embeds, hyper_out_embeds = self._embed_tokens_inference(
                     tokens, codebook_updates, codebook_updates_indices
                 )
+                if self.zip2zip_config.base_token_positions and positions is None:
+                    positions = self._base_token_positions(tokens, codebook=None)
             else:
+                # Plain/base-mode path: tokens ARE the uncompressed stream, so
+                # base-space positions == arange — the default (positions=None)
+                # is already correct with or without base_token_positions.
                 h = self.tok_embeddings(tokens)
                 hyper_embeds = None
                 hyper_out_embeds = None

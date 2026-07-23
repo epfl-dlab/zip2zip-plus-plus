@@ -50,9 +50,12 @@
 #                     launcher only; evals auto-configure from the checkpoint
 #                     meta.pt (no eval passthrough), so no "0" ambiguity.
 #   ENCODER_N_LAYERS= hyper-encoder depth (default 2 = v0.5). Set 4 for the
-#                     v0.6.1 deeper-encoder recipe. Inherited by the train
-#                     launcher; evals auto-configure from meta.pt like the
-#                     untied flag.
+#                     v0.6.1 deeper-encoder recipe (negative result — keep 2).
+#                     Inherited by the train launcher; evals auto-configure
+#                     from meta.pt like the untied flag.
+#   BASE_TOKEN_POSITIONS= set 1 for uncompressed-stream RoPE positions
+#                     (v0.6.2 recipe). Inherited by the train launcher; evals
+#                     auto-configure from meta.pt like the untied flag.
 #   FINAL_LIMIT=      per-task sample limit for the FINAL eval (default: full).
 #                     Only for pipeline rehearsals — never for real numbers.
 # Anything else the finetune launcher reads (LR, SEQ_LEN, ...) passes through.

@@ -115,6 +115,14 @@ UNTIED_FLAG=""
 if [ -n "$UNTIED_HYPER_ENCODER" ] && [ "$UNTIED_HYPER_ENCODER" != "0" ]; then
     UNTIED_FLAG="--untied_hyper_encoder"
 fi
+# BASE_TOKEN_POSITIONS=1: RoPE positions follow the uncompressed stream
+# (v0.6.2 recipe) instead of one position per compressed token. Eval
+# auto-configures from the checkpoint meta.pt — no eval-side env needed.
+BASE_TOKEN_POSITIONS=${BASE_TOKEN_POSITIONS:-}
+BASEPOS_FLAG=""
+if [ -n "$BASE_TOKEN_POSITIONS" ] && [ "$BASE_TOKEN_POSITIONS" != "0" ]; then
+    BASEPOS_FLAG="--base_token_positions"
+fi
 # WARMSTART_STEPS=N: freeze decoder-LoRA for the first N steps (hyper-encoder
 # only), then unfreeze. Training-only; eval unaffected. Empty/0 = off.
 WARMSTART_STEPS=${WARMSTART_STEPS:-}
@@ -277,7 +285,7 @@ echo "NUM_GPUS=$NUM_GPUS  MODEL=$MODEL_CONFIG  MAX_SUBTOKENS=$MAX_SUBTOKENS"
 echo "INIT_FROM_HF=$INIT_FROM_HF  TOKENIZER=$TOKENIZER"
 echo "FREEZE_DECODER=$FREEZE_DECODER  LORA_RANK=$LORA_RANK  LORA_ALPHA=$LORA_ALPHA"
 echo "ENCODER: type=$HYPER_ENCODER_TYPE dim=$ENCODER_DIM layers=$ENCODER_N_LAYERS heads=$ENCODER_N_HEADS inter=$ENCODER_INTERMEDIATE_SIZE"
-echo "DIGIT_FLAG='$DIGIT_FLAG'  UNTIED_FLAG='$UNTIED_FLAG'  WARMSTART_FLAG='$WARMSTART_FLAG'"
+echo "DIGIT_FLAG='$DIGIT_FLAG'  UNTIED_FLAG='$UNTIED_FLAG'  WARMSTART_FLAG='$WARMSTART_FLAG'  BASEPOS_FLAG='$BASEPOS_FLAG'"
 echo "CODEBOOK(active)=$MAX_ACTIVE_CODEBOOK_SIZE  LR=$LR->$MIN_LR warmup=$WARMUP_STEPS wd=$WEIGHT_DECAY beta2=$ADAM_BETA2"
 echo "SEQ_LEN=$SEQ_LEN  GRAD_ACCUM=$GRAD_ACCUM  TOKENS/STEP=$TOKENS_PER_STEP (released: 32768)"
 echo "STEPS=$STEPS  MAX_TOKENS=$MAX_TOKENS"
@@ -318,6 +326,7 @@ fi
     --no_remap_codebook --hyper_causal_mask \
     $DIGIT_FLAG \
     $UNTIED_FLAG \
+    $BASEPOS_FLAG \
     $WARMSTART_FLAG \
     $HF_REPO_FLAG \
     $AC_FLAG \

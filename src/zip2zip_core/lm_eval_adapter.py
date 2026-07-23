@@ -128,6 +128,12 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
     if train_args.get("untied_hyper_encoder"):
         overrides["tie_hyper_encoder"] = False
         print("[zip2zip-lm-eval] untied hyper-encoder: building separate output encoder")
+    if train_args.get("base_token_positions"):
+        # Behavior flag, no weights: compressed-mode evals must position tokens
+        # in base space exactly as trained; base-mode evals are unaffected
+        # (uncompressed stream, positions == arange either way).
+        overrides["base_token_positions"] = True
+        print("[zip2zip-lm-eval] base-token RoPE positions: enabled from meta.pt")
     if overrides:
         cfg = dataclasses.replace(cfg, **overrides)
 

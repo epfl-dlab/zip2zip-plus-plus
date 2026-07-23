@@ -55,6 +55,9 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
         # untied checkpoints carry a second hyper_output encoder; without this the
         # strict load below fails on unexpected hyper_output.* keys.
         tie_hyper_encoder=not args.get("untied_hyper_encoder", False),
+        # behavior flag (no weights): compressed generation must position tokens
+        # in base space exactly as trained.
+        base_token_positions=bool(args.get("base_token_positions", False)),
         **enc_overrides,
     )
     model = Zip2ZipLlama3Model(cfg).to(device)
