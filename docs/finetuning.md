@@ -295,9 +295,22 @@ RUN_NAME=<name> DISABLE_DIGIT_IDS=1 UNTIED_HYPER_ENCODER=1 BASE_TOKEN_POSITIONS=
   bash scripts/pipeline_ft_eval_rcp.sh
 ```
 
-Experimental until it validates against v0.5-8k at the same budget (success =
-GSM8K flexible clearly above .623/.630 with MC/ppl not regressing; the paired
-decomposition should show the input term shrinking from 6.5pt).
+The v0.6.2 run (2026-07-23, same budget as v0.5-8k, single variable = position
+geometry) VALIDATED the mechanism — the first GSM8K gain of the recipe line:
+flexible 0.623 → **0.650** (+2.7pt; fresh paired re-run 0.647 replicates it),
+strict 0.078 → 0.210, train loss and throughput identical to v0.5 (positions
+are free at runtime). The paired decomposition confirms the effect is exactly
+where designed: the GSM8K input term shrank 6.5 → 4.3pt (base-mode 0.690 vs
+compressed 0.647) while base-mode math stayed flat — the gain is all
+compressed-reading, not weights. The canonical "sprints" corruption is
+structurally fixed (answer 540, previously 180). Cost: a small weights-side MC
+tax — ARC-c acc_norm .561 → .545, HellaSwag .725 → .713, both ≲1.6σ
+individually and mostly weights-term per the decomposition; WinoGrande, ARC-e,
+and wikitext ppl are flat. With the input term now the SMALLER share of the
+remaining 9.5pt gap (4.3 input / 5.2 weights), the next lever should be
+weights-side (`--token_type_loss_weight` is wired and untried). Recipe status:
+pass `BASE_TOKEN_POSITIONS=1` on math-focused runs alongside the v0.5 flags;
+the MC trade is documented above so the choice stays explicit per run.
 
 ## Canonical RCP locations and run conventions
 
