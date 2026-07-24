@@ -59,6 +59,9 @@
 #   TOKEN_TYPE_LOSS_WEIGHT= auxiliary base-vs-hyper type loss weight
 #                     (v0.6.3 recipe, 0.05). 0/off = v0.6.2 behavior. Inherited
 #                     by the train launcher; evals auto-configure from meta.pt.
+#   ZERO_INIT_ENCODER_OUTPUT= set 1 to start the hyper-encoder at exactly zero
+#                     (v0.6.4 recipe — fixes a silent init no-op). Training-only
+#                     (init), so evals need nothing.
 #   FINAL_LIMIT=      per-task sample limit for the FINAL eval (default: full).
 #                     Only for pipeline rehearsals — never for real numbers.
 # Anything else the finetune launcher reads (LR, SEQ_LEN, ...) passes through.

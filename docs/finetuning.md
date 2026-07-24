@@ -342,6 +342,85 @@ not any single significant gain. Recommended champion recipe: v0.6.3
 parsimony is preferred, v0.6.2 alone keeps ~90% of the benefit with one fewer
 knob.
 
+## Hyper-encoder zero-init fix (v0.6.4)
+
+This one is a **bug fix**, not a new idea. The `encoder_residual` design computes
+`hyper_embed = first_token_embed + encoder_out` and zero-initializes the encoder
+output so a hypertoken *starts* as its first base token's embedding, then learns
+a delta. The zero-init only ever touched `proj_out`:
+
+```python
+if name.endswith('proj_out') and isinstance(module, nn.Linear):
+    nn.init.zeros_(module.weight)
+```
+
+…but `proj_out` is built **only when `encoder_dim != model_dim`**. The released
+recipe sets `ENCODER_DIM=3072` on a `dim=3072` model, so `proj_out is None`, the
+loop matched nothing, and the intent was silently never implemented. Every
+v0.1–v0.6.3 run therefore trained from `first_token_embed + a LayerNorm-scaled
+random vector`. Measured on the exact run config (`tests/test_encoder_zero_init.py`
+pins the same fact on a small config):
+
+| config | zero-init fires? | ‖first_token‖ | ‖encoder_out‖ | ratio |
+|---|---|---|---|---|
+| Phi runs (`encoder_dim=3072`) | no | 1.00 | 54.0 | **54×** |
+| old Llama cfg (`encoder_dim=512`) | yes | 1.00 | 0.00 | 0× |
+| Phi + this fix | yes | 1.00 | 0.00 | 0× |
+
+The ratio is `sqrt(dim)` — the final `LayerNorm` forces unit RMS per channel
+while Phi's embeddings are initialized at `dim**-0.5` — so the damage grows with
+model size and is worst exactly for the 3072-wide production model. This is the
+same failure mode already documented for `tok_embeddings` in `configs.py` ("~55x
+too large … ~1500 initial loss"); that instance was fixed, this one survived.
+
+It also explains the transient the v0.6 warm-start tried to treat: initial loss
+is ~70 at step 10 **with or without** warm-start (v0.5 70.2, v0.6 69.6), because
+freezing the LoRA cannot fix a random encoder output. Warm-start was aimed at a
+symptom of this bug.
+
+`ZERO_INIT_ENCODER_OUTPUT=1` (train arg `--zero_init_encoder_output`, config
+`zero_init_encoder_output`) zeroes the final `LayerNorm`'s weight **and** bias
+when no `proj_out` exists, which makes the encoder output exactly zero through
+both the padded and the varlen pooling paths. Properties:
+
+- **Init-only.** No new parameters, no architecture change, `state_dict` keys and
+  shapes are identical to v0.6.3 (pinned by test Z5), so eval, export, and
+  `scripts/inference.py` need *nothing*. It is also why the resume guard treats
+  the flag as **soft**: a resume loads weights from the checkpoint, which
+  overwrites any init, so a mismatch is harmless and only worth a note.
+- **No-op where the original code worked.** With `encoder_dim != model_dim` the
+  `proj_out` branch still runs and the flag changes nothing (test Z3).
+- **Fail-loud.** If the flag is on and neither a `proj_out` nor a final
+  `LayerNorm` exists (e.g. the gated-MLP `fast_hierarchical` composer, which is
+  already identity-initialized), it raises instead of silently doing nothing —
+  the exact failure mode that cost six experiments (test Z7).
+- **Observable.** Training prints `[encoder_zero_init] zeroed={...}` naming the
+  modules it matched; an empty list means the encoder is starting far from the
+  identity.
+- **Escapable.** The zeroed `LayerNorm` weight receives gradient immediately, so
+  the encoder trains normally from step 1 (test Z6).
+
+Note the flag is default-off so the frozen v0.1–v0.6.3 baselines stay exactly
+reproducible and v0.6.4 is a clean single-variable A/B. **If it validates, flip
+it to a code default** — it is a correctness fix, not a preference.
+
+Launch = the v0.6.3 command plus one env var:
+
+```bash
+RUN_NAME=<name> DISABLE_DIGIT_IDS=1 UNTIED_HYPER_ENCODER=1 BASE_TOKEN_POSITIONS=1 \
+  TOKEN_TYPE_LOSS_WEIGHT=0.05 ZERO_INIT_ENCODER_OUTPUT=1 \
+  bash scripts/pipeline_ft_eval_rcp.sh
+```
+
+Experimental until it validates against v0.6.3-8k at the same budget. The
+immediate tell is in the first log lines: step-10 loss should be far below the
+~70 every previous run started at. Success = GSM8K flexible above .652 with
+MC/ppl not regressing; the paired base-mode decomposition then says whether the
+recovered points came from the input term, the weights term, or both. Because
+the control never runs the hyper-encoder (`max_codebook_size=0` gates the path
+off), it never had this handicap — so part of the residual gap to the control may
+simply be this bug.
+
 ## Canonical RCP locations and run conventions
 
 Single source of truth for where things live on the cluster (`$SCRATCH =

@@ -560,6 +560,13 @@ class Zip2ZipLlama3Model(Decoder):
         # meant in pretraining regardless of local compression ratio. Off = one
         # position per compressed token (v0.5 and released-model behavior).
         base_token_positions: bool = False
+        # Guarantee the hyper-encoder emits EXACTLY zero at init, so the first
+        # hypertoken embedding equals its first base token's embedding (the
+        # documented intent of the encoder_residual design). The existing
+        # zero-init only touches proj_out, which does not exist when
+        # encoder_dim == model_dim — see _init_hyper_encoder. Off = the
+        # v0.1-v0.6.3 behavior (encoder starts at ~54x the embedding norm).
+        zero_init_encoder_output: bool = False
         reconstruction_loss_weight: float = 0.0
         token_type_loss_weight: float = (
             0.0  # weight for base/hyper token type prediction head
@@ -620,6 +627,11 @@ class Zip2ZipLlama3Model(Decoder):
         # alongside the embed buffers so base_token_positions can be computed
         # in incremental inference where only codebook UPDATES are visible.
         self._hyper_span_buf: torch.Tensor | None = None
+        # Which module(s) init_weights() zeroed per encoder role, so a zero-init
+        # that silently matches nothing is visible instead of costing six
+        # experiments. Populated by _init_hyper_encoder; plain dict, so it never
+        # reaches the state dict or FSDP.
+        self.zero_init_report: dict[str, list[str]] = {}
 
         # Hyper-encoder(s) for computing hypertoken embeddings. Tied: one encoder
         # serves both the input-embedding and output-logit roles. Untied: a second
@@ -668,11 +680,11 @@ class Zip2ZipLlama3Model(Decoder):
         # Initialize hyper-encoder(s) — same treatment for the tied encoder and,
         # when untied, the output-role encoder (single-variable: untied differs
         # from tied only in having a second encoder, not in init scheme).
-        self._init_hyper_encoder(self.hyper_encoder)
+        self._init_hyper_encoder(self.hyper_encoder, role="hyper_encoder")
         if self.hyper_output is not None:
-            self._init_hyper_encoder(self.hyper_output)
+            self._init_hyper_encoder(self.hyper_output, role="hyper_output")
 
-    def _init_hyper_encoder(self, encoder) -> None:
+    def _init_hyper_encoder(self, encoder, role: str = "hyper_encoder") -> None:
         if hasattr(encoder, 'init_weights'):
             encoder.init_weights()
         else:
@@ -687,10 +699,41 @@ class Zip2ZipLlama3Model(Decoder):
                     module.reset_parameters()
 
         # Zero-init encoder output so initial hyper embedding ≈ first base token
+        zeroed: list[str] = []
         if getattr(self, 'encoder_residual', True):
             for name, module in encoder.named_modules():
                 if name.endswith('proj_out') and isinstance(module, nn.Linear):
                     nn.init.zeros_(module.weight)
+                    zeroed.append(name)
+            # proj_out exists ONLY when encoder_dim != model_dim, so with the
+            # released Phi recipe (encoder_dim == dim == 3072) the loop above
+            # matches nothing and silently leaves the intent unimplemented: the
+            # encoder then starts emitting a LayerNorm-scaled random vector with
+            # ~54x the norm of the embedding it is supposed to nudge, which is
+            # what produced the ~70-150 initial loss in every v0.1-v0.6.3 run.
+            # Zeroing the final LayerNorm (weight AND bias, so the output is
+            # exactly 0 through both the padded and the varlen pooling paths)
+            # restores the intended identity start with no new parameters and no
+            # state-dict change.
+            if not zeroed and self.zip2zip_config.zero_init_encoder_output:
+                tail, prefix = encoder, ""
+                while getattr(tail, "pair_encoder", None) is not None:
+                    tail = tail.pair_encoder
+                    prefix += "pair_encoder."
+                norm = getattr(tail, "norm", None)
+                if not isinstance(norm, nn.LayerNorm):
+                    raise ValueError(
+                        f"zero_init_encoder_output=True but {type(encoder).__name__} "
+                        f"has no proj_out (encoder_dim == model_dim) and no final "
+                        f"LayerNorm to zero, so a zero initial encoder output cannot "
+                        f"be guaranteed. Set encoder_dim != dim, or drop the flag for "
+                        f"this hyper_encoder_type (a gated-MLP composer is already "
+                        f"identity-initialized and does not need it)."
+                    )
+                nn.init.zeros_(norm.weight)
+                nn.init.zeros_(norm.bias)
+                zeroed.append(prefix + "norm")
+        self.zero_init_report[role] = zeroed
 
     def reset_inference_cache(self) -> None:
         """Reset hyper embedding buffers. Call between sequences during inference."""

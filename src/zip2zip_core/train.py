@@ -370,7 +370,12 @@ def validate_resume_args(resume_dir, args):
             "untied_hyper_encoder", "base_token_positions",
             "token_type_loss_weight", "encoder_dim", "encoder_n_layers",
             "encoder_n_heads", "encoder_intermediate_size")
-    soft = ("max_subtokens", "seq_len", "data_dir", "warmstart_steps")
+    # zero_init_encoder_output is deliberately SOFT, unlike the other recipe
+    # flags: it only changes the INITIAL weights, which a resume overwrites from
+    # the checkpoint, so a mismatch on resume is harmless (it matters only for
+    # fresh runs and for --random_weights). A note keeps the provenance visible.
+    soft = ("max_subtokens", "seq_len", "data_dir", "warmstart_steps",
+            "zero_init_encoder_output")
     # Hard keys whose ABSENCE from an old meta.pt has an unambiguous meaning:
     # the flag/objective did not exist, i.e. it was OFF. Treat absence as that
     # default so e.g. resuming a v0.5 lineage with --base_token_positions or a
@@ -599,6 +604,14 @@ def main():
                         help="Use a separate output-role hyper-encoder (reading lm_head "
                              "rows) instead of reusing the input hyper-encoder for logits. "
                              "Matches the released model. Default off = tied (legacy).")
+    parser.add_argument("--zero_init_encoder_output", action="store_true",
+                        help="Make the hyper-encoder emit exactly zero at init, so the "
+                             "first hypertoken embedding equals its first base token's "
+                             "embedding (the encoder_residual design intent). Fixes a "
+                             "silent no-op: the existing zero-init only touches "
+                             "proj_out, which does not exist when encoder_dim == dim "
+                             "(every Phi run), leaving the encoder ~54x too large at "
+                             "step 0. Default off = v0.1-v0.6.3 behavior.")
     parser.add_argument("--base_token_positions", action="store_true",
                         help="RoPE positions follow the uncompressed stream (each token "
                              "sits at the base-space index of its last constituent) "
@@ -808,6 +821,7 @@ def main():
         # to tie_hyper_encoder=False. The adapter applies the same inversion.
         tie_hyper_encoder=not args.untied_hyper_encoder,
         base_token_positions=args.base_token_positions,
+        zero_init_encoder_output=args.zero_init_encoder_output,
         rope=dataclasses.replace(
             config.rope,
             max_seq_len=rope_cache_len(
@@ -837,6 +851,12 @@ def main():
         model.encoder_residual = False
     with torch.no_grad():
         model.init_weights()
+    if rank == 0:
+        # Print what the encoder zero-init actually matched. An empty list means
+        # the encoder starts far from the identity (the v0.1-v0.6.3 state) — the
+        # silent no-op that this reporting exists to make impossible.
+        print(f"[encoder_zero_init] zeroed={model.zero_init_report} "
+              f"(flag={'on' if args.zero_init_encoder_output else 'off'})")
     # Keep params in fp32 on device; FSDP's MixedPrecisionPolicy casts to bf16 for
     # compute and the optimizer runs on the (sharded) fp32 params.
     model = model.to(device=device)
