@@ -254,7 +254,8 @@ def main():
                 base_args = dict(
                     disable_digit_ids=True, max_codebook_size=4096,
                     tokenizer="microsoft/Phi-3.5", untied_hyper_encoder=True,
-                    base_token_positions=True, encoder_dim=3072,
+                    base_token_positions=True, token_type_loss_weight=0.0,
+                    encoder_dim=3072,
                     encoder_n_layers=2, encoder_n_heads=32,
                     encoder_intermediate_size=12288, max_subtokens=4,
                     seq_len=2048, data_dir="/data", warmstart_steps=0,

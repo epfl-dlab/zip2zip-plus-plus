@@ -82,6 +82,7 @@ def _resume_args(**over):
     base = dict(
         disable_digit_ids=True, max_codebook_size=4096, tokenizer="microsoft/Phi-3.5",
         untied_hyper_encoder=True, base_token_positions=False,
+        token_type_loss_weight=0.0,
         encoder_dim=3072, encoder_n_layers=4,
         encoder_n_heads=32, encoder_intermediate_size=12288,
         max_subtokens=4, seq_len=2048, data_dir="/data", warmstart_steps=0,
