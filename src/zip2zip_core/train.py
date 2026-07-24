@@ -367,23 +367,30 @@ def validate_resume_args(resume_dir, args):
         return
     prev = torch.load(meta_path, map_location="cpu", weights_only=False).get("args", {}) or {}
     hard = ("disable_digit_ids", "max_codebook_size", "tokenizer",
-            "untied_hyper_encoder", "base_token_positions", "encoder_dim",
-            "encoder_n_layers", "encoder_n_heads", "encoder_intermediate_size")
+            "untied_hyper_encoder", "base_token_positions",
+            "token_type_loss_weight", "encoder_dim", "encoder_n_layers",
+            "encoder_n_heads", "encoder_intermediate_size")
     soft = ("max_subtokens", "seq_len", "data_dir", "warmstart_steps")
-    # Boolean (store_true) hard flags: a meta.pt written before the flag existed
-    # unambiguously means the behavior was OFF — treat absence as False so that
-    # e.g. resuming a v0.5 lineage with --base_token_positions is caught instead
-    # of silently changing position geometry mid-lineage.
-    bool_hard = ("disable_digit_ids", "untied_hyper_encoder", "base_token_positions")
+    # Hard keys whose ABSENCE from an old meta.pt has an unambiguous meaning:
+    # the flag/objective did not exist, i.e. it was OFF. Treat absence as that
+    # default so e.g. resuming a v0.5 lineage with --base_token_positions or a
+    # fresh --token_type_loss_weight is caught instead of silently changing
+    # semantics mid-lineage.
+    absent_defaults = {
+        "disable_digit_ids": False,
+        "untied_hyper_encoder": False,
+        "base_token_positions": False,
+        "token_type_loss_weight": 0.0,
+    }
     # Legacy metas record None for the encoder_* args (they predate the
     # effective-value resolution at startup): unknown is not a conflict there,
     # and the strict checkpoint load backstops real architecture mismatches.
     # For every other hard key a recorded None IS a difference worth stopping on.
     mismatches = [
-        (k, prev.get(k, False if k in bool_hard else None), getattr(args, k))
+        (k, prev.get(k, absent_defaults.get(k)), getattr(args, k))
         for k in hard
-        if (k in prev or k in bool_hard)
-        and prev.get(k, False if k in bool_hard else None) != getattr(args, k)
+        if (k in prev or k in absent_defaults)
+        and prev.get(k, absent_defaults.get(k)) != getattr(args, k)
         and not (k.startswith("encoder_") and prev.get(k) is None)
     ]
     if mismatches and not args.allow_resume_mismatch:

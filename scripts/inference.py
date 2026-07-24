@@ -58,6 +58,9 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
         # behavior flag (no weights): compressed generation must position tokens
         # in base space exactly as trained.
         base_token_positions=bool(args.get("base_token_positions", False)),
+        # builds the (eval-unused) token_type_head so its checkpoint weights
+        # have a home and the strict load below does not fail on them.
+        token_type_loss_weight=float(args.get("token_type_loss_weight") or 0.0),
         **enc_overrides,
     )
     model = Zip2ZipLlama3Model(cfg).to(device)

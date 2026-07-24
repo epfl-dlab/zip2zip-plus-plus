@@ -56,6 +56,9 @@
 #   BASE_TOKEN_POSITIONS= set 1 for uncompressed-stream RoPE positions
 #                     (v0.6.2 recipe). Inherited by the train launcher; evals
 #                     auto-configure from meta.pt like the untied flag.
+#   TOKEN_TYPE_LOSS_WEIGHT= auxiliary base-vs-hyper type loss weight
+#                     (v0.6.3 recipe, 0.05). 0/off = v0.6.2 behavior. Inherited
+#                     by the train launcher; evals auto-configure from meta.pt.
 #   FINAL_LIMIT=      per-task sample limit for the FINAL eval (default: full).
 #                     Only for pipeline rehearsals — never for real numbers.
 # Anything else the finetune launcher reads (LR, SEQ_LEN, ...) passes through.

@@ -312,6 +312,22 @@ weights-side (`--token_type_loss_weight` is wired and untried). Recipe status:
 pass `BASE_TOKEN_POSITIONS=1` on math-focused runs alongside the v0.5 flags;
 the MC trade is documented above so the choice stays explicit per run.
 
+## Token-type auxiliary loss (experimental, v0.6.3)
+
+Attacks the WEIGHTS term, which the v0.6.2 decomposition left as the larger
+share of the remaining gap (5.2pt weights vs 4.3pt input). A small head on the
+final hidden state predicts whether the NEXT token is a base token or a
+hypertoken (BCE, masked exactly like the LM loss, weighted into the backward
+loss). The machinery has existed since early on (`--token_type_loss_weight`,
+`token_type_head`, metrics `type_loss=`/`type_acc=` in the step log) but has
+never been trained with. `TOKEN_TYPE_LOSS_WEIGHT=0.05` on top of the v0.6.2
+recipe; 0 (default) builds no head and is bit-identical to v0.6.2. The head's
+weights ride the checkpoint (eval loaders rebuild it from meta.pt; it is
+unused at eval), and `token_type_loss_weight` is a resume-hard key — legacy
+metas without it count as 0. Experimental until it validates against
+v0.6.2-8k at the same budget (success = GSM8K holding ≥ .65 with the MC tax
+recovered, i.e. ARC-c/HellaSwag back toward .561/.725).
+
 ## Canonical RCP locations and run conventions
 
 Single source of truth for where things live on the cluster (`$SCRATCH =

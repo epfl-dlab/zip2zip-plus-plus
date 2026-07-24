@@ -123,6 +123,11 @@ BASEPOS_FLAG=""
 if [ -n "$BASE_TOKEN_POSITIONS" ] && [ "$BASE_TOKEN_POSITIONS" != "0" ]; then
     BASEPOS_FLAG="--base_token_positions"
 fi
+# TOKEN_TYPE_LOSS_WEIGHT=w: auxiliary base-vs-hyper next-token type loss
+# (v0.6.3 recipe, w=0.05). 0 = off (no head, v0.6.2 behavior). Always passed
+# explicitly so meta.pt records the effective value; eval needs no env (the
+# adapter rebuilds the head from meta.pt, the head is unused at eval).
+TOKEN_TYPE_LOSS_WEIGHT=${TOKEN_TYPE_LOSS_WEIGHT:-0}
 # WARMSTART_STEPS=N: freeze decoder-LoRA for the first N steps (hyper-encoder
 # only), then unfreeze. Training-only; eval unaffected. Empty/0 = off.
 WARMSTART_STEPS=${WARMSTART_STEPS:-}
@@ -285,7 +290,7 @@ echo "NUM_GPUS=$NUM_GPUS  MODEL=$MODEL_CONFIG  MAX_SUBTOKENS=$MAX_SUBTOKENS"
 echo "INIT_FROM_HF=$INIT_FROM_HF  TOKENIZER=$TOKENIZER"
 echo "FREEZE_DECODER=$FREEZE_DECODER  LORA_RANK=$LORA_RANK  LORA_ALPHA=$LORA_ALPHA"
 echo "ENCODER: type=$HYPER_ENCODER_TYPE dim=$ENCODER_DIM layers=$ENCODER_N_LAYERS heads=$ENCODER_N_HEADS inter=$ENCODER_INTERMEDIATE_SIZE"
-echo "DIGIT_FLAG='$DIGIT_FLAG'  UNTIED_FLAG='$UNTIED_FLAG'  WARMSTART_FLAG='$WARMSTART_FLAG'  BASEPOS_FLAG='$BASEPOS_FLAG'"
+echo "DIGIT_FLAG='$DIGIT_FLAG'  UNTIED_FLAG='$UNTIED_FLAG'  WARMSTART_FLAG='$WARMSTART_FLAG'  BASEPOS_FLAG='$BASEPOS_FLAG'  TOKEN_TYPE_LOSS_WEIGHT=$TOKEN_TYPE_LOSS_WEIGHT"
 echo "CODEBOOK(active)=$MAX_ACTIVE_CODEBOOK_SIZE  LR=$LR->$MIN_LR warmup=$WARMUP_STEPS wd=$WEIGHT_DECAY beta2=$ADAM_BETA2"
 echo "SEQ_LEN=$SEQ_LEN  GRAD_ACCUM=$GRAD_ACCUM  TOKENS/STEP=$TOKENS_PER_STEP (released: 32768)"
 echo "STEPS=$STEPS  MAX_TOKENS=$MAX_TOKENS"
@@ -328,6 +333,7 @@ fi
     $UNTIED_FLAG \
     $BASEPOS_FLAG \
     $WARMSTART_FLAG \
+    --token_type_loss_weight "$TOKEN_TYPE_LOSS_WEIGHT" \
     $HF_REPO_FLAG \
     $AC_FLAG \
     $DISABLE_VARLEN_FLAG \
