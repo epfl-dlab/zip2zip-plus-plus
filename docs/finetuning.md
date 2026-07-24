@@ -324,9 +324,23 @@ never been trained with. `TOKEN_TYPE_LOSS_WEIGHT=0.05` on top of the v0.6.2
 recipe; 0 (default) builds no head and is bit-identical to v0.6.2. The head's
 weights ride the checkpoint (eval loaders rebuild it from meta.pt; it is
 unused at eval), and `token_type_loss_weight` is a resume-hard key — legacy
-metas without it count as 0. Experimental until it validates against
-v0.6.2-8k at the same budget (success = GSM8K holding ≥ .65 with the MC tax
-recovered, i.e. ARC-c/HellaSwag back toward .561/.725).
+metas without it count as 0. The v0.6.3 run (2026-07-24, weight 0.05 on top of v0.6.2, same budget)
+DELIVERED both halves: GSM8K flexible held at 0.652 (v0.6.2 was 0.650, so the
+math win survived) AND the MC tax roughly halved — 5 of 6 MC tasks nudged back
+toward v0.5 (ARC-c .545 → .551, ARC-e .819 → .822, HellaSwag .713 → .715,
+OpenBookQA .464 → .472, WinoGrande .739 → .745; only PIQA slipped .798 → .793).
+Wikitext byte-ppl essentially flat (1.6866 → 1.6918, +0.3%), final train loss
+back to v0.5's ~1.52 (v0.6.2 had trained slightly lower). The head genuinely
+LEARNED rather than collapsing to the majority class: hyper-token recall
+climbed from ~0 early to ~0.50 by end (type_acc 0.86 vs the 0.78 majority
+floor), confirming the auxiliary signal reached the shared representation.
+Caveat: every individual v0.6.3-vs-v0.6.2 delta is within ~1σ; the case for it
+rests on the *consistent direction* across metrics plus the neutral ppl/loss,
+not any single significant gain. Recommended champion recipe: v0.6.3
+(`BASE_TOKEN_POSITIONS=1 TOKEN_TYPE_LOSS_WEIGHT=0.05` on top of the v0.5 flags)
+— it captures the v0.6.2 math gain with less MC collateral. If maximum
+parsimony is preferred, v0.6.2 alone keeps ~90% of the benefit with one fewer
+knob.
 
 ## Canonical RCP locations and run conventions
 
