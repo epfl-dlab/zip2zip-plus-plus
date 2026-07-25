@@ -29,6 +29,11 @@
 #
 # Env vars:
 #   RUN_NAME=...      (required) also the W&B run name — make it exhaustive
+#   RECIPE=v0.6.4     (recommended) the named recipe: fills in every recipe env
+#                     var you did not set yourself. THIS IS THE CURRENT STANDARD
+#                     RECIPE — see `python scripts/recipes.py --list`. Explicit
+#                     env vars still win, so RECIPE=v0.6.4 ENCODER_N_LAYERS=4 is
+#                     a clean single-variable experiment on top of it.
 #   DATA_DIR=...      (default: $Z2Z_SCRATCH/datasets/phi-1B-sft-8shards-eosfix)
 #   STEPS=8000        total steps (forwarded to the finetune launcher)
 #   SMOKE_EVERY=1000  smoke-eval cadence in steps
@@ -80,6 +85,18 @@ export TOKENIZERS_PARALLELISM=false
 
 PROJECT_DIR=$Z2Z_SCRATCH/code/zip2zip-core
 RUN_NAME=${RUN_NAME:?Must set RUN_NAME (also becomes the W&B run name)}
+
+# Resolve a named recipe HERE, before anything below reads these variables: the
+# digit-protection preflight and every eval phase consume them in THIS process,
+# and the finetune launcher (a child) inherits them. An explicit env var always
+# wins; resolving is idempotent, so the launcher re-resolving is harmless.
+RECIPE=${RECIPE:-}
+if [ -n "$RECIPE" ]; then
+    _recipe_env=$(python "$PROJECT_DIR/scripts/recipes.py" "$RECIPE") || exit 1
+    eval "$_recipe_env"
+    unset _recipe_env
+fi
+export RECIPE
 export DATA_DIR=${DATA_DIR:-$Z2Z_SCRATCH/datasets/phi-1B-sft-8shards-eosfix}
 export STEPS=${STEPS:-8000}
 SMOKE_EVERY=${SMOKE_EVERY:-1000}
@@ -110,6 +127,7 @@ export RUN_NAME
 {
 echo "=== zip2zip finetune->eval pipeline ==="
 echo "  RUN_NAME:    $RUN_NAME"
+echo "  RECIPE:      ${RECIPE:-<none, explicit env only>}"
 echo "  OUTPUT_DIR:  $OUTPUT_DIR"
 echo "  DATA_DIR:    $DATA_DIR"
 echo "  STEPS:       $STEPS  SMOKE_EVERY: $SMOKE_EVERY  SMOKE_LIMIT: $SMOKE_LIMIT"

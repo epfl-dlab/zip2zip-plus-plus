@@ -82,6 +82,20 @@ if [ ! -x .venv/bin/python ]; then
 fi
 PYTHON=$PROJECT_DIR/.venv/bin/python
 
+# ---------- named recipe (optional) ----------
+# RECIPE=v0.6.4 fills in every recipe env var you did NOT set yourself, so the
+# canonical five-lever recipe is one word instead of five flags. An explicit env
+# var always wins (including `0`/empty = off), so single-variable experiments
+# stay trivial: RECIPE=v0.6.4 ENCODER_N_LAYERS=4. Resolving is idempotent, so it
+# does not matter that pipeline_ft_eval_rcp.sh already resolved it before calling
+# this script. See scripts/recipes.py (--list, --show <name>).
+RECIPE=${RECIPE:-}
+if [ -n "$RECIPE" ]; then
+    _recipe_env=$("$PYTHON" "$PROJECT_DIR/scripts/recipes.py" "$RECIPE") || exit 1
+    eval "$_recipe_env"
+    unset _recipe_env
+fi
+
 # ---------- config (defaults = faithful released recipe; override via env) ----------
 NUM_GPUS=${NUM_GPUS:-$(nvidia-smi -L | wc -l | tr -d ' ')}
 
@@ -300,6 +314,7 @@ echo "NUM_GPUS=$NUM_GPUS  MODEL=$MODEL_CONFIG  MAX_SUBTOKENS=$MAX_SUBTOKENS"
 echo "INIT_FROM_HF=$INIT_FROM_HF  TOKENIZER=$TOKENIZER"
 echo "FREEZE_DECODER=$FREEZE_DECODER  LORA_RANK=$LORA_RANK  LORA_ALPHA=$LORA_ALPHA"
 echo "ENCODER: type=$HYPER_ENCODER_TYPE dim=$ENCODER_DIM layers=$ENCODER_N_LAYERS heads=$ENCODER_N_HEADS inter=$ENCODER_INTERMEDIATE_SIZE"
+echo "RECIPE=${RECIPE:-<none, explicit env only>}"
 echo "DIGIT_FLAG='$DIGIT_FLAG'  UNTIED_FLAG='$UNTIED_FLAG'  WARMSTART_FLAG='$WARMSTART_FLAG'  BASEPOS_FLAG='$BASEPOS_FLAG'  ZEROINIT_FLAG='$ZEROINIT_FLAG'  TOKEN_TYPE_LOSS_WEIGHT=$TOKEN_TYPE_LOSS_WEIGHT"
 echo "CODEBOOK(active)=$MAX_ACTIVE_CODEBOOK_SIZE  LR=$LR->$MIN_LR warmup=$WARMUP_STEPS wd=$WEIGHT_DECAY beta2=$ADAM_BETA2"
 echo "SEQ_LEN=$SEQ_LEN  GRAD_ACCUM=$GRAD_ACCUM  TOKENS/STEP=$TOKENS_PER_STEP (released: 32768)"

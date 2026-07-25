@@ -1,5 +1,57 @@
 # Finetuning from Pretrained Weights
 
+## Current standard recipe: v0.6.4
+
+**Launch every new finetune with `RECIPE=v0.6.4`.** One name selects the whole
+recipe, so there is nothing to remember and nothing to forget:
+
+```bash
+runai submit --name ft-<short-name> \
+  --image ghcr.io/jkminder/dlab-runai-images/pytorch:master \
+  --gpu 4 --cpu 16 --memory 128Gi \
+  --pvc dlab-scratch:/mnt --large-shm --node-pools h100 \
+  --environment WANDB_API_KEY=$WANDB_API_KEY \
+  --environment RUN_NAME=andrea-z2z-phi35-4B-<change>-1BData-<version>-Zip2zipCore \
+  --environment RECIPE=v0.6.4 \
+  -- "bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
+```
+
+v0.6.4 resolves to these five levers — each one a validated win, each documented
+in its own section below:
+
+| lever | why it is in the recipe | added by |
+|---|---|---|
+| `DISABLE_DIGIT_IDS=1` | digits never LZW-merge; +23pt GSM8K, the single biggest jump | v0.4 |
+| `UNTIED_HYPER_ENCODER=1` | separate output-role encoder on `lm_head`; matches the released architecture | v0.5 |
+| `BASE_TOKEN_POSITIONS=1` | RoPE positions follow the uncompressed stream; +2.7pt GSM8K | v0.6.2 |
+| `TOKEN_TYPE_LOSS_WEIGHT=0.05` | auxiliary base-vs-hyper objective; recovered v0.6.2's MC cost | v0.6.3 |
+| `ZERO_INIT_ENCODER_OUTPUT=1` | encoder starts at the identity; fixes a silent init no-op | v0.6.4 |
+
+**None of the five is a code default, on purpose.** Every lever ships default-off
+so the frozen v0.1–v0.6.x baselines stay bit-reproducible and every experiment is
+a clean single-variable A/B. The recipe *name* is what carries the defaults, which
+is why you should always pass `RECIPE=` rather than the individual flags.
+
+`scripts/recipes.py` is the single source of truth (stdlib-only, no venv needed):
+
+```bash
+python scripts/recipes.py --list             # every recipe, with status
+python scripts/recipes.py --show v0.6.4      # what it resolves to, and which version added each lever
+python scripts/recipes.py --identify <ckpt>  # which recipe an existing checkpoint was trained with
+```
+
+Three things worth knowing about how it behaves:
+
+- **An explicit env var always wins**, including `0` or empty meaning "off". So a
+  single-variable experiment on top of the standard recipe is
+  `RECIPE=v0.6.4 ENCODER_N_LAYERS=4` — no need to restate the other five.
+- **Older recipes are reproducible by name** (`RECIPE=v0.5`). Selecting a
+  superseded recipe prints a note; selecting one of the two measured *negative*
+  results (`v0.6` warm-start, `v0.6.1` deeper encoder) prints a loud warning.
+- **An unknown name is a fatal error**, never a silent fallback to "no levers".
+  Both launchers print the resolved `RECIPE=` in their banner, and `meta.pt`
+  records every resolved flag, so a checkpoint's recipe is always recoverable.
+
 ## Overview
 
 zip2zip-core supports finetuning from existing HuggingFace Llama checkpoints. The decoder weights are loaded from the pretrained model, while the hyper-encoder and other zip2zip-specific components are randomly initialized and trained from scratch.
