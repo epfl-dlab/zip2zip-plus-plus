@@ -92,9 +92,14 @@ RUN_NAME=${RUN_NAME:?Must set RUN_NAME (also becomes the W&B run name)}
 # wins; resolving is idempotent, so the launcher re-resolving is harmless.
 RECIPE=${RECIPE:-}
 if [ -n "$RECIPE" ]; then
-    _recipe_env=$(python "$PROJECT_DIR/scripts/recipes.py" "$RECIPE") || exit 1
+    # recipes.py is stdlib-only, so any interpreter works. Prefer one on PATH
+    # (the job container has it) and fall back to the repo venv, which is the
+    # only python present in some shells.
+    _py=$(command -v python3 || command -v python || echo "$PROJECT_DIR/.venv/bin/python")
+    [ -x "$_py" ] || { echo "FATAL: no python found to resolve RECIPE=$RECIPE" >&2; exit 1; }
+    _recipe_env=$("$_py" "$PROJECT_DIR/scripts/recipes.py" "$RECIPE") || exit 1
     eval "$_recipe_env"
-    unset _recipe_env
+    unset _recipe_env _py
 fi
 export RECIPE
 export DATA_DIR=${DATA_DIR:-$Z2Z_SCRATCH/datasets/phi-1B-sft-8shards-eosfix}
