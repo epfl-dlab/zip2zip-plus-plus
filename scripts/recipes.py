@@ -230,26 +230,66 @@ def expected_args(name):
     return out
 
 
+_OFF_BY_ARG = {arg: off for (arg, _kind, off) in ENV_KEYS.values()}
+
+
+def resolve_data(name):
+    """The dataset a recipe implies, inherited from the nearest ancestor that
+    declares one (informational: recipes never export DATA_DIR, since the path is
+    cluster-specific)."""
+    hint = None
+    for step in lineage(name):
+        if RECIPES[step].get("data"):
+            hint = RECIPES[step]["data"]
+    return hint
+
+
+def _effective(arg, train_args):
+    """What a checkpoint effectively used for one lever.
+
+    A key MISSING from an old meta.pt means the lever did not exist when that run
+    was trained, i.e. it was off — not "unknown". Treating it as unknown would let
+    a v0.4 checkpoint match v0.5 (whose only lever, untied, postdates it).
+    encoder_n_layers is also recorded as None by runs predating its normalization.
+    """
+    value = train_args.get(arg, None)
+    return _OFF_BY_ARG[arg] if value is None else value
+
+
 def identify(train_args):
     """Name the recipe a checkpoint was trained with.
 
-    Returns (name, {}) on an exact match, else (closest_name, diffs) where diffs
-    maps arg -> (recipe_value, checkpoint_value). Only the args in ENV_KEYS are
-    considered — LR, data, budget and the rest are NOT checked.
+    Returns (matches, diffs):
+      * matches = every recipe whose levers match EXACTLY. Normally one. It is
+        legitimately two when recipes differ only by dataset and no usable
+        data_dir was recorded (v0.2 vs v0.3) — reported rather than guessed.
+      * diffs   = {} whenever matches is non-empty; otherwise the closest
+        recipe's arg -> (recipe_value, checkpoint_value).
+    Only the levers in ENV_KEYS are compared: LR, budget and the rest are NOT.
     """
-    best, best_diffs = None, None
+    exact, best, best_diffs = [], None, None
     for name in RECIPES:
-        exp = expected_args(name)
         diffs = {
-            arg: (want, train_args.get(arg))
-            for arg, want in exp.items()
-            if arg in train_args and train_args[arg] != want
+            arg: (want, train_args.get(arg, "<absent>"))
+            for arg, want in expected_args(name).items()
+            if _effective(arg, train_args) != want
         }
         if not diffs:
-            return name, {}
-        if best_diffs is None or len(diffs) < len(best_diffs):
+            exact.append(name)
+        elif best_diffs is None or len(diffs) < len(best_diffs):
             best, best_diffs = name, diffs
-    return best, best_diffs
+
+    if len(exact) > 1:
+        # Tie-break on the recorded dataset, the only thing separating them.
+        recorded = os.path.basename(str(train_args.get("data_dir") or "").rstrip("/"))
+        if recorded:
+            narrowed = [n for n in exact
+                        if os.path.basename(str(resolve_data(n) or "")) == recorded]
+            if narrowed:
+                exact = narrowed
+    if exact:
+        return exact, {}
+    return ([best] if best else []), (best_diffs or {})
 
 
 def _cmd_list():
@@ -286,11 +326,18 @@ def _cmd_identify(ckpt_dir):
     if not os.path.exists(meta):
         raise RecipeError(f"no meta.pt in {ckpt_dir}")
     args = torch.load(meta, map_location="cpu", weights_only=False).get("args", {}) or {}
-    name, diffs = identify(args)
-    if not diffs:
-        print(f"{name}" + ("  (current)" if name == CURRENT else ""))
+    matches, diffs = identify(args)
+    if matches and not diffs:
+        if len(matches) == 1:
+            name = matches[0]
+            print(f"{name}" + ("  (current)" if name == CURRENT else ""))
+        else:
+            print(" or ".join(matches)
+                  + "  (identical levers; they differ only by dataset, and this"
+                    " checkpoint's data_dir does not match either hint)")
         return
-    print(f"custom — closest is {name}, differing in:")
+    closest = matches[0] if matches else "?"
+    print(f"custom — closest is {closest}, differing in:")
     for arg, (want, got) in sorted(diffs.items()):
         print(f"  {arg}: recipe {want!r} vs checkpoint {got!r}")
 

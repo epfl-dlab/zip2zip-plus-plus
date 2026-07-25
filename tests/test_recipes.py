@@ -153,15 +153,44 @@ def main():
           neg.returncode == 0 and "WARNING" in neg.stderr and "WARMSTART_STEPS" in neg.stdout,
           "a measured-negative recipe still resolves, loudly")
 
-    # ---- R7: identify() round-trip ----
-    name, diffs = R.identify(R.expected_args("v0.6.4"))
-    check("R7_identify_roundtrips_current", name == "v0.6.4" and not diffs,
-          f"-> {name}, diffs={diffs}")
+    # ---- R7: identify() round-trip, for EVERY recipe ----
+    wrong = []
+    for name in R.RECIPES:
+        args = dict(R.expected_args(name))
+        hint = R.resolve_data(name)
+        if hint:
+            args["data_dir"] = hint
+        matches, diffs = R.identify(args)
+        if matches != [name] or diffs:
+            wrong.append((name, matches, sorted(diffs)))
+    check("R7_identify_roundtrips_every_recipe", not wrong,
+          f"all {len(R.RECIPES)} recipes map back to themselves"
+          if not wrong else f"wrong={wrong}")
+
+    # absent keys must count as OFF: a v0.4-era checkpoint (recorded before the
+    # untied/basepos/zeroinit flags existed) must NOT also match v0.5+.
+    v04_era = {"disable_digit_ids": True, "token_type_loss_weight": 0.0,
+               "data_dir": R.resolve_data("v0.4")}
+    matches, _ = R.identify(v04_era)
+    check("R7_absent_keys_count_as_off", matches == ["v0.4"],
+          f"v0.4-era args (newer flags absent) -> {matches}")
+
+    # v0.2 and v0.3 have identical levers; only the dataset separates them
+    check("R7_data_breaks_the_v02_v03_tie",
+          R.identify(dict(R.expected_args("v0.3"),
+                          data_dir="/x/phi-1B-sft-8shards-mathchat"))[0] == ["v0.3"]
+          and R.identify(dict(R.expected_args("v0.2"),
+                              data_dir="/x/phi-1B-sft-8shards-eosfix"))[0] == ["v0.2"],
+          "same levers, disambiguated by the recorded data_dir")
+    ambiguous, _ = R.identify(R.expected_args("v0.2"))  # no data_dir recorded
+    check("R7_ambiguity_is_reported_not_guessed",
+          sorted(ambiguous) == ["v0.2", "v0.3"],
+          f"without data_dir -> {sorted(ambiguous)} (both, honestly)")
+
     off = dict(R.expected_args("v0.6.4"), encoder_n_layers=4)
-    name2, diffs2 = R.identify(off)
+    _, diffs2 = R.identify(off)
     check("R7_identify_flags_off_recipe_checkpoint",
-          "encoder_n_layers" in diffs2,
-          f"closest={name2}, diffs={sorted(diffs2)}")
+          "encoder_n_layers" in diffs2, f"diffs={sorted(diffs2)}")
 
     # ---- R8: the docs cannot silently disagree with the code ----
     docs = open(DOCS).read()
