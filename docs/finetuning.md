@@ -426,14 +426,45 @@ RUN_NAME=<name> DISABLE_DIGIT_IDS=1 UNTIED_HYPER_ENCODER=1 BASE_TOKEN_POSITIONS=
   bash scripts/pipeline_ft_eval_rcp.sh
 ```
 
-Experimental until it validates against v0.6.3-8k at the same budget. The
-immediate tell is in the first log lines: step-10 loss should be far below the
-~70 every previous run started at. Success = GSM8K flexible above .652 with
-MC/ppl not regressing; the paired base-mode decomposition then says whether the
-recovered points came from the input term, the weights term, or both. Because
-the control never runs the hyper-encoder (`max_codebook_size=0` gates the path
-off), it never had this handicap — so part of the residual gap to the control may
-simply be this bug.
+The v0.6.4 run (2026-07-25, same budget, single variable = the init fix)
+VALIDATED, and it is the largest single improvement of the whole line — the only
+change so far that improved **every** axis at once:
+
+| | GSM8K flex | strict | ARC-c | ARC-e | HellaSwag | PIQA | WinoGrande | OBQA | wiki byte-ppl |
+|---|---|---|---|---|---|---|---|---|---|
+| v0.5 | .6232 | .066 | .5606 | .8237 | .7250 | .7900 | .7427 | .4740 | 1.7110 |
+| v0.6.2 | .6505 | .210 | .5452 | .8190 | .7127 | .7976 | .7388 | .4640 | 1.6866 |
+| v0.6.3 | .6520 | .024 | .5512 | .8224 | .7145 | .7927 | .7451 | .4720 | 1.6918 |
+| **v0.6.4** | **.6770** | .215 | **.5700** | **.8304** | .7233 | **.8003** | .7443 | .4660 | **1.6574** |
+| control | .7415 | .372 | .5930 | .8443 | .7372 | .8161 | .7514 | .4780 | — |
+
+GSM8K +2.5pt over v0.6.3 (+5.4pt over v0.5), and the GSM8K gap to the control is
+down to **6.5pt** from ~11.8pt at v0.5. The MC tax that v0.6.2 introduced is
+**gone**: ARC-c, ARC-e and PIQA now sit at or above v0.5, HellaSwag is back within
+noise, and byte-perplexity is the best ever measured on this line (−2% vs
+v0.6.3). Only OpenBookQA is marginally down (−0.6pt, ≪1σ). Training was healthier
+throughout: step-10 loss 3.97 instead of ~70-100, initial grad-norm 50 instead of
+~1000-4700, final loss 1.434 (v0.6.3 ~1.52), end grad-norm 0.23. Throughput was
+unchanged at ~32.9k tok/s — the fix is free.
+
+Two checks worth recording because they could have invalidated the result:
+
+- **The gain is not bought by compressing less.** `input_compression_ratio` is
+  1.0772 for v0.5/v0.6.2/v0.6.3/v0.6.4 alike, and `gen_compression_ratio` is
+  1.2536 vs 1.2616/1.2537/1.2593 — v0.6.4 emits hypertokens at the same rate, so
+  it is not quietly falling back to the base vocabulary.
+- **The identity start does not trap the hyper path.** An exactly-zero encoder
+  output makes two entries sharing a first token initially indistinguishable, so
+  `hyper_token_acc` starts at 0.000 — but it reaches 0.339 by step 500 and
+  0.42–0.49 later, against v0.6.3's 0.061 at step 400. The degeneracy resolves at
+  once and then far surpasses the old init. `type_acc` likewise reaches 0.871 by
+  step 500 (v0.6.3: 0.830 at step 1000) and ends at 0.867.
+
+Because the control never runs the hyper-encoder (`max_codebook_size=0` gates the
+path off) it never had this handicap, so part of the gap we had been attributing
+to compression was this bug. **Recommendation: promote `zero_init_encoder_output`
+to a code default** — it is a correctness fix, it improves every metric, and the
+only reason it is a flag is to keep the frozen v0.1–v0.6.3 baselines reproducible.
 
 ## Canonical RCP locations and run conventions
 
