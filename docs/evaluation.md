@@ -149,6 +149,29 @@ encoder` — same self-healing pattern: it rebuilds the untied model from the
 checkpoint's meta.pt and hard-fails if the `hyper_output.*` weights are missing,
 so an untied checkpoint can never be silently scored as tied.
 
+Two more meta.pt-driven lines, both behavior-only settings that no state-dict key
+could restore:
+
+- `base-token RoPE positions: enabled from meta.pt` — for a v0.6.2+ checkpoint
+  (`BASE_TOKEN_POSITIONS=1`). Expected on every compressed eval of such a
+  checkpoint; its absence means the eval positioned tokens by compressed index
+  instead of base index, i.e. a geometry the checkpoint never trained on. Base-mode
+  evals are unaffected either way (an uncompressed stream is `arange` regardless).
+- `hyper-encoder residual: disabled from meta.pt` — for a checkpoint trained with
+  `NO_ENCODER_RESIDUAL=1` (an ablation; no production run uses it). This is the one
+  line that appears only in the *non-default* case, so its absence is normal and
+  healthy — do not grep for it expecting a hit. It exists because the residual is a
+  plain runtime attribute with no weight signature: before it was restored from
+  meta.pt, a no-residual checkpoint was silently scored *with* the residual, which
+  changes the composed hypertoken embedding by exactly the first-token term.
+  `scripts/inference.py` logs the same thing as `[inference] hyper-encoder
+  residual: disabled from meta.pt`.
+
+The v0.6.4 encoder zero-init (`ZERO_INIT_ENCODER_OUTPUT=1`) deliberately has **no**
+eval health line: it only changes the initial weights, which the checkpoint load
+overwrites, so it cannot affect eval. Its counterpart lives in the *training* log
+as `[encoder_zero_init] zeroed={...}`.
+
 Generation-mode runs should show `gen_compression_ratio ≈ 1.4` (a healthy model
 emits hyper-tokens; ~1.0 means it never does). Before any full eval of a new
 checkpoint, run the 15-minute sanity gate `scripts/diagnose_ckpt_rcp.sh` (train-style

@@ -23,19 +23,27 @@ Invariants proven:
       untouched.
   Z4  untied: BOTH encoders are zeroed (report carries both roles), and the
       output-role encoder satisfies the same guarantee.
-  Z5  state_dict keys and shapes are identical flag on vs off — the fix is
-      init-only, so eval/export/inference need no changes.
-  Z6  the zero is escapable: one backward puts nonzero grad on the zeroed
-      LayerNorm weight, so the encoder is not permanently dead.
+  Z5  state_dict keys and shapes are identical flag on vs off, and every tensor
+      except the intended output-gate weights is bit-identical.
+  Z6  the zero is escapable: the first backward trains only the zeroed output
+      gate; after one update opens it, the next backward reaches upstream
+      encoder parameters.
   Z7  fail-loud: an encoder type with neither proj_out nor a final LayerNorm
       raises instead of silently not applying (the original bug's failure mode).
   Z8  the nested-composer type (hierarchical) is covered via pair_encoder.norm.
-  Z9  encoder_residual=False: the flag does nothing (zero output with no
-      residual would mean identically-zero hypertoken embeddings).
-  Z10 the resume guard treats the flag as SOFT (init is overwritten by the
-      checkpoint on resume, so a mismatch must not hard-error).
+  Z9  the model-level guard does not zero an encoder used without the residual.
+  Z10 the CLI rejects zero-init together with --no_encoder_residual.
+  Z11 zero-init and residual mode are hard resume-lineage keys, including when
+      absent from legacy meta.pt (absence means false).
+  Z12 the real lm-eval checkpoint loader restores residual mode from meta.pt,
+      and the setting changes encoder composition by exactly the residual term.
+  Z13 the compressed-generation checkpoint loader restores the same flag.
 """
 import dataclasses
+import contextlib
+import importlib
+import importlib.util
+import io
 import os
 import sys
 import tempfile
@@ -105,6 +113,39 @@ def encoder_out_norm(model, cfg, dev):
     return (composed - first).norm(dim=-1).mean().item(), first.norm(dim=-1).mean().item()
 
 
+def import_eval_adapter():
+    """Import the real adapter while stubbing only absent lm-eval registration APIs."""
+    created = []
+    try:
+        return importlib.import_module("zip2zip_core.lm_eval_adapter"), created
+    except ModuleNotFoundError as e:
+        if e.name != "lm_eval":
+            raise
+
+    lm_eval = types.ModuleType("lm_eval")
+    lm_eval.__path__ = []
+    api = types.ModuleType("lm_eval.api")
+    api.__path__ = []
+    api_model = types.ModuleType("lm_eval.api.model")
+    api_registry = types.ModuleType("lm_eval.api.registry")
+    utils = types.ModuleType("lm_eval.utils")
+    api_model.LM = object
+    api_registry.register_model = lambda _name: lambda cls: cls
+    utils.get_rolling_token_windows = lambda *args, **kwargs: ()
+    utils.make_disjoint_window = lambda window: window
+    stubs = {
+        "lm_eval": lm_eval,
+        "lm_eval.api": api,
+        "lm_eval.api.model": api_model,
+        "lm_eval.api.registry": api_registry,
+        "lm_eval.utils": utils,
+    }
+    for name, module in stubs.items():
+        sys.modules[name] = module
+        created.append(name)
+    return importlib.import_module("zip2zip_core.lm_eval_adapter"), created
+
+
 def main():
     results, check = make_harness()
 
@@ -165,21 +206,46 @@ def main():
     check("Z4_output_role_identity_start", bool(torch.equal(out_role, first_out)),
           "output-role encoder starts at its lm_head row")
 
-    # ---- Z5: init-only — no state-dict change ----
+    # ---- Z5: init-only — no state-dict structure change or collateral init ----
     k_off = {k: tuple(v.shape) for k, v in moff.state_dict().items()}
     k_on = {k: tuple(v.shape) for k, v in mon.state_dict().items()}
     check("Z5_state_dict_identical_keys_shapes", k_off == k_on,
           f"{len(k_on)} keys, same shapes -> eval/export/inference unchanged")
+    sd_off = moff.state_dict()
+    sd_on = mon.state_dict()
+    changed = {k for k in sd_off if not torch.equal(sd_off[k], sd_on[k])}
+    intended = {"hyper_encoder.norm.weight", "hyper_output.norm.weight"}
+    check("Z5_only_output_gate_weights_change", changed == intended,
+          f"changed={sorted(changed)}")
 
-    # ---- Z6: the zero is escapable ----
+    # ---- Z6: the zero is escapable, with one update of gate-only gradients ----
     mgrad, cfg_g = build(zero_init=True, seed=5)
     mgrad.train()
     out = mgrad._encode_codebook_with_weights(codebook(cfg_g, dev), mgrad.tok_embeddings.weight)
     out.sum().backward()
-    g = mgrad.hyper_encoder.norm.weight.grad
-    check("Z6_zeroed_norm_receives_grad",
-          g is not None and float(g.abs().max()) > 0,
-          f"max|grad|={float(g.abs().max()):.3e} (encoder is not dead)")
+    first_nonzero = {
+        name for name, p in mgrad.hyper_encoder.named_parameters()
+        if p.grad is not None and float(p.grad.abs().max()) > 0
+    }
+    check("Z6_first_backward_trains_only_gate",
+          first_nonzero == {"norm.weight", "norm.bias"},
+          f"nonzero grads={sorted(first_nonzero)}")
+    with torch.no_grad():
+        for p in mgrad.hyper_encoder.parameters():
+            if p.grad is not None:
+                p.add_(p.grad, alpha=-1e-3)
+    mgrad.zero_grad(set_to_none=True)
+    out = mgrad._encode_codebook_with_weights(codebook(cfg_g, dev), mgrad.tok_embeddings.weight)
+    out.sum().backward()
+    upstream_nonzero = {
+        name for name, p in mgrad.hyper_encoder.named_parameters()
+        if not name.startswith("norm.")
+        and p.grad is not None
+        and float(p.grad.abs().max()) > 0
+    }
+    check("Z6_second_backward_reaches_upstream",
+          bool(upstream_nonzero),
+          f"{len(upstream_nonzero)} upstream tensors now have nonzero grad")
     mgrad.zero_grad(set_to_none=True)
 
     # ---- Z7: fail-loud on an unsupported encoder type ----
@@ -198,7 +264,7 @@ def main():
           and mh.zero_init_report["hyper_encoder"] == ["pair_encoder.norm"],
           f"||enc_out||={e_h} report={mh.zero_init_report['hyper_encoder']}")
 
-    # ---- Z9: no residual -> flag does nothing ----
+    # ---- Z9: direct model use without residual does not zero the full embedding ----
     cfg_nr = small_cfg(zero_init=True)
     torch.manual_seed(9)
     m_nr = cfg_nr.build()
@@ -209,34 +275,184 @@ def main():
           m_nr.zero_init_report["hyper_encoder"] == [],
           "zero output without a residual would be identically-zero embeddings")
 
-    # ---- Z10: resume guard treats the flag as soft ----
+    # ---- Z10: the training CLI rejects the contradictory flag pair ----
     import zip2zip_core.train as train_mod
+    saved_argv = sys.argv
+    err = io.StringIO()
+    cli_rejected = False
+    try:
+        sys.argv = [
+            "train.py", "--data_dir", "/tmp/data", "--output_dir", "/tmp/out",
+            "--zero_init_encoder_output", "--no_encoder_residual",
+        ]
+        with contextlib.redirect_stderr(err):
+            try:
+                train_mod.main()
+            except SystemExit as e:
+                cli_rejected = e.code == 2
+    finally:
+        sys.argv = saved_argv
+    cli_error = err.getvalue()
+    check("Z10_cli_rejects_zero_init_without_residual",
+          cli_rejected
+          and "--zero_init_encoder_output" in cli_error
+          and "--no_encoder_residual" in cli_error,
+          "argparse rejects the mutually exclusive flags before model construction")
+
+    # ---- Z11: both behavior/init flags are hard resume-lineage keys ----
     saved_dist = train_mod.dist
     train_mod.dist = types.SimpleNamespace(get_rank=lambda: 0)
     try:
         with tempfile.TemporaryDirectory() as td:
-            args = types.SimpleNamespace(
+            common = dict(
                 disable_digit_ids=True, max_codebook_size=4096,
                 tokenizer="microsoft/Phi-3.5", untied_hyper_encoder=True,
                 base_token_positions=True, token_type_loss_weight=0.05,
-                zero_init_encoder_output=True, encoder_dim=3072,
                 encoder_n_layers=2, encoder_n_heads=32,
                 encoder_intermediate_size=12288, max_subtokens=4,
                 seq_len=2048, data_dir="/data", warmstart_steps=0,
                 allow_resume_mismatch=False,
             )
-            rec = dict(vars(args)); del rec["allow_resume_mismatch"]
-            rec["zero_init_encoder_output"] = False        # mismatch on purpose
-            torch.save({"args": rec}, os.path.join(td, "meta.pt"))
-            soft_ok = True
+
+            def guard_rejects(args, recorded):
+                torch.save({"args": recorded}, os.path.join(td, "meta.pt"))
+                try:
+                    train_mod.validate_resume_args(td, args)
+                    return False
+                except ValueError:
+                    return True
+
+            args_zero = types.SimpleNamespace(
+                **common, zero_init_encoder_output=True,
+                no_encoder_residual=False, encoder_dim=3072,
+            )
+            rec_zero = dict(vars(args_zero))
+            del rec_zero["allow_resume_mismatch"]
+            rec_zero["zero_init_encoder_output"] = False
+            check("Z11_zero_init_is_resume_hard",
+                  guard_rejects(args_zero, rec_zero),
+                  "a v0.6.3 checkpoint cannot be silently relabeled v0.6.4")
+
+            legacy = dict(rec_zero)
+            del legacy["zero_init_encoder_output"]
+            del legacy["no_encoder_residual"]
+            check("Z11_legacy_absence_means_zero_init_off",
+                  guard_rejects(args_zero, legacy),
+                  "legacy meta.pt absence is compared as false")
+
+            args_nores = types.SimpleNamespace(
+                **common, zero_init_encoder_output=False,
+                no_encoder_residual=True, encoder_dim=3072,
+            )
+            rec_nores = dict(vars(args_nores))
+            del rec_nores["allow_resume_mismatch"]
+            rec_nores["no_encoder_residual"] = False
+            check("Z11_no_residual_is_resume_hard",
+                  guard_rejects(args_nores, rec_nores),
+                  "behavior-only residual mode cannot change silently")
+
+            rec_match = dict(vars(args_zero))
+            del rec_match["allow_resume_mismatch"]
+            torch.save({"args": rec_match}, os.path.join(td, "meta.pt"))
+            matching_ok = True
             try:
-                train_mod.validate_resume_args(td, args)
+                train_mod.validate_resume_args(td, args_zero)
             except ValueError:
-                soft_ok = False
-            check("Z10_flag_is_soft_on_resume", soft_ok,
-                  "init-only: a resume overwrites it from the checkpoint")
+                matching_ok = False
+            check("Z11_matching_recipe_resumes",
+                  matching_ok,
+                  "the guard accepts an unchanged recipe")
     finally:
         train_mod.dist = saved_dist
+
+    # ---- Z12: eval restores the behavior-only residual flag from meta.pt ----
+    adapter, lm_eval_stubs = import_eval_adapter()
+    eval_key = "_encoder_residual_restore_test"
+    cfg_eval = small_cfg(zero_init=False, untied=False)
+    source = build_model(cfg_eval, seed=12)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            adapter.zip2zip_llama_configs[eval_key] = cfg_eval
+            torch.save(source.state_dict(), os.path.join(td, "model.pt"))
+
+            def adapter_load(no_residual):
+                meta_args = {"model_config": eval_key}
+                if no_residual is not None:
+                    meta_args["no_encoder_residual"] = no_residual
+                torch.save({"args": meta_args}, os.path.join(td, "meta.pt"))
+                loaded, _, _ = adapter._load_zip2zip_checkpoint(
+                    td, dev, torch.float32
+                )
+                loaded.hyper_encoder.disable_varlen = True
+                return loaded
+
+            default_eval = adapter_load(None)
+            nores_eval = adapter_load(True)
+            check("Z12_eval_restores_residual_mode",
+                  getattr(default_eval, "encoder_residual", True) is True
+                  and nores_eval.encoder_residual is False,
+                  "legacy absence -> on; recorded no_encoder_residual -> off")
+
+            cb_eval = codebook(cfg_eval, dev)
+            with torch.no_grad():
+                default_out = default_eval._encode_codebook_with_weights(
+                    cb_eval, default_eval.tok_embeddings.weight
+                )[0, :5]
+                nores_out = nores_eval._encode_codebook_with_weights(
+                    cb_eval, nores_eval.tok_embeddings.weight
+                )[0, :5]
+                first_eval = default_eval.tok_embeddings.weight[
+                    cb_eval[0, :5, 0]
+                ]
+            check("Z12_eval_flag_changes_composition_exactly",
+                  torch.equal(default_out, first_eval + nores_out)
+                  and not torch.equal(default_out, nores_out),
+                  "residual-on output == first-token embedding + residual-off output")
+    finally:
+        adapter.zip2zip_llama_configs.pop(eval_key, None)
+        if lm_eval_stubs:
+            sys.modules.pop("zip2zip_core.lm_eval_adapter", None)
+            for name in reversed(lm_eval_stubs):
+                sys.modules.pop(name, None)
+
+    # ---- Z13: compressed-generation loader uses the same restoration path ----
+    inference_path = os.path.join(
+        os.path.dirname(__file__), "..", "scripts", "inference.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_encoder_residual_inference_test", inference_path
+    )
+    inference_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(inference_mod)
+    inference_key = "_encoder_residual_inference_test"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            inference_mod.zip2zip_llama_configs[inference_key] = cfg_eval
+            torch.save(source.state_dict(), os.path.join(td, "model.pt"))
+            torch.save(
+                {"args": {
+                    "model_config": inference_key,
+                    "max_subtokens": cfg_eval.max_subtokens,
+                    "max_codebook_size": cfg_eval.max_codebook_size,
+                    "no_encoder_residual": True,
+                }},
+                os.path.join(td, "meta.pt"),
+            )
+            inference_model, _ = inference_mod.load_model(td, str(dev))
+            inference_model.hyper_encoder.disable_varlen = True
+            with torch.no_grad():
+                source_out = source._encode_codebook_with_weights(
+                    cb_eval, source.tok_embeddings.weight
+                )[0, :5]
+                inference_out = inference_model._encode_codebook_with_weights(
+                    cb_eval, inference_model.tok_embeddings.weight
+                )[0, :5]
+            check("Z13_inference_restores_residual_mode",
+                  inference_model.encoder_residual is False
+                  and torch.equal(source_out, first_eval + inference_out),
+                  "compressed generation restores no-residual composition")
+    finally:
+        inference_mod.zip2zip_llama_configs.pop(inference_key, None)
 
     return summarize(results)
 

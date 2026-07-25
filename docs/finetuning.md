@@ -368,15 +368,17 @@ pins the same fact on a small config):
 | Phi + this fix | yes | 1.00 | 0.00 | 0× |
 
 The ratio is `sqrt(dim)` — the final `LayerNorm` forces unit RMS per channel
-while Phi's embeddings are initialized at `dim**-0.5` — so the damage grows with
-model size and is worst exactly for the 3072-wide production model. This is the
-same failure mode already documented for `tok_embeddings` in `configs.py` ("~55x
-too large … ~1500 initial loss"); that instance was fixed, this one survived.
+while Phi's embeddings are initialized at `dim**-0.5` — so the norm mismatch
+grows with model size and is largest for the 3072-wide production model. This
+is the same failure mode already documented for `tok_embeddings` in
+`configs.py` ("~55x too large … ~1500 initial loss"); that instance was fixed,
+this one survived.
 
-It also explains the transient the v0.6 warm-start tried to treat: initial loss
-is ~70 at step 10 **with or without** warm-start (v0.5 70.2, v0.6 69.6), because
-freezing the LoRA cannot fix a random encoder output. Warm-start was aimed at a
-symptom of this bug.
+It is consistent with the transient the v0.6 warm-start tried to treat: initial
+loss is ~70 at step 10 **with or without** warm-start (v0.5 70.2, v0.6 69.6),
+because freezing the LoRA does not change the random encoder output. This makes
+the initialization bug a plausible source of that transient; only the paired
+v0.6.4 run can establish how much it mattered to final performance.
 
 `ZERO_INIT_ENCODER_OUTPUT=1` (train arg `--zero_init_encoder_output`, config
 `zero_init_encoder_output`) zeroes the final `LayerNorm`'s weight **and** bias
@@ -385,20 +387,32 @@ both the padded and the varlen pooling paths. Properties:
 
 - **Init-only.** No new parameters, no architecture change, `state_dict` keys and
   shapes are identical to v0.6.3 (pinned by test Z5), so eval, export, and
-  `scripts/inference.py` need *nothing*. It is also why the resume guard treats
-  the flag as **soft**: a resume loads weights from the checkpoint, which
-  overwrites any init, so a mismatch is harmless and only worth a note.
+  `scripts/inference.py` need *nothing*. The flag is nevertheless a **hard**
+  resume-lineage key: a normal resume loads checkpoint weights over the new
+  initialization, so turning the flag on while resuming v0.6.3 would have no
+  effect and would mislabel the run as v0.6.4. Start v0.6.4 fresh from the same
+  HF base; `--allow_resume_mismatch` only acknowledges the mismatch and does not
+  make the initialization reapply to loaded weights.
 - **No-op where the original code worked.** With `encoder_dim != model_dim` the
   `proj_out` branch still runs and the flag changes nothing (test Z3).
 - **Fail-loud.** If the flag is on and neither a `proj_out` nor a final
-  `LayerNorm` exists (e.g. the gated-MLP `fast_hierarchical` composer, which is
-  already identity-initialized), it raises instead of silently doing nothing —
-  the exact failure mode that cost six experiments (test Z7).
+  `LayerNorm` exists (e.g. the gated-MLP `fast_hierarchical` composer), it raises
+  instead of silently doing nothing (test Z7). This prevents another invisible
+  no-op; it is an unsupported zero-init path, not a claim that the gated-MLP
+  composer is already identity-initialized.
 - **Observable.** Training prints `[encoder_zero_init] zeroed={...}` naming the
-  modules it matched; an empty list means the encoder is starting far from the
-  identity.
-- **Escapable.** The zeroed `LayerNorm` weight receives gradient immediately, so
-  the encoder trains normally from step 1 (test Z6).
+  modules it matched and whether the flag is on. In residual mode, flag-on must
+  name an output gate or fail; flag-off legitimately prints an empty list for
+  the Phi configuration.
+- **Escapable, with a one-update delay upstream.** On the first backward pass,
+  the zeroed `LayerNorm` weight and bias receive gradients, while parameters
+  before that gate receive zero gradient. After the first optimizer update opens
+  the gate, upstream encoder parameters receive gradients on the next backward
+  pass. This is normal zero-gated residual-branch behavior, not a permanently
+  dead encoder (test Z6).
+- **Requires the residual.** `--zero_init_encoder_output` and
+  `--no_encoder_residual` are mutually exclusive. Without the residual, an
+  exactly zero encoder output would make the complete hypertoken embedding zero.
 
 Note the flag is default-off so the frozen v0.1–v0.6.3 baselines stay exactly
 reproducible and v0.6.4 is a clean single-variable A/B. **If it validates, flip

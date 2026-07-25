@@ -353,12 +353,13 @@ def _clean_state_dict(model_state):
 
 
 def validate_resume_args(resume_dir, args):
-    """Fail fast when a resume would silently change the training distribution.
+    """Fail fast when a resume would silently change the training recipe.
 
     Compression semantics must never change inside one checkpoint lineage:
     a resume that drops --disable_digit_ids (or changes the codebook size or
     tokenizer) would continue the run on a different data distribution with no
-    error anywhere. Curriculum phases legitimately change max_subtokens /
+    error anywhere. Architecture, objective, and initialization lineage must
+    also remain explicit. Curriculum phases legitimately change max_subtokens /
     seq_len / data_dir, so those only print a note. Deliberate changes to the
     hard set require --allow_resume_mismatch.
     """
@@ -368,14 +369,10 @@ def validate_resume_args(resume_dir, args):
     prev = torch.load(meta_path, map_location="cpu", weights_only=False).get("args", {}) or {}
     hard = ("disable_digit_ids", "max_codebook_size", "tokenizer",
             "untied_hyper_encoder", "base_token_positions",
+            "zero_init_encoder_output", "no_encoder_residual",
             "token_type_loss_weight", "encoder_dim", "encoder_n_layers",
             "encoder_n_heads", "encoder_intermediate_size")
-    # zero_init_encoder_output is deliberately SOFT, unlike the other recipe
-    # flags: it only changes the INITIAL weights, which a resume overwrites from
-    # the checkpoint, so a mismatch on resume is harmless (it matters only for
-    # fresh runs and for --random_weights). A note keeps the provenance visible.
-    soft = ("max_subtokens", "seq_len", "data_dir", "warmstart_steps",
-            "zero_init_encoder_output")
+    soft = ("max_subtokens", "seq_len", "data_dir", "warmstart_steps")
     # Hard keys whose ABSENCE from an old meta.pt has an unambiguous meaning:
     # the flag/objective did not exist, i.e. it was OFF. Treat absence as that
     # default so e.g. resuming a v0.5 lineage with --base_token_positions or a
@@ -385,6 +382,8 @@ def validate_resume_args(resume_dir, args):
         "disable_digit_ids": False,
         "untied_hyper_encoder": False,
         "base_token_positions": False,
+        "zero_init_encoder_output": False,
+        "no_encoder_residual": False,
         "token_type_loss_weight": 0.0,
     }
     # Legacy metas record None for the encoder_* args (they predate the
@@ -392,17 +391,21 @@ def validate_resume_args(resume_dir, args):
     # and the strict checkpoint load backstops real architecture mismatches.
     # For every other hard key a recorded None IS a difference worth stopping on.
     mismatches = [
-        (k, prev.get(k, absent_defaults.get(k)), getattr(args, k))
+        (k, prev.get(k, absent_defaults.get(k)),
+         getattr(args, k, absent_defaults.get(k)))
         for k in hard
         if (k in prev or k in absent_defaults)
-        and prev.get(k, absent_defaults.get(k)) != getattr(args, k)
+        and prev.get(k, absent_defaults.get(k)) != getattr(
+            args, k, absent_defaults.get(k)
+        )
         and not (k.startswith("encoder_") and prev.get(k) is None)
     ]
     if mismatches and not args.allow_resume_mismatch:
         raise ValueError(
-            f"resume args differ from {meta_path} on distribution-critical settings "
+            f"resume args differ from {meta_path} on recipe-critical settings "
             f"{mismatches} (recorded, requested) — resuming would silently change the "
-            "training distribution mid-lineage. Pass the recorded values, or "
+            "training recipe or mislabel its initialization lineage. Pass the "
+            "recorded values, or "
             "--allow_resume_mismatch for a deliberate change."
         )
     if dist.get_rank() == 0:
@@ -604,14 +607,16 @@ def main():
                         help="Use a separate output-role hyper-encoder (reading lm_head "
                              "rows) instead of reusing the input hyper-encoder for logits. "
                              "Matches the released model. Default off = tied (legacy).")
-    parser.add_argument("--zero_init_encoder_output", action="store_true",
-                        help="Make the hyper-encoder emit exactly zero at init, so the "
-                             "first hypertoken embedding equals its first base token's "
-                             "embedding (the encoder_residual design intent). Fixes a "
-                             "silent no-op: the existing zero-init only touches "
-                             "proj_out, which does not exist when encoder_dim == dim "
-                             "(every Phi run), leaving the encoder ~54x too large at "
-                             "step 0. Default off = v0.1-v0.6.3 behavior.")
+    encoder_residual_group = parser.add_mutually_exclusive_group()
+    encoder_residual_group.add_argument(
+        "--zero_init_encoder_output", action="store_true",
+        help="Make the hyper-encoder emit exactly zero at init, so the "
+             "first hypertoken embedding equals its first base token's "
+             "embedding (the encoder_residual design intent). Fixes a "
+             "silent no-op: the existing zero-init only touches "
+             "proj_out, which does not exist when encoder_dim == dim "
+             "(every Phi run), leaving the encoder ~54x too large at "
+             "step 0. Default off = v0.1-v0.6.3 behavior.")
     parser.add_argument("--base_token_positions", action="store_true",
                         help="RoPE positions follow the uncompressed stream (each token "
                              "sits at the base-space index of its last constituent) "
@@ -647,9 +652,9 @@ def main():
     parser.add_argument("--log_freq", type=int, default=10)
     parser.add_argument("--save_freq", type=int, default=1000)
     parser.add_argument("--allow_resume_mismatch", action="store_true",
-                        help="Permit resuming with distribution-critical args (digit "
-                             "protection, codebook size, tokenizer) that differ from "
-                             "the checkpoint's meta.pt. Off = hard error.")
+                        help="Permit resuming with recipe-critical args (data/compression "
+                             "semantics, architecture, objective, or initialization lineage) "
+                             "that differ from the checkpoint's meta.pt. Off = hard error.")
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Local checkpoint dir, or 'latest' to auto-find latest step_* in output_dir")
     parser.add_argument("--resume_from_hf", type=str, default=None,
@@ -716,8 +721,11 @@ def main():
                         help="Number of profiler warmup steps before active profiling")
     parser.add_argument("--disable_varlen", action="store_true",
                         help="Disable varlen attention in hyper-encoder (use padded path instead)")
-    parser.add_argument("--no_encoder_residual", action="store_true",
-                        help="Disable residual connection in hyper-encoder (ablation experiment)")
+    encoder_residual_group.add_argument(
+        "--no_encoder_residual", action="store_true",
+        help="Disable residual connection in hyper-encoder (ablation experiment). "
+             "Incompatible with --zero_init_encoder_output because a zero encoder "
+             "output would make the complete hypertoken embedding zero.")
     parser.add_argument("--debug_first_steps", type=int, default=0,
                         help="Print per-rank progress markers for the first N training steps. "
                              "Useful for diagnosing hangs before step 1 logging.")
@@ -852,9 +860,9 @@ def main():
     with torch.no_grad():
         model.init_weights()
     if rank == 0:
-        # Print what the encoder zero-init actually matched. An empty list means
-        # the encoder starts far from the identity (the v0.1-v0.6.3 state) — the
-        # silent no-op that this reporting exists to make impossible.
+        # Print what the encoder zero-init actually matched. With the flag on,
+        # residual mode cannot silently report an empty list: it either names
+        # the output gate or fails during initialization.
         print(f"[encoder_zero_init] zeroed={model.zero_init_report} "
               f"(flag={'on' if args.zero_init_encoder_output else 'off'})")
     # Keep params in fp32 on device; FSDP's MixedPrecisionPolicy casts to bf16 for

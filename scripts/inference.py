@@ -21,7 +21,7 @@ from transformers import AutoTokenizer
 
 from zip2zip_core.codebook import CodebookManager
 from zip2zip_core.configs import zip2zip_llama_configs
-from zip2zip_core.model import Zip2ZipLlama3Model
+from zip2zip_core.model import Zip2ZipLlama3Model, restore_encoder_residual
 from zip2zip_core.viz import colorize_by_ngram, render_colored_tokens
 
 
@@ -63,7 +63,10 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
         token_type_loss_weight=float(args.get("token_type_loss_weight") or 0.0),
         **enc_overrides,
     )
-    model = Zip2ZipLlama3Model(cfg).to(device)
+    model = Zip2ZipLlama3Model(cfg)
+    if not restore_encoder_residual(model, args):
+        print("[inference] hyper-encoder residual: disabled from meta.pt")
+    model = model.to(device)
     sd = torch.load(f"{ckpt_dir}/model.pt", map_location=device, weights_only=True)
     model.load_state_dict(sd, strict=True)
     model.eval()

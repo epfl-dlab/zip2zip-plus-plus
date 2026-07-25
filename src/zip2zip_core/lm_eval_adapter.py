@@ -33,7 +33,7 @@ from zip2zip_compression import (
 )
 
 from zip2zip_core.configs import zip2zip_llama_configs
-from zip2zip_core.model import Zip2ZipLlama3Model
+from zip2zip_core.model import Zip2ZipLlama3Model, restore_encoder_residual
 
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
@@ -137,7 +137,13 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
     if overrides:
         cfg = dataclasses.replace(cfg, **overrides)
 
-    model = Zip2ZipLlama3Model(cfg).to(device=device)
+    model = Zip2ZipLlama3Model(cfg)
+    if not restore_encoder_residual(model, train_args):
+        # Behavior-only flag: there is no state-dict key that can restore it.
+        # Missing this silently evaluates a no-residual checkpoint with the
+        # residual enabled.
+        print("[zip2zip-lm-eval] hyper-encoder residual: disabled from meta.pt")
+    model = model.to(device=device)
     if dtype is not None and dtype != torch.float32:
         # Cast parameters and real-valued buffers ONLY. A blanket .to(dtype)
         # also converts the complex64 RoPE cache (freqs_cis and rope.cache) to

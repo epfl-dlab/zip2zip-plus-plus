@@ -35,6 +35,13 @@ def rope_cache_len(seq_len: int, max_subtokens: int, base_token_positions: bool)
     return seq_len * (max_subtokens if base_token_positions else 1)
 
 
+def restore_encoder_residual(model: nn.Module, train_args: dict) -> bool:
+    """Restore the checkpoint's behavior-only encoder residual setting."""
+    enabled = not bool(train_args.get("no_encoder_residual", False))
+    model.encoder_residual = enabled
+    return enabled
+
+
 class HyperEncoderLayer(nn.Module):
     """Single transformer layer for the hyper-encoder."""
 
@@ -628,9 +635,9 @@ class Zip2ZipLlama3Model(Decoder):
         # in incremental inference where only codebook UPDATES are visible.
         self._hyper_span_buf: torch.Tensor | None = None
         # Which module(s) init_weights() zeroed per encoder role, so a zero-init
-        # that silently matches nothing is visible instead of costing six
-        # experiments. Populated by _init_hyper_encoder; plain dict, so it never
-        # reaches the state dict or FSDP.
+        # that silently matches nothing is visible. Populated by
+        # _init_hyper_encoder; plain dict, so it never reaches the state dict or
+        # FSDP.
         self.zero_init_report: dict[str, list[str]] = {}
 
         # Hyper-encoder(s) for computing hypertoken embeddings. Tied: one encoder
@@ -709,8 +716,9 @@ class Zip2ZipLlama3Model(Decoder):
             # released Phi recipe (encoder_dim == dim == 3072) the loop above
             # matches nothing and silently leaves the intent unimplemented: the
             # encoder then starts emitting a LayerNorm-scaled random vector with
-            # ~54x the norm of the embedding it is supposed to nudge, which is
-            # what produced the ~70-150 initial loss in every v0.1-v0.6.3 run.
+            # ~54x the norm of the embedding it is supposed to nudge. That is the
+            # initialization every v0.1-v0.6.3 run used and is consistent with
+            # their large early-loss transient.
             # Zeroing the final LayerNorm (weight AND bias, so the output is
             # exactly 0 through both the padded and the varlen pooling paths)
             # restores the intended identity start with no new parameters and no
@@ -724,11 +732,10 @@ class Zip2ZipLlama3Model(Decoder):
                 if not isinstance(norm, nn.LayerNorm):
                     raise ValueError(
                         f"zero_init_encoder_output=True but {type(encoder).__name__} "
-                        f"has no proj_out (encoder_dim == model_dim) and no final "
-                        f"LayerNorm to zero, so a zero initial encoder output cannot "
-                        f"be guaranteed. Set encoder_dim != dim, or drop the flag for "
-                        f"this hyper_encoder_type (a gated-MLP composer is already "
-                        f"identity-initialized and does not need it)."
+                        f"has no proj_out and no final LayerNorm to zero, so a zero "
+                        f"initial encoder output cannot be guaranteed. Use a "
+                        f"hyper_encoder_type with a zeroable final output gate, or "
+                        f"drop the flag."
                     )
                 nn.init.zeros_(norm.weight)
                 nn.init.zeros_(norm.bias)
