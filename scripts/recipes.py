@@ -7,7 +7,7 @@ v0.1-v0.6.x baselines stay bit-reproducible. The cost of that choice was that
 the recipe lived only in shell history and in docs/finetuning.md: five flags to
 retype on every launch, and one forgotten flag silently trains the wrong thing
 for hours. A recipe NAME fixes this without touching a single code default, and
-keeps old recipes reproducible by name instead of by archaeology.
+keeps historical lever sets selectable by name instead of by archaeology.
 
     RECIPE=v0.6.4   # -> the five flags below, all at once
 
@@ -33,7 +33,7 @@ CLI:
     python scripts/recipes.py v0.6.4           # shell exports (for eval)
     python scripts/recipes.py --list           # every recipe + status
     python scripts/recipes.py --show v0.6.4    # fully resolved, human readable
-    python scripts/recipes.py --identify DIR   # which recipe a checkpoint used
+    python scripts/recipes.py --identify DIR   # which named lever set it matches
 
 ADDING A RECIPE. Add one entry whose `extends` names its parent and whose `env`
 holds ONLY the keys that change. That is this project's versioning convention
@@ -136,8 +136,8 @@ RECIPES = {
         "status": "current",
         "description": "hyper-encoder starts at exactly zero (fixes a silent init no-op)",
         "env": {"ZERO_INIT_ENCODER_OUTPUT": "1"},
-        "notes": "largest single improvement of the line: the only change that moved "
-                 "every axis at once (GSM8K .652 -> .677, MC tax erased, best ppl).",
+        "notes": "broadest balanced improvement of the line: GSM8K .652 -> .677, "
+                 "MC average recovered, best ppl; OBQA/Wino changes within noise.",
     },
 }
 

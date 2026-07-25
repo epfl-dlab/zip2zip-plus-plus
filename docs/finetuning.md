@@ -37,7 +37,7 @@ is why you should always pass `RECIPE=` rather than the individual flags.
 ```bash
 python scripts/recipes.py --list             # every recipe, with status
 python scripts/recipes.py --show v0.6.4      # what it resolves to, and which version added each lever
-python scripts/recipes.py --identify <ckpt>  # which recipe an existing checkpoint was trained with
+python scripts/recipes.py --identify <ckpt>  # which named lever set a checkpoint matches
 ```
 
 Three things worth knowing about how it behaves:
@@ -45,12 +45,13 @@ Three things worth knowing about how it behaves:
 - **An explicit env var always wins**, including `0` or empty meaning "off". So a
   single-variable experiment on top of the standard recipe is
   `RECIPE=v0.6.4 ENCODER_N_LAYERS=4` — no need to restate the other five.
-- **Older recipes are reproducible by name** (`RECIPE=v0.5`). Selecting a
+- **Older lever sets are selectable by name** (`RECIPE=v0.5`). Selecting a
   superseded recipe prints a note; selecting one of the two measured *negative*
   results (`v0.6` warm-start, `v0.6.1` deeper encoder) prints a loud warning.
 - **An unknown name is a fatal error**, never a silent fallback to "no levers".
   Both launchers print the resolved `RECIPE=` in their banner, and `meta.pt`
-  records every resolved flag, so a checkpoint's recipe is always recoverable.
+  records every resolved flag, so the effective experimental levers are
+  recoverable.
 
 ## Overview
 
@@ -467,8 +468,9 @@ both the padded and the varlen pooling paths. Properties:
   exactly zero encoder output would make the complete hypertoken embedding zero.
 
 Note the flag is default-off so the frozen v0.1–v0.6.3 baselines stay exactly
-reproducible and v0.6.4 is a clean single-variable A/B. **If it validates, flip
-it to a code default** — it is a correctness fix, not a preference.
+reproducible and v0.6.4 is a clean single-variable A/B. If it validates, keep it
+in the standard named recipe while leaving the low-level code default off. This
+selects the correctness fix for new experiments without changing old commands.
 
 Launch = the v0.6.3 command plus one env var:
 
@@ -479,8 +481,9 @@ RUN_NAME=<name> DISABLE_DIGIT_IDS=1 UNTIED_HYPER_ENCODER=1 BASE_TOKEN_POSITIONS=
 ```
 
 The v0.6.4 run (2026-07-25, same budget, single variable = the init fix)
-VALIDATED, and it is the largest single improvement of the whole line — the only
-change so far that improved **every** axis at once:
+VALIDATED. It is the broadest balanced improvement of the line: GSM8K, the
+six-task MC average and byte-perplexity all improve together, while the small
+OpenBookQA and WinoGrande regressions are within noise:
 
 | | GSM8K flex | strict | ARC-c | ARC-e | HellaSwag | PIQA | WinoGrande | OBQA | wiki byte-ppl |
 |---|---|---|---|---|---|---|---|---|---|
@@ -494,10 +497,11 @@ GSM8K +2.5pt over v0.6.3 (+5.4pt over v0.5), and the GSM8K gap to the control is
 down to **6.5pt** from ~11.8pt at v0.5. The MC tax that v0.6.2 introduced is
 **gone**: ARC-c, ARC-e and PIQA now sit at or above v0.5, HellaSwag is back within
 noise, and byte-perplexity is the best ever measured on this line (−2% vs
-v0.6.3). Only OpenBookQA is marginally down (−0.6pt, ≪1σ). Training was healthier
-throughout: step-10 loss 3.97 instead of ~70-100, initial grad-norm 50 instead of
-~1000-4700, final loss 1.434 (v0.6.3 ~1.52), end grad-norm 0.23. Throughput was
-unchanged at ~32.9k tok/s — the fix is free.
+v0.6.3). OpenBookQA (−0.6pt) and WinoGrande (−0.08pt) are marginally down, both
+well below 1σ. Training was healthier throughout: step-10 loss 3.97 instead of
+~70-100, initial grad-norm 50 instead of ~1000-4700, final loss 1.434 (v0.6.3
+~1.52), end grad-norm 0.23. Steady-state throughput was unchanged at ~32.9k
+tok/s.
 
 Two checks worth recording because they could have invalidated the result:
 
@@ -514,9 +518,10 @@ Two checks worth recording because they could have invalidated the result:
 
 Because the control never runs the hyper-encoder (`max_codebook_size=0` gates the
 path off) it never had this handicap, so part of the gap we had been attributing
-to compression was this bug. **Recommendation: promote `zero_init_encoder_output`
-to a code default** — it is a correctness fix, it improves every metric, and the
-only reason it is a flag is to keep the frozen v0.1–v0.6.3 baselines reproducible.
+to compression was this bug. **Recommendation: keep
+`zero_init_encoder_output` in the standard named recipe while retaining its
+low-level default-off behavior.** This applies the correctness fix to new runs
+without changing frozen v0.1–v0.6.3 commands.
 
 ## Canonical RCP locations and run conventions
 
