@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from torch.distributed.checkpoint.stateful import Stateful
 
-from zip2zip_compression import LZWCompressor
+from zip2zip_compression import CodebookManager, CompressionConfig, LZWCompressor
 
 # Special tokens for compression/decompression task (unused Llama3 special token slots)
 COMPRESS_TOKEN_ID = 128002
@@ -23,6 +23,79 @@ def _debug_data_log(enabled: bool, rank: int, worker_id: int, message: str):
         return
     ts = time.strftime("%H:%M:%S")
     print(f"[data-debug {ts}] [rank{rank}] [worker{worker_id}] {message}", flush=True)
+
+
+def online_codebook_counts(compressed_ids, codebook, compressor_args):
+    """Rows installed by the online decoder after each compressed token.
+
+    Training has the encoder's final codebook, but generation builds the same
+    dictionary incrementally from each emitted token's base-token expansion.
+    Replay that exact CodebookManager path and return a scalar count per
+    position. LZW row indices are sequential, so row ``k`` is available iff
+    ``k < count[t]``.
+    """
+    cb_dict = codebook.to_dict()
+    vocab_size = compressor_args["initial_vocab_size"]
+    manager = CodebookManager(CompressionConfig(**compressor_args))
+    installed = 0
+    counts = []
+
+    for tok in compressed_ids:
+        tok = int(tok)
+        if tok < vocab_size:
+            expansion = [tok]
+        else:
+            expansion = cb_dict.get(tok)
+            if expansion is None:
+                raise RuntimeError(
+                    f"compressed token {tok} is absent from the final codebook"
+                )
+            expansion = list(expansion)
+
+        _, update_indices = manager.update_codebooks([expansion])
+        new_indices = [int(i) for i in update_indices[0]]
+        expected = list(range(installed, installed + len(new_indices)))
+        if new_indices != expected:
+            raise RuntimeError(
+                "online codebook rows were not installed sequentially: "
+                f"expected {expected}, got {new_indices}"
+            )
+        installed += len(new_indices)
+        counts.append(installed)
+
+    return torch.tensor(counts, dtype=torch.long)
+
+
+def online_unavailable_targets(
+    labels, counts, vocab_size, max_codebook_entries
+):
+    """Targets outside the current decoder or model output vocabulary.
+
+    The codec has rare legal unknown-next-ID cases (force-merge/KwKwK): the
+    next target is exactly the first uninstalled row. The current generation
+    runtime has no embedding for that row, so v0.6.5 excludes it from the
+    teacher-forced objective instead of leaking its final-codebook embedding.
+    Rows beyond the model's active codebook are likewise unscorable. A decoder
+    gap larger than one is not a supported special case and fails loudly.
+    """
+    if labels.shape != counts.shape:
+        raise ValueError(
+            f"labels/counts shape mismatch: {tuple(labels.shape)} vs "
+            f"{tuple(counts.shape)}"
+        )
+    slots = labels - vocab_size
+    is_hyper = labels >= vocab_size
+    decoder_unavailable = is_hyper & (slots >= counts)
+    if decoder_unavailable.any() and not torch.equal(
+        slots[decoder_unavailable], counts[decoder_unavailable]
+    ):
+        raise RuntimeError(
+            "online codebook target is more than the single legal next row "
+            "ahead of decoder state"
+        )
+    return decoder_unavailable | (
+        is_hyper & (slots >= max_codebook_entries)
+    )
 
 
 class Zip2ZipDataset(IterableDataset, Stateful):
@@ -53,6 +126,8 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         world_size: int = 1,
         mode: str = "lm",
         remap_codebook: bool = True,
+        online_codebook_mask: bool = False,
+        max_active_codebook_size: int | None = None,
         debug_samples: int = 0,
     ):
         self.data_dir = data_dir
@@ -63,6 +138,12 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         self.pad_token_id = pad_token_id
         self.mode = mode
         self.remap_codebook = remap_codebook
+        self.online_codebook_mask = online_codebook_mask
+        self.max_active_codebook_size = (
+            max_codebook_size
+            if max_active_codebook_size is None
+            else max_active_codebook_size
+        )
         self.base_chunk_len = seq_len * 2
         self.rank = rank
         self.debug_samples = debug_samples
@@ -84,6 +165,20 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                 f"world_size={world_size} exceeds available token shards={len(shard_files)} "
                 f"in {data_dir}. Each rank needs at least one shard with the current "
                 "rank::world_size partitioning."
+            )
+        if self.online_codebook_mask and self.mode != "lm":
+            raise ValueError("online_codebook_mask is supported only in mode='lm'")
+        if self.online_codebook_mask and self.remap_codebook:
+            raise ValueError(
+                "online_codebook_mask requires remap_codebook=False because "
+                "decoder-installed counts refer to original LZW row indices"
+            )
+        if (
+            self.online_codebook_mask
+            and self.max_active_codebook_size <= 0
+        ):
+            raise ValueError(
+                "online_codebook_mask requires max_active_codebook_size > 0"
             )
 
         mask_files = [self._mask_path_for_shard(path) for path in shard_files]
@@ -313,6 +408,34 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                         if not loss_mask.any():
                             continue
                         y[~loss_mask] = -100
+
+                    available_counts = None
+                    online_skipped_targets = 0
+                    if self.online_codebook_mask:
+                        out_of_range_input = x >= (
+                            self.initial_vocab_size
+                            + self.max_active_codebook_size
+                        )
+                        if out_of_range_input.any():
+                            bad_id = int(x[out_of_range_input][0].item())
+                            raise RuntimeError(
+                                f"input hyper-token {bad_id} exceeds the active "
+                                f"codebook size {self.max_active_codebook_size}"
+                            )
+                        available_counts = online_codebook_counts(
+                            compressed[:-1], codebook, self.compressor_args
+                        )
+                        unavailable = online_unavailable_targets(
+                            y,
+                            available_counts,
+                            self.initial_vocab_size,
+                            self.max_active_codebook_size,
+                        )
+                        online_skipped_targets = int(unavailable.sum().item())
+                        y[unavailable] = -100
+                        if not (y != -100).any():
+                            continue
+
                     cb = self._codebook_to_tensor(codebook)
 
                     # Remap to compact codebook
@@ -326,7 +449,15 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                             f"codebook={tuple(cb.shape)} n_base_tokens={n_base_tokens}"
                         )
                     self._debug_samples_emitted += 1
-                    yield {"input": x, "codebook": cb, "n_base_tokens": n_base_tokens}, y
+                    sample = {
+                        "input": x,
+                        "codebook": cb,
+                        "n_base_tokens": n_base_tokens,
+                    }
+                    if self.online_codebook_mask:
+                        sample["codebook_counts"] = available_counts
+                        sample["online_skipped_targets"] = online_skipped_targets
+                    yield sample, y
 
             # Loop
             self._shard_idx = 0
@@ -498,7 +629,21 @@ def remap_collate_fn(batch, pad_token_id, max_subtokens, max_active_codebook_siz
 
     n_base_tokens = torch.tensor([inp["n_base_tokens"] for inp in inputs_list], dtype=torch.long)
 
-    return {"input": input_ids, "codebook": codebooks, "n_base_tokens": n_base_tokens}, labels
+    inputs = {
+        "input": input_ids,
+        "codebook": codebooks,
+        "n_base_tokens": n_base_tokens,
+    }
+    if "codebook_counts" in inputs_list[0]:
+        inputs["codebook_counts"] = torch.stack(
+            [inp["codebook_counts"] for inp in inputs_list]
+        )
+        inputs["online_skipped_targets"] = torch.tensor(
+            [inp["online_skipped_targets"] for inp in inputs_list],
+            dtype=torch.long,
+        )
+
+    return inputs, labels
 
 
 def build_dataloader(
@@ -516,6 +661,7 @@ def build_dataloader(
     disabled_ids: tuple[int, ...] | list[int] | None = None,
     mode: str = "lm",
     remap_codebook: bool = True,
+    online_codebook_mask: bool = False,
     debug_samples: int = 0,
 ) -> DataLoader:
     """Build a Zip2Zip DataLoader with remapping collation."""
@@ -531,6 +677,8 @@ def build_dataloader(
         world_size=world_size,
         mode=mode,
         remap_codebook=remap_codebook,
+        online_codebook_mask=online_codebook_mask,
+        max_active_codebook_size=max_active_codebook_size,
         debug_samples=debug_samples,
     )
 

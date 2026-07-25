@@ -152,6 +152,15 @@ ZEROINIT_FLAG=""
 if [ -n "$ZERO_INIT_ENCODER_OUTPUT" ] && [ "$ZERO_INIT_ENCODER_OUTPUT" != "0" ]; then
     ZEROINIT_FLAG="--zero_init_encoder_output"
 fi
+# ONLINE_CODEBOOK_MASK=1: replace the k<=t training approximation with the
+# entries actually installed by the incremental decoder after each input token
+# (v0.6.5 candidate). Requires the canonical --no_remap_codebook path below.
+# Default off preserves all historical recipes.
+ONLINE_CODEBOOK_MASK=${ONLINE_CODEBOOK_MASK:-}
+ONLINECB_FLAG=""
+if [ -n "$ONLINE_CODEBOOK_MASK" ] && [ "$ONLINE_CODEBOOK_MASK" != "0" ]; then
+    ONLINECB_FLAG="--online_codebook_mask"
+fi
 # WARMSTART_STEPS=N: freeze decoder-LoRA for the first N steps (hyper-encoder
 # only), then unfreeze. Training-only; eval unaffected. Empty/0 = off.
 WARMSTART_STEPS=${WARMSTART_STEPS:-}
@@ -315,7 +324,7 @@ echo "INIT_FROM_HF=$INIT_FROM_HF  TOKENIZER=$TOKENIZER"
 echo "FREEZE_DECODER=$FREEZE_DECODER  LORA_RANK=$LORA_RANK  LORA_ALPHA=$LORA_ALPHA"
 echo "ENCODER: type=$HYPER_ENCODER_TYPE dim=$ENCODER_DIM layers=$ENCODER_N_LAYERS heads=$ENCODER_N_HEADS inter=$ENCODER_INTERMEDIATE_SIZE"
 echo "RECIPE=${RECIPE:-<none, explicit env only>}"
-echo "DIGIT_FLAG='$DIGIT_FLAG'  UNTIED_FLAG='$UNTIED_FLAG'  WARMSTART_FLAG='$WARMSTART_FLAG'  BASEPOS_FLAG='$BASEPOS_FLAG'  ZEROINIT_FLAG='$ZEROINIT_FLAG'  TOKEN_TYPE_LOSS_WEIGHT=$TOKEN_TYPE_LOSS_WEIGHT"
+echo "DIGIT_FLAG='$DIGIT_FLAG'  UNTIED_FLAG='$UNTIED_FLAG'  WARMSTART_FLAG='$WARMSTART_FLAG'  BASEPOS_FLAG='$BASEPOS_FLAG'  ZEROINIT_FLAG='$ZEROINIT_FLAG'  ONLINECB_FLAG='$ONLINECB_FLAG'  TOKEN_TYPE_LOSS_WEIGHT=$TOKEN_TYPE_LOSS_WEIGHT"
 echo "CODEBOOK(active)=$MAX_ACTIVE_CODEBOOK_SIZE  LR=$LR->$MIN_LR warmup=$WARMUP_STEPS wd=$WEIGHT_DECAY beta2=$ADAM_BETA2"
 echo "SEQ_LEN=$SEQ_LEN  GRAD_ACCUM=$GRAD_ACCUM  TOKENS/STEP=$TOKENS_PER_STEP (released: 32768)"
 echo "STEPS=$STEPS  MAX_TOKENS=$MAX_TOKENS"
@@ -354,6 +363,7 @@ fi
     --save_freq "$SAVE_FREQ" \
     --log_freq "$LOG_FREQ" \
     --no_remap_codebook --hyper_causal_mask \
+    $ONLINECB_FLAG \
     $DIGIT_FLAG \
     $UNTIED_FLAG \
     $BASEPOS_FLAG \

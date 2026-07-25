@@ -64,13 +64,14 @@ ENV_KEYS = {
     "UNTIED_HYPER_ENCODER":     ("untied_hyper_encoder",     "flag",  False),
     "BASE_TOKEN_POSITIONS":     ("base_token_positions",     "flag",  False),
     "ZERO_INIT_ENCODER_OUTPUT": ("zero_init_encoder_output", "flag",  False),
+    "ONLINE_CODEBOOK_MASK":     ("online_codebook_mask",     "flag",  False),
     "TOKEN_TYPE_LOSS_WEIGHT":   ("token_type_loss_weight",   "float", 0.0),
     "WARMSTART_STEPS":          ("warmstart_steps",          "int",   0),
     # off = the Phi3.5-mini config default, the only model config this line uses
     "ENCODER_N_LAYERS":         ("encoder_n_layers",         "int",   2),
 }
 
-# status: current | superseded | negative (a measured negative result)
+# status: current | candidate | superseded | negative (a measured negative result)
 RECIPES = {
     "v0.2": {
         "extends": None,
@@ -138,6 +139,14 @@ RECIPES = {
         "env": {"ZERO_INIT_ENCODER_OUTPUT": "1"},
         "notes": "broadest balanced improvement of the line: GSM8K .652 -> .677, "
                  "MC average recovered, best ppl; OBQA/Wino changes within noise.",
+    },
+    "v0.6.5": {
+        "extends": "v0.6.4",
+        "status": "candidate",
+        "description": "decoder-time codebook availability during teacher forcing",
+        "env": {"ONLINE_CODEBOOK_MASK": "1"},
+        "notes": "unmeasured candidate; removes train-generation vocabulary "
+                 "leakage while preserving v0.6.4 as the current standard",
     },
 }
 
@@ -296,9 +305,17 @@ def _cmd_list():
     width = max(len(n) for n in RECIPES)
     for name in RECIPES:
         spec = RECIPES[name]
-        mark = {"current": "*", "negative": "!", "superseded": " "}[spec["status"]]
+        mark = {
+            "current": "*",
+            "candidate": "+",
+            "negative": "!",
+            "superseded": " ",
+        }[spec["status"]]
         print(f"{mark} {name:<{width}}  {spec['status']:<10}  {spec['description']}")
-    print(f"\n* = current standard recipe ({CURRENT})   ! = measured negative result")
+    print(
+        f"\n* = current standard recipe ({CURRENT})   "
+        "+ = unmeasured candidate   ! = measured negative result"
+    )
 
 
 def _cmd_show(name):
@@ -367,6 +384,9 @@ def main(argv):
     if status == "negative":
         print(f"[recipe] WARNING: {name} is a MEASURED NEGATIVE RESULT "
               f"({RECIPES[name]['notes']})", file=sys.stderr)
+    elif status == "candidate":
+        print(f"[recipe] note: {name} is an UNMEASURED CANDIDATE; the current "
+              f"standard recipe remains {CURRENT}", file=sys.stderr)
     elif name != CURRENT:
         print(f"[recipe] note: {name} is superseded; the current standard recipe "
               f"is {CURRENT}", file=sys.stderr)

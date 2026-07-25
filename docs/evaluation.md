@@ -166,11 +166,40 @@ could restore:
   changes the composed hypertoken embedding by exactly the first-token term.
   `scripts/inference.py` logs the same thing as `[inference] hyper-encoder
   residual: disabled from meta.pt`.
+- `decoder-time online codebook mask: enabled from meta.pt (active in this
+  eval)` — for a v0.6.5 checkpoint in compressed mode. Teacher-forced scoring
+  replays the same incremental Rust decoder as generation and masks every
+  uninstalled row. The results JSON records both the checkpoint flag
+  (`online_codebook_mask`) and whether it was active in this evaluation
+  (`online_codebook_mask_active`); the pipeline audits both. Rare legal
+  unknown-next-row targets that the current generator cannot represent are
+  excluded only for rolling perplexity and counted as
+  `compression.online_skipped_targets`. Request-based `loglikelihood` scoring
+  (including MC) fails loudly if one occurs in the continuation: skipping a
+  negative term would bias the option score and could also corrupt
+  `is_greedy`.
 
 The v0.6.4 encoder zero-init (`ZERO_INIT_ENCODER_OUTPUT=1`) deliberately has **no**
 eval health line: it only changes the initial weights, which the checkpoint load
 overwrites, so it cannot affect eval. Its counterpart lives in the *training* log
 as `[encoder_zero_init] zeroed={...}`.
+
+GSM8K generation already used the incremental dictionary before v0.6.5, so its
+paired delta isolates the effect of training with the corrected vocabulary.
+Compressed MC and perplexity use teacher forcing: their v0.6.5 deltas combine
+the weight change with exact-mask renormalization. For rolling perplexity, the
+very rare excluded targets still contribute bytes to lm-eval's external
+denominator, so inspect and report `online_skipped_targets`. A successful MC
+evaluation has zero skipped continuation targets by construction; otherwise
+the adapter aborts before reporting a score.
+
+Exact decoder replay currently performs one Rust manager update per compressed
+input token from a Python loop. The results JSON records total task time as
+`eval_wall_seconds`, plus replay requests, tokens, total seconds, milliseconds
+per request, and microseconds per token under
+`compression.online_replay_*`. Before a full v0.6.5 evaluation, time one
+complete MC task and compare both wall-clock and these counters with the same
+task under the historical mask.
 
 Generation-mode runs should show `gen_compression_ratio ≈ 1.4` (a healthy model
 emits hyper-tokens; ~1.0 means it never does). Before any full eval of a new

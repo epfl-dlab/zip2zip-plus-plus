@@ -67,6 +67,11 @@
 #   ZERO_INIT_ENCODER_OUTPUT= set 1 to start the hyper-encoder at exactly zero
 #                     (v0.6.4 recipe — fixes a silent init no-op). Training-only
 #                     (init), so evals need nothing.
+#   ONLINE_CODEBOOK_MASK= set 1 to train with decoder-time codebook availability
+#                     instead of the k<=t approximation (v0.6.5 candidate).
+#                     The checkpoint records it so compressed offline eval
+#                     automatically uses the matching mask; generation is
+#                     already incremental.
 #   FINAL_LIMIT=      per-task sample limit for the FINAL eval (default: full).
 #                     Only for pipeline rehearsals — never for real numbers.
 # Anything else the finetune launcher reads (LR, SEQ_LEN, ...) passes through.
@@ -200,13 +205,18 @@ cd "$PROJECT_DIR"
 
 # Audit: the results JSON must record the eval flags we asked for. Catches
 # plumbing regressions where a control run (EVAL_MODE=base) or a digit-protected
-# run (DISABLE_DIGIT_IDS=1) silently falls back to defaults. No-op when neither
-# env is set.
+# run (DISABLE_DIGIT_IDS=1) silently falls back to defaults. The online-mask
+# check also proves that the evaluator recovered the training behavior from
+# meta.pt. No-op when none of these env vars is set.
 audit_eval_mode() {
-    [ -z "${EVAL_MODE:-}" ] && [ -z "${DISABLE_DIGIT_IDS:-}" ] && return 0
-    python - "$1" "${EVAL_MODE:-}" "${DISABLE_DIGIT_IDS:-}" <<'PY'
+    [ -z "${EVAL_MODE:-}" ] \
+        && [ -z "${DISABLE_DIGIT_IDS:-}" ] \
+        && [ -z "${ONLINE_CODEBOOK_MASK:-}" ] \
+        && return 0
+    python - "$1" "${EVAL_MODE:-}" "${DISABLE_DIGIT_IDS:-}" \
+        "${ONLINE_CODEBOOK_MASK:-}" <<'PY'
 import json, sys
-path, want_mode, want_digits = sys.argv[1], sys.argv[2], sys.argv[3]
+path, want_mode, want_digits, want_online_raw = sys.argv[1:5]
 args = json.load(open(path))["args"]
 if want_mode:
     got = args["eval_mode"]
@@ -214,6 +224,19 @@ if want_mode:
 if want_digits:
     got = args.get("disable_digit_ids")
     assert got is True, f"digit-flag audit FAILED: {path} recorded disable_digit_ids={got!r}, expected True"
+if want_online_raw:
+    want_online = want_online_raw != "0"
+    got = args.get("online_codebook_mask")
+    assert got is want_online, (
+        f"online-mask audit FAILED: {path} recorded "
+        f"online_codebook_mask={got!r}, expected {want_online!r}"
+    )
+    got_active = args.get("online_codebook_mask_active")
+    want_active = want_online and args.get("eval_mode") == "compressed"
+    assert got_active is want_active, (
+        f"online-mask audit FAILED: {path} recorded "
+        f"online_codebook_mask_active={got_active!r}, expected {want_active!r}"
+    )
 print(f"[pipeline] eval-flags audit OK: {path}")
 PY
 }

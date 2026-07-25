@@ -41,6 +41,7 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 from zip2zip_compression import LZWCompressor
 
+from zip2zip_core.data import online_codebook_counts, online_unavailable_targets
 from zip2zip_core.lm_eval_adapter import Zip2ZipLM
 from lm_eval.utils import get_rolling_token_windows, make_disjoint_window
 
@@ -147,10 +148,53 @@ def train_style_replay(lm, chunk, mask, seq_len, disabled_ids, tokenizer):
         if not lm_mask.any():
             return None
         y[0][~lm_mask.to(lm.device)] = -100
-    cb = lm._codebook_to_tensor(codebook).unsqueeze(0).to(lm.device)
+    recorded_active_k = lm.train_args.get("max_active_codebook_size")
+    active_k = (
+        cfg.max_codebook_size
+        if recorded_active_k is None
+        else int(recorded_active_k)
+    )
+    cb = (
+        lm._codebook_to_tensor(codebook)[:active_k]
+        .unsqueeze(0)
+        .to(lm.device)
+    )
+    out_of_range_input = x >= cfg.vocab_size + active_k
+    if out_of_range_input.any():
+        bad_id = int(x[out_of_range_input][0].item())
+        raise RuntimeError(
+            f"train-style replay input hyper-token {bad_id} exceeds "
+            f"max_active_codebook_size={active_k}"
+        )
+    codebook_counts = None
+    online_skipped = 0
+    if lm.online_codebook_mask:
+        compressor_args = {
+            "initial_vocab_size": cfg.vocab_size,
+            "max_codebook_size": cfg.max_codebook_size,
+            "max_subtokens": cfg.max_subtokens,
+            "pad_token_id": cfg.pad_token_id,
+            "disabled_ids": list(disabled_ids),
+        }
+        counts_cpu = online_codebook_counts(
+            compressed[:-1], codebook, compressor_args
+        )
+        unavailable = online_unavailable_targets(
+            y[0].cpu(), counts_cpu, cfg.vocab_size, cb.shape[1]
+        )
+        online_skipped = int(unavailable.sum().item())
+        y[0][unavailable.to(lm.device)] = -100
+        if not (y != -100).any():
+            return None
+        codebook_counts = counts_cpu.unsqueeze(0).to(lm.device)
 
     with torch.autocast(device_type=lm.device.type, dtype=lm._dtype):
-        out = lm.model(x, codebook=cb, hyper_causal_mask=True)
+        out = lm.model(
+            x,
+            codebook=cb,
+            hyper_causal_mask=True,
+            codebook_counts=codebook_counts,
+        )
     logits = (out[0] if isinstance(out, tuple) else out).flatten(0, 1).float()
     labels = y.flatten(0, 1)
     per_tok = F.cross_entropy(logits, labels, reduction="none", ignore_index=-100)
@@ -165,6 +209,7 @@ def train_style_replay(lm, chunk, mask, seq_len, disabled_ids, tokenizer):
         n_comp=len(compressed),
         n_bytes=n_bytes,
         valid_frac=valid_frac,
+        online_skipped=online_skipped,
         acc=(logits[valid].argmax(-1) == labels[valid]).float().mean().item(),
     )
 
@@ -218,12 +263,23 @@ def main():
     )
     log(f"cfg: vocab={lm.cfg.vocab_size} max_codebook={lm.cfg.max_codebook_size} "
         f"max_subtokens={lm.cfg.max_subtokens} pad={lm.cfg.pad_token_id}")
-    log(f"train_args from meta.pt: { {k: lm.train_args.get(k) for k in ('model_config', 'seq_len', 'max_subtokens', 'max_codebook_size', 'max_active_codebook_size', 'lora_rank', 'lora_alpha', 'hyper_causal_mask', 'no_remap_codebook', 'data_dir', 'tokenizer')} }")
+    log(f"train_args from meta.pt: { {k: lm.train_args.get(k) for k in ('model_config', 'seq_len', 'max_subtokens', 'max_codebook_size', 'max_active_codebook_size', 'lora_rank', 'lora_alpha', 'hyper_causal_mask', 'online_codebook_mask', 'no_remap_codebook', 'data_dir', 'tokenizer')} }")
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     special = set(tokenizer.all_special_ids or [])
     added = set(tokenizer.get_added_vocab().values())
-    train_disabled = sorted(i for i in (special | added) if 0 <= i < lm.cfg.vocab_size)
+    train_disabled = {
+        i for i in (special | added) if 0 <= i < lm.cfg.vocab_size
+    }
+    if lm.train_args.get("disable_digit_ids"):
+        digit_pieces = {str(d) for d in range(10)} | {
+            f"▁{d}" for d in range(10)
+        }
+        train_disabled.update(
+            i for piece, i in tokenizer.get_vocab().items()
+            if piece in digit_pieces and 0 <= i < lm.cfg.vocab_size
+        )
+    train_disabled = sorted(train_disabled)
     log(f"training disabled_ids ({len(train_disabled)}): {train_disabled}")
     log(f"adapter disabled_ids  ({len(lm._disabled_ids)}): {lm._disabled_ids} "
         f"(match={list(lm._disabled_ids) == train_disabled})")
@@ -231,7 +287,7 @@ def main():
     chunks = load_chunks(args.data_dir, args.n_chunks, args.seq_len * 2, args.start_frac)
 
     log("=== step 2: train-style replay (exact data.py/train.py recipe) ===")
-    agg = dict(ce=0.0, base=0, valid=0, comp=0, bytes=0)
+    agg = dict(ce=0.0, base=0, valid=0, comp=0, bytes=0, online_skipped=0)
     accs = []
     for i, (chunk, mask) in enumerate(chunks):
         m = train_style_replay(lm, chunk, mask, args.seq_len, train_disabled, tokenizer)
@@ -242,9 +298,11 @@ def main():
             f"nats/valid_comp={m['ce_sum'] / max(m['n_valid'], 1):.4f} "
             f"nats/byte={m['ce_sum'] / m['n_bytes']:.4f} "
             f"acc={m['acc']:.3f} compression={m['n_base'] / m['n_comp']:.3f} "
-            f"valid_frac={m['valid_frac']:.3f}")
+            f"assistant_valid_frac_before_online={m['valid_frac']:.3f} "
+            f"online_skipped={m['online_skipped']}")
         agg["ce"] += m["ce_sum"]; agg["base"] += m["n_base"]; agg["valid"] += m["n_valid"]
-        agg["comp"] += m["n_comp"]; agg["bytes"] += m["n_bytes"]; accs.append(m["acc"])
+        agg["comp"] += m["n_comp"]; agg["bytes"] += m["n_bytes"]
+        agg["online_skipped"] += m["online_skipped"]; accs.append(m["acc"])
 
     if agg["base"] == 0:
         raise SystemExit("No scorable chunks — check DATA_DIR / start_frac.")
@@ -255,7 +313,8 @@ def main():
         f"(W&B step-8000 'loss' was ~1.63) | nats/valid-comp-token={agg['ce'] / agg['valid']:.4f} "
         f"| bits/byte={train_nats_byte / math.log(2):.4f} | byte_ppl={math.exp(train_nats_byte):.4f} "
         f"| acc={sum(accs) / len(accs):.3f} (W&B acc ~0.5x) "
-        f"| compression={agg['base'] / agg['comp']:.3f} (W&B ~1.45-1.50)")
+        f"| compression={agg['base'] / agg['comp']:.3f} (W&B ~1.45-1.50) "
+        f"| online_skipped={agg['online_skipped']}")
 
     log("=== step 3: eval-style rolling windows on the SAME data (real adapter scorer) ===")
     for max_len in (1024, 2048):

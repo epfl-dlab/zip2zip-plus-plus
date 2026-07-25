@@ -7,9 +7,10 @@ perplexity over long texts.
 Two scoring modes:
 
 * "compressed" (default): apply LZW compression over (context + continuation),
-  run the model with the resulting codebook and `hyper_causal_mask=True`
-  (matching `scripts/eval_lm.sh`), then sum the logprobs of compressed tokens
-  whose base-position span is at or after the continuation boundary.
+  then sum the logprobs of compressed tokens whose base-position span is at or
+  after the continuation boundary. v0.1-v0.6.4 checkpoints use the historical
+  `k <= t` codebook mask. A v0.6.5+ checkpoint records the exact decoder-time
+  mask in `meta.pt`, and this adapter restores it automatically.
 
 * "base": skip compression, feed raw base tokens with no codebook (vanilla LM
   path of the model), and read logprobs from the base-vocab logits. This is OOD
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import time
 from typing import List, Tuple
 
 import torch
@@ -33,6 +35,7 @@ from zip2zip_compression import (
 )
 
 from zip2zip_core.configs import zip2zip_llama_configs
+from zip2zip_core.data import online_codebook_counts, online_unavailable_targets
 from zip2zip_core.model import Zip2ZipLlama3Model, restore_encoder_residual
 
 from lm_eval.api.model import LM
@@ -305,6 +308,20 @@ class Zip2ZipLM(LM):
         self.eval_mode = eval_mode
         self._batch_size = int(batch_size)
         self.hyper_causal_mask = bool(hyper_causal_mask)
+        self.online_codebook_mask = bool(
+            (self.train_args or {}).get("online_codebook_mask")
+        )
+        self.online_codebook_mask_active = bool(
+            self.online_codebook_mask
+            and self.eval_mode == "compressed"
+            and self.hyper_causal_mask
+        )
+        if self.online_codebook_mask:
+            state = "active" if self.online_codebook_mask_active else "inactive"
+            print(
+                "[zip2zip-lm-eval] decoder-time online codebook mask: "
+                f"enabled from meta.pt ({state} in this eval)"
+            )
 
         # Generation must stop on every eos the base model declares, not just
         # tokenizer.eos_token_id: Phi-3.5's generation_config lists
@@ -326,6 +343,13 @@ class Zip2ZipLM(LM):
         # in_*: full (context + continuation) sequences fed for scoring.
         # gen_*: tokens emitted by generate_until.
         self.compression_stats = {"in_comp": 0, "in_base": 0, "gen_comp": 0, "gen_base": 0}
+        if self.online_codebook_mask_active:
+            self.compression_stats.update(
+                online_skipped_targets=0,
+                online_replay_requests=0,
+                online_replay_tokens=0,
+                online_replay_seconds=0.0,
+            )
 
         self._compressor_kwargs = dict(
             initial_vocab_size=self.cfg.vocab_size,
@@ -430,7 +454,11 @@ class Zip2ZipLM(LM):
 
     @torch.no_grad()
     def _score_compressed(
-        self, full_ids: List[int], cont_start_base: int
+        self,
+        full_ids: List[int],
+        cont_start_base: int,
+        *,
+        reject_unavailable_targets: bool = False,
     ) -> Tuple[float, bool, int, int]:
         """Compress full_ids, run the model, sum logprobs of compressed tokens
         whose base span starts at or after `cont_start_base`.
@@ -463,9 +491,38 @@ class Zip2ZipLM(LM):
 
         x = torch.tensor(compressed[:-1], dtype=torch.long, device=self._device).unsqueeze(0)
         cb = self._codebook_to_tensor(codebook).to(self._device).unsqueeze(0)
+        codebook_counts = None
+        unavailable = None
+        if self.online_codebook_mask_active:
+            replay_start = time.perf_counter()
+            counts_cpu = online_codebook_counts(
+                compressed[:-1], codebook, self._compressor_kwargs
+            )
+            self.compression_stats["online_replay_seconds"] += (
+                time.perf_counter() - replay_start
+            )
+            self.compression_stats["online_replay_requests"] += 1
+            self.compression_stats["online_replay_tokens"] += len(compressed) - 1
+            targets_cpu = torch.tensor(compressed[1:], dtype=torch.long)
+            unavailable = online_unavailable_targets(
+                targets_cpu, counts_cpu, V, cb.shape[1]
+            ).tolist()
+            codebook_counts = counts_cpu.to(self._device).unsqueeze(0)
 
         with torch.autocast(device_type=self._device.type, dtype=self._dtype):
-            out = self.model(x, codebook=cb, hyper_causal_mask=self.hyper_causal_mask)
+            if codebook_counts is None:
+                # Preserve the historical scorer exactly for v0.1-v0.6.4 and
+                # for explicit --no_hyper_causal_mask diagnostics.
+                out = self.model(
+                    x, codebook=cb, hyper_causal_mask=self.hyper_causal_mask
+                )
+            else:
+                out = self.model(
+                    x,
+                    codebook=cb,
+                    hyper_causal_mask=self.hyper_causal_mask,
+                    codebook_counts=codebook_counts,
+                )
         logits = out[0] if isinstance(out, tuple) else out
         log_probs = F.log_softmax(logits[0].float(), dim=-1)
 
@@ -477,6 +534,17 @@ class Zip2ZipLM(LM):
             target = compressed[t + 1]
             bstart, bend = spans[t + 1]
             if bstart < cont_start_base:
+                continue
+            if unavailable is not None and unavailable[t]:
+                self.compression_stats["online_skipped_targets"] += 1
+                if reject_unavailable_targets:
+                    raise RuntimeError(
+                        "online codebook target is unavailable inside a "
+                        "loglikelihood continuation; skipping it would bias "
+                        "the request score and is_greedy result "
+                        f"(compressed_position={t + 1}, target_id={target}). "
+                        "The evaluation was stopped instead."
+                    )
                 continue
             total += log_probs[t, target].item()
             if int(log_probs[t].argmax().item()) != target:
@@ -514,10 +582,20 @@ class Zip2ZipLM(LM):
             n += 1
         return total, is_greedy, n, n
 
-    def _score(self, full_ids: List[int], cont_start_base: int):
+    def _score(
+        self,
+        full_ids: List[int],
+        cont_start_base: int,
+        *,
+        reject_unavailable_targets: bool = False,
+    ):
         if self.eval_mode == "base":
             return self._score_base(full_ids, cont_start_base)
-        return self._score_compressed(full_ids, cont_start_base)
+        return self._score_compressed(
+            full_ids,
+            cont_start_base,
+            reject_unavailable_targets=reject_unavailable_targets,
+        )
 
     def compression_summary(self) -> dict:
         """Raw counters plus derived ratios (base tokens per compressed token,
@@ -528,6 +606,16 @@ class Zip2ZipLM(LM):
             s["input_compression_ratio"] = s["in_base"] / s["in_comp"]
         if s["gen_comp"]:
             s["gen_compression_ratio"] = s["gen_base"] / s["gen_comp"]
+        if s.get("online_replay_requests"):
+            s["online_replay_ms_per_request"] = (
+                1000 * s["online_replay_seconds"]
+                / s["online_replay_requests"]
+            )
+        if s.get("online_replay_tokens"):
+            s["online_replay_us_per_token"] = (
+                1_000_000 * s["online_replay_seconds"]
+                / s["online_replay_tokens"]
+            )
         return s
 
     # ──────────────────────── lm-eval interface ───────────────────────────
@@ -564,7 +652,11 @@ class Zip2ZipLM(LM):
             else:
                 cont_start_base = len(ctx_ids)
 
-            lp, greedy, _, _ = self._score(full_ids, cont_start_base)
+            lp, greedy, _, _ = self._score(
+                full_ids,
+                cont_start_base,
+                reject_unavailable_targets=True,
+            )
             out.append((lp, greedy))
         return out
 

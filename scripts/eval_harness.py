@@ -27,6 +27,7 @@ import glob
 import json
 import os
 import sys
+import time
 
 # Make src/ and torchtitan importable when run as a standalone script.
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -169,16 +170,23 @@ def main():
     args.disable_digit_ids = lm.disable_digit_ids
     args.disable_mathsym_ids = lm.disable_mathsym_ids
     args.eval_mode = lm.eval_mode
+    args.online_codebook_mask = lm.online_codebook_mask
+    args.online_codebook_mask_active = lm.online_codebook_mask_active
 
     if preset_info:
         print(f"[eval_harness] preset: {preset_info[0]} — {preset_info[1]}")
     print(f"[eval_harness] checkpoint:   {ckpt_dir}")
     print(f"[eval_harness] tasks:        {tasks}")
     print(f"[eval_harness] eval_mode:    {args.eval_mode}")
+    print(
+        f"[eval_harness] online mask:  checkpoint={args.online_codebook_mask} "
+        f"active={args.online_codebook_mask_active}"
+    )
     print(f"[eval_harness] include_path: {include_path}")
 
     task_manager = TaskManager(include_path=include_path) if include_path else TaskManager()
 
+    eval_start = time.perf_counter()
     results = simple_evaluate(
         model=lm,
         tasks=tasks,
@@ -195,6 +203,7 @@ def main():
         apply_chat_template=getattr(args, 'apply_chat_template', False),
         fewshot_as_multiturn=getattr(args, 'fewshot_as_multiturn', False),
     )
+    eval_wall_seconds = time.perf_counter() - eval_start
 
     print("\n" + "=" * 72)
     print("Results:")
@@ -204,6 +213,7 @@ def main():
     compression = lm.compression_summary()
     print("Compression (base tokens per compressed token, >1 = more compression):")
     print(json.dumps(compression, indent=2))
+    print(f"Evaluation wall time: {eval_wall_seconds:.1f}s")
     print("=" * 72)
 
     if not args.no_log_samples:
@@ -251,9 +261,17 @@ def main():
             results["versions"] = {k: str(v) for k, v in results["versions"].items()}
         wandb_logger.post_init(results)
         wandb_logger.log_eval_result()
-        wandb.log(
-            {f"eval/{k}": v for k, v in compression.items() if k.endswith("_ratio")}
-        )
+        eval_stats = {
+            f"eval/{k}": v
+            for k, v in compression.items()
+            if (
+                k.endswith("_ratio")
+                or k == "online_skipped_targets"
+                or k.startswith("online_replay_")
+            )
+        }
+        eval_stats["eval/wall_seconds"] = eval_wall_seconds
+        wandb.log(eval_stats)
         if not args.no_log_samples and "samples" in results:
             wandb_logger.log_eval_samples(results["samples"])
         print(f"[eval_harness] Results logged to W&B: {wandb_logger.run.url}")
@@ -268,6 +286,7 @@ def main():
                     "results": results.get("results"),
                     "configs": results.get("configs"),
                     "compression": compression,
+                    "eval_wall_seconds": eval_wall_seconds,
                     "ckpt_dir": ckpt_dir,
                     "tasks": tasks,
                     "args": vars(args),

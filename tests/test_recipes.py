@@ -9,7 +9,8 @@ under pytest.
 Invariants proven:
   R1  the registry is internally consistent: exactly one status=current, CURRENT
       points at it, every `extends` resolves, no inheritance cycles.
-  R2  v0.6.4 resolves to exactly the five documented levers.
+  R2  v0.6.4 resolves to the five validated levers; v0.6.5 is exactly that
+      parent plus the one candidate online-mask lever.
   R3  the ledger property: every recipe differs from its parent by exactly the
       keys in its own `env` block (so the file reads as "parent + one change").
   R4  every env key any recipe sets is ACTUALLY CONSUMED by both launchers — the
@@ -68,6 +69,10 @@ EXPECTED_V064 = {
     "TOKEN_TYPE_LOSS_WEIGHT": "0.05",
     "ZERO_INIT_ENCODER_OUTPUT": "1",
 }
+EXPECTED_V065 = {
+    **EXPECTED_V064,
+    "ONLINE_CODEBOOK_MASK": "1",
+}
 
 
 def bash(script):
@@ -91,6 +96,11 @@ def main():
     check("R2_current_resolves_to_five_levers",
           R.resolve("v0.6.4") == EXPECTED_V064,
           f"{sorted(R.resolve('v0.6.4').items())}")
+    check("R2_v065_is_v064_plus_online_mask",
+          R.resolve("v0.6.5") == EXPECTED_V065
+          and R.RECIPES["v0.6.5"]["extends"] == "v0.6.4"
+          and R.RECIPES["v0.6.5"]["status"] == "candidate",
+          f"{sorted(R.resolve('v0.6.5').items())}")
 
     # ---- R3: ledger property — each version = parent + its own env block ----
     offenders = []
@@ -140,6 +150,13 @@ def main():
     for label, script, want in cases:
         got = bash(script).stdout.strip()
         check(f"R5_{label.replace(' ', '_')}", got == want, f"got {got!r} want {want!r}")
+    candidate_cmd = (
+        f'R=$({sys.executable} scripts/recipes.py v0.6.5 2>/dev/null); '
+        'ONLINE_CODEBOOK_MASK=0; eval "$R"; echo "$ONLINE_CODEBOOK_MASK"'
+    )
+    check("R5_candidate_explicit_off_wins",
+          bash(candidate_cmd).stdout.strip() == "0",
+          "ONLINE_CODEBOOK_MASK=0 overrides the v0.6.5 candidate")
 
     # ---- R6: unknown name is fatal ----
     bad = subprocess.run([sys.executable, RECIPES_PY, "v9.9"],
@@ -152,6 +169,16 @@ def main():
     check("R6_negative_recipe_warns_but_works",
           neg.returncode == 0 and "WARNING" in neg.stderr and "WARMSTART_STEPS" in neg.stdout,
           "a measured-negative recipe still resolves, loudly")
+    candidate = subprocess.run(
+        [sys.executable, RECIPES_PY, "v0.6.5"],
+        capture_output=True,
+        text=True,
+    )
+    check("R6_candidate_warns_but_works",
+          candidate.returncode == 0
+          and "UNMEASURED CANDIDATE" in candidate.stderr
+          and "ONLINE_CODEBOOK_MASK" in candidate.stdout,
+          "candidate resolves, but cannot be mistaken for the current standard")
 
     # ---- R7: identify() round-trip, for EVERY recipe ----
     wrong = []

@@ -976,6 +976,7 @@ class Zip2ZipLlama3Model(Decoder):
         codebook_updates: torch.Tensor | None = None,
         codebook_updates_indices: list[list[int]] | None = None,
         hyper_causal_mask: bool = False,
+        codebook_counts: torch.Tensor | None = None,
     ):
         """Forward pass with zip2zip compressed tokens.
 
@@ -994,7 +995,18 @@ class Zip2ZipLlama3Model(Decoder):
             codebook_updates: (B, max_updates, max_subtokens) new codebook entries (inference)
             codebook_updates_indices: per-batch buffer write indices (inference)
             hyper_causal_mask: if True, mask future codebook entries at each position (training only)
+            codebook_counts: optional (B, T) exact number of decoder-installed
+                rows after each input token. Takes precedence over the legacy
+                position-based hyper causal mask.
         """
+        if codebook_counts is not None:
+            if codebook is None:
+                raise ValueError("codebook_counts requires a full training codebook")
+            if codebook_counts.shape != tokens.shape:
+                raise ValueError(
+                    f"codebook_counts shape {tuple(codebook_counts.shape)} must "
+                    f"match tokens shape {tuple(tokens.shape)}"
+                )
 
         # === Embedding ===
         with torch.profiler.record_function("hyper_encoder"):
@@ -1054,9 +1066,20 @@ class Zip2ZipLlama3Model(Decoder):
                     hyper_logits = hyper_logits.masked_fill(
                         ~codebook_used.unsqueeze(1), float("-inf")
                     )
-                    # Hyper causal mask: entry k is created at LZW step k,
-                    # so at position t only entries with k <= t are available.
-                    if hyper_causal_mask:
+                    if codebook_counts is not None:
+                        # Exact decoder-time mask: after consuming token t, only
+                        # the first count[t] sequential LZW rows exist.
+                        K = hyper_embeds.shape[1]
+                        entry_idx = torch.arange(
+                            K, device=h.device
+                        ).view(1, 1, K)
+                        hyper_logits = hyper_logits.masked_fill(
+                            entry_idx >= codebook_counts.unsqueeze(-1),
+                            float("-inf"),
+                        )
+                    # Legacy approximation: entry k is assumed to be created at
+                    # compressed position k, so k <= t is exposed.
+                    elif hyper_causal_mask:
                         T = h.shape[1]
                         K = hyper_embeds.shape[1]
                         pos = torch.arange(T, device=h.device).view(1, T, 1)

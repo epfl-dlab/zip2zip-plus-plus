@@ -94,8 +94,14 @@ def main():
             raise SystemExit(f"No numeric metrics found in {args.json}")
         compression = data.get("compression") or {}
         for k, v in compression.items():
-            if k.endswith("_ratio"):
+            if (
+                k.endswith("_ratio")
+                or k == "online_skipped_targets"
+                or k.startswith("online_replay_")
+            ):
                 flat[f"eval/{k}"] = v
+        if isinstance(data.get("eval_wall_seconds"), (int, float)):
+            flat["eval/wall_seconds"] = data["eval_wall_seconds"]
     elif not args.append_notes and not args.resolve_pending:
         raise SystemExit("Nothing to do: pass --json, --append_notes and/or --resolve_pending.")
 

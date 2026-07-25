@@ -48,6 +48,9 @@ Three things worth knowing about how it behaves:
 - **Older lever sets are selectable by name** (`RECIPE=v0.5`). Selecting a
   superseded recipe prints a note; selecting one of the two measured *negative*
   results (`v0.6` warm-start, `v0.6.1` deeper encoder) prints a loud warning.
+- **An unmeasured candidate is marked `+`**. `RECIPE=v0.6.5` is available for
+  verification and launch, but v0.6.4 remains the current standard until the
+  paired full evaluation is complete.
 - **An unknown name is a fatal error**, never a silent fallback to "no levers".
   Both launchers print the resolved `RECIPE=` in their banner, and `meta.pt`
   records every resolved flag, so the effective experimental levers are
@@ -522,6 +525,105 @@ to compression was this bug. **Recommendation: keep
 `zero_init_encoder_output` in the standard named recipe while retaining its
 low-level default-off behavior.** This applies the correctness fix to new runs
 without changing frozen v0.1–v0.6.3 commands.
+
+## Exact decoder-time codebook mask (v0.6.5 candidate)
+
+**Definition: `v0.6.5 = v0.6.4 + ONLINE_CODEBOOK_MASK=1`.** This is an
+unmeasured candidate. v0.6.4 remains the current standard until v0.6.5 finishes
+the same 8k training and paired full evaluation.
+
+The legacy teacher-forced path receives the final LZW codebook, including rows
+created later in the sequence, and approximates availability with `row k <=
+compressed position t`. That is not the vocabulary available to generation.
+The generator reconstructs a decoder codebook from the emitted base-token
+expansions; after input token `x[t]`, it can score only the rows that decoder has
+actually installed. Encoder insertion time is not sufficient here: even for
+`[1,2,1,2] -> [1,2,V]`, the encoder creates row `V` while emitting the first
+code, but the online decoder cannot reconstruct that row until it has consumed
+the second code.
+
+With the flag on, the dataloader replays each compressed input through the same
+Rust `CodebookManager` used by generation and records `count[t]`, the number of
+sequential rows installed after `x[t]`. The model masks row `k` exactly when
+`k >= count[t]`. This also hides rows created beyond a truncated training
+window. The implementation deliberately supports only the canonical LM,
+unremapped-codebook path; incompatible modes fail before distributed or GPU
+initialization. The flag is default-off and resume-hard, so every historical
+recipe keeps its old behavior and a v0.6.4 checkpoint cannot be resumed and
+relabeled v0.6.5.
+
+There is one rare codec edge case. A legal LZW stream can emit the next row ID
+before the decoder has installed that row (KwKwK/cScSc). The current generator
+cannot score that ID because it has no output embedding for an uninstalled row.
+During training and rolling-perplexity evaluation, v0.6.5 therefore sets only
+that target to `-100`; any target more than one row ahead is treated as a codec
+error. A target whose original slot is outside the collated model vocabulary
+(`slot >= max_active_codebook_size`) is also unscorable and masked. An input ID
+outside that active vocabulary fails loudly instead of reaching an out-of-range
+logit or embedding lookup. In the 64-window pre-run diagnostic, the
+unknown-next-row case was 22 of 125,734 valid targets (0.0175%). Training logs
+expose both `online_skip=<rate>` and the count, and final compressed-eval
+JSON/W&B records `online_skipped_targets`.
+
+The same exact mask is restored automatically from `meta.pt` for compressed
+teacher-forced evaluation (MC and perplexity). Generation needs no new flag:
+GSM8K already uses the incremental decoder codebook. Consequently:
+
+- a paired GSM8K change measures what the retrained weights learned;
+- MC and perplexity changes combine retraining with the mechanical
+  renormalization after unavailable logits are removed;
+- compressed `loglikelihood` scoring, including MC tasks, aborts if an
+  unavailable target occurs inside a continuation. Omitting that negative
+  log-probability term would favor options with more omissions and could also
+  leave `is_greedy=True` after an untested position. Therefore every valid MC
+  result must have zero skipped continuation targets;
+- the rare skipped target makes rolling perplexity very slightly optimistic,
+  because the external text denominator still contains its bytes. Always
+  report `online_skipped_targets`; a v0.6.4 checkpoint scored with the exact
+  mask is the attribution diagnostic if the MC/PPL delta matters.
+
+The 64-window short test on the frozen v0.6.4 checkpoint found that the legacy
+mask assigned 3.68% probability mass to unavailable rows and chose one as
+argmax on 1.13% of valid positions. Removing them changed teacher-forced
+next-token accuracy from 49.405% to 50.150% (+0.745 percentage points). This is
+a mechanism check, not a benchmark forecast: GSM8K generation already removed
+those rows, so the expected reason to run v0.6.5 is train-generation alignment,
+not a guaranteed score increase.
+
+The earlier 1.28% estimate used the encoder's row-insertion schedule. It is not
+the same quantity as the 3.68% result above: the online decoder can install a
+row only after it has received enough emitted-token expansions to reconstruct
+it, which is one step later even in the simple ideal-LZW case. Decoder
+installation is the inference-relevant schedule, so 3.68% is the correct
+estimate for this lever; the earlier 1.28% was a useful but less restrictive
+proxy.
+
+After committing, pushing, and pulling these changes on RCP, launch the
+candidate with the named recipe:
+
+```bash
+runai-rcp-prod submit --name ft-onlinecb-v065 \
+  --image ghcr.io/jkminder/dlab-runai-images/pytorch:master \
+  --gpu 4 --cpu 16 --memory 128Gi \
+  --pvc dlab-scratch:/mnt --large-shm --node-pools h100 \
+  --environment WANDB_API_KEY=$WANDB_API_KEY \
+  --environment RUN_NAME=andrea-z2z-phi35-4B-onlinecb-1BData-v0.6.5-Zip2zipCore \
+  --environment RECIPE=v0.6.5 \
+  -- "bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
+```
+
+Before an 8k launch, the required gate is every CPU invariant suite plus a
+20-step, four-H100 smoke with `RECIPE=v0.6.5`. Check finite loss/gradients,
+nonzero `online_skip`, the resolved flag in the log, and steady-state throughput
+against v0.6.4 (~32.9k tokens/s); the extra cost is CPU-side Rust replay. Then
+run one complete MC task (for example `TASKS=arc_easy`, `PRESET=default`) on the
+smoke checkpoint before the full 8k pipeline. Record wall-clock time and inspect
+`eval_wall_seconds`, `compression.online_replay_seconds`,
+`online_replay_requests`,
+`online_replay_tokens`, `online_replay_ms_per_request`, and
+`online_replay_us_per_token`. The run must complete with zero
+`online_skipped_targets`; otherwise its MC score is rejected rather than
+reported.
 
 ## Canonical RCP locations and run conventions
 

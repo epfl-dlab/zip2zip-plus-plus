@@ -367,10 +367,12 @@ def validate_resume_args(resume_dir, args):
     if not os.path.exists(meta_path):
         return
     prev = torch.load(meta_path, map_location="cpu", weights_only=False).get("args", {}) or {}
-    hard = ("disable_digit_ids", "max_codebook_size", "tokenizer",
+    hard = ("disable_digit_ids", "max_codebook_size",
+            "max_active_codebook_size", "tokenizer",
             "untied_hyper_encoder", "base_token_positions",
             "zero_init_encoder_output", "no_encoder_residual",
-            "token_type_loss_weight", "encoder_dim", "encoder_n_layers",
+            "token_type_loss_weight", "online_codebook_mask",
+            "encoder_dim", "encoder_n_layers",
             "encoder_n_heads", "encoder_intermediate_size")
     soft = ("max_subtokens", "seq_len", "data_dir", "warmstart_steps")
     # Hard keys whose ABSENCE from an old meta.pt has an unambiguous meaning:
@@ -385,6 +387,7 @@ def validate_resume_args(resume_dir, args):
         "zero_init_encoder_output": False,
         "no_encoder_residual": False,
         "token_type_loss_weight": 0.0,
+        "online_codebook_mask": False,
     }
     # Legacy metas record None for the encoder_* args (they predate the
     # effective-value resolution at startup): unknown is not a conflict there,
@@ -709,6 +712,14 @@ def main():
                         help="Disable compact codebook remapping (ablation: use full codebook with original hyper IDs)")
     parser.add_argument("--hyper_causal_mask", action="store_true",
                         help="Enable hyper causal mask: at position t, only codebook entries k <= t are available")
+    parser.add_argument(
+        "--online_codebook_mask",
+        action="store_true",
+        help="Replace the position-based hyper causal approximation with exact "
+             "decoder-time row availability replayed by the dataloader. Requires "
+             "--no_remap_codebook and --mode lm. Default off preserves historical "
+             "training behavior.",
+    )
     parser.add_argument("--token_type_loss_weight", type=float, default=0.0,
                         help="Weight for token type (base vs hyper) prediction head. 0 = disabled.")
     parser.add_argument("--eval", action="store_true",
@@ -733,6 +744,16 @@ def main():
 
     if args.no_compile:
         args.compile = False
+    if args.online_codebook_mask and not args.no_remap_codebook:
+        parser.error("--online_codebook_mask requires --no_remap_codebook")
+    if args.online_codebook_mask and args.mode != "lm":
+        parser.error("--online_codebook_mask requires --mode lm")
+    if args.online_codebook_mask and args.max_codebook_size == 0:
+        parser.error("--online_codebook_mask requires compression (max_codebook_size > 0)")
+    if args.online_codebook_mask and args.max_active_codebook_size <= 0:
+        parser.error(
+            "--online_codebook_mask requires max_active_codebook_size > 0"
+        )
     if args.stop_at is None:
         args.stop_at = args.steps
     if args.hyper_lr is None:
@@ -1011,6 +1032,7 @@ def main():
         disabled_ids=disabled_ids,
         mode=args.mode,
         remap_codebook=not args.no_remap_codebook,
+        online_codebook_mask=args.online_codebook_mask,
         debug_samples=max(0, args.debug_first_steps * max(1, args.gradient_accumulation_steps)),
     )
 
@@ -1039,6 +1061,7 @@ def main():
         total_hyper_count = 0
         total_relaxed_hyper_correct = 0
         total_relaxed_loss_sum = 0.0
+        total_online_skipped = 0
         # Per-merge-size accuracy: index 0 unused, index k = merge size k
         max_ms = config.max_subtokens
         merge_correct = [0] * (max_ms + 1)
@@ -1052,11 +1075,23 @@ def main():
                 input_dict, labels = next(data_iter)
                 x = input_dict["input"].to(device)
                 cb = input_dict["codebook"].to(device)
+                codebook_counts = input_dict.get("codebook_counts")
+                if codebook_counts is not None:
+                    codebook_counts = codebook_counts.to(device)
                 n_base_tokens = input_dict["n_base_tokens"].to(device)
                 labels = labels.to(device)
+                if args.online_codebook_mask:
+                    total_online_skipped += int(
+                        input_dict["online_skipped_targets"].sum().item()
+                    )
 
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    output = model(x, codebook=cb, hyper_causal_mask=args.hyper_causal_mask)
+                    output = model(
+                        x,
+                        codebook=cb,
+                        hyper_causal_mask=args.hyper_causal_mask,
+                        codebook_counts=codebook_counts,
+                    )
                     if use_token_type_head:
                         logits, _ = output
                     else:
@@ -1127,7 +1162,7 @@ def main():
             total_loss_sum, total_valid_tokens, total_base_tokens, total_target_bytes,
             total_correct, total_base_correct, total_base_count,
             total_hyper_correct, total_hyper_count, total_relaxed_hyper_correct,
-            total_relaxed_loss_sum,
+            total_relaxed_loss_sum, total_online_skipped,
         ], device=device, dtype=torch.float64)
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
@@ -1138,7 +1173,7 @@ def main():
         mc = merge_stats[: max_ms + 1].tolist()
         mn = merge_stats[max_ms + 1 :].tolist()
 
-        loss_sum, valid_tok, base_tok, target_bytes, correct, base_correct, base_count, hyper_correct, hyper_count, relaxed_hyper_correct, relaxed_loss_sum = stats.tolist()
+        loss_sum, valid_tok, base_tok, target_bytes, correct, base_correct, base_count, hyper_correct, hyper_count, relaxed_hyper_correct, relaxed_loss_sum, online_skipped = stats.tolist()
 
         if rank == 0:
             avg_loss = loss_sum / valid_tok
@@ -1177,6 +1212,12 @@ def main():
             print(f"  relaxed_acc           = {relaxed_acc:.4f}")
             print(f"  compression           = {compression:.2f}")
             print(f"  total tokens evaluated = {int(valid_tok):,}")
+            if args.online_codebook_mask:
+                online_skip_rate = online_skipped / (valid_tok + online_skipped)
+                print(
+                    f"  online targets skipped = {int(online_skipped):,} "
+                    f"({online_skip_rate:.6f})"
+                )
             for k in range(2, max_ms + 1):
                 if mn[k] > 0:
                     print(f"  hyper_acc_ms{k}         = {mc[k] / mn[k]:.4f}  (n={int(mn[k]):,})")
@@ -1203,6 +1244,11 @@ def main():
                     "eval/relaxed_acc": relaxed_acc,
                     "eval/compression": compression,
                 }
+                if args.online_codebook_mask:
+                    eval_dict["eval/online_skipped_targets"] = online_skipped
+                    eval_dict["eval/online_skipped_target_rate"] = (
+                        online_skipped / (valid_tok + online_skipped)
+                    )
                 for k in range(2, max_ms + 1):
                     if mn[k] > 0:
                         eval_dict[f"eval/hyper_acc_ms{k}"] = mc[k] / mn[k]
@@ -1254,6 +1300,8 @@ def main():
     log_base_type_acc = 0.0
     log_hyper_type_acc = 0.0
     log_hyper_ratio = 0.0
+    log_online_skipped = 0
+    log_online_targets = 0
     log_tokens = 0
     start_time = time.time()
 
@@ -1320,6 +1368,9 @@ def main():
 
             x = input_dict["input"].to(device)
             cb = input_dict["codebook"].to(device)
+            codebook_counts = input_dict.get("codebook_counts")
+            if codebook_counts is not None:
+                codebook_counts = codebook_counts.to(device)
             n_base_tokens = input_dict["n_base_tokens"].to(device)
             labels = labels.to(device)
             _debug_rank_log(
@@ -1339,7 +1390,12 @@ def main():
               with torch.profiler.record_function("fwd"):
                 _debug_rank_log(debug_enabled, rank, step, micro_step, "before model forward")
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    output = model(x, codebook=cb, hyper_causal_mask=args.hyper_causal_mask)
+                    output = model(
+                        x,
+                        codebook=cb,
+                        hyper_causal_mask=args.hyper_causal_mask,
+                        codebook_counts=codebook_counts,
+                    )
                     if use_token_type_head:
                         logits, token_type_logits = output
                     else:
@@ -1357,6 +1413,12 @@ def main():
                     )
                 _debug_rank_log(debug_enabled, rank, step, micro_step, "after cross_entropy")
                 valid_mask = flat_labels != -100
+                if args.online_codebook_mask:
+                    skipped = int(
+                        input_dict["online_skipped_targets"].sum().item()
+                    )
+                    log_online_skipped += skipped
+                    log_online_targets += int(valid_mask.sum().item()) + skipped
                 loss_sum = per_token_loss.sum()
                 backward_loss = loss_sum / valid_mask.sum()
                 base_token_loss = loss_sum / n_base_tokens.sum()
@@ -1502,6 +1564,22 @@ def main():
                 dist.all_reduce(hyper_type_acc_tensor, op=dist.ReduceOp.AVG)
                 dist.all_reduce(hyper_ratio_tensor, op=dist.ReduceOp.AVG)
 
+            if args.online_codebook_mask:
+                online_counts_tensor = torch.tensor(
+                    [log_online_skipped, log_online_targets],
+                    device=device,
+                    dtype=torch.float64,
+                )
+                dist.all_reduce(online_counts_tensor, op=dist.ReduceOp.SUM)
+                online_skipped_value, online_targets_value = (
+                    online_counts_tensor.tolist()
+                )
+                online_skip_rate = (
+                    online_skipped_value / online_targets_value
+                    if online_targets_value
+                    else 0.0
+                )
+
             tokens_per_sec = log_tokens * world_size / elapsed
 
             if rank == 0:
@@ -1531,6 +1609,11 @@ def main():
                         f"type_loss={type_loss_tensor.item():.4f} | type_acc={type_acc_tensor.item():.4f} | "
                         f"base_acc={base_type_acc_tensor.item():.4f} | hyper_acc={hyper_type_acc_tensor.item():.4f} | "
                         f"hyper_ratio={hyper_ratio_tensor.item():.4f} | "
+                    )
+                if args.online_codebook_mask:
+                    log_msg += (
+                        f"online_skip={online_skip_rate:.6f} "
+                        f"(n={int(online_skipped_value)}) | "
                     )
                 hyper_lr_suffix = f" | hyper_lr={hyper_lr:.2e}" if hyper_lr != lr else ""
                 log_msg += (
@@ -1564,6 +1647,9 @@ def main():
                         log_dict["base_type_acc"] = base_type_acc_tensor.item()
                         log_dict["hyper_type_acc"] = hyper_type_acc_tensor.item()
                         log_dict["hyper_ratio"] = hyper_ratio_tensor.item()
+                    if args.online_codebook_mask:
+                        log_dict["online_skipped_targets"] = online_skipped_value
+                        log_dict["online_skipped_target_rate"] = online_skip_rate
                     wandb.log(log_dict, step=step)
 
             log_loss = 0.0
@@ -1578,6 +1664,8 @@ def main():
             log_base_type_acc = 0.0
             log_hyper_type_acc = 0.0
             log_hyper_ratio = 0.0
+            log_online_skipped = 0
+            log_online_targets = 0
             log_tokens = 0
             start_time = time.time()
 
