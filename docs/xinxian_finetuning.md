@@ -46,7 +46,7 @@ Status: to run.
 
 ## Embedding Interpretation
 
-After `vx0.6.1` and `vx0.6.2`, analyze the embedding properties directly.
+After `vx0.6.2`, analyze the embedding properties directly （`v0.6.4` vs `vx0.6.2`）.
 
 Starting point: the previous Claude report.
 
