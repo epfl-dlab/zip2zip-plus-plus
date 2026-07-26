@@ -41,6 +41,7 @@
 #   SMOKE_TASKS=arc_easy,hellaswag,winogrande,gsm8k_boxed
 #   TOKENIZER=microsoft/Phi-3.5-mini-instruct
 #   WANDB_PROJECT=zip2zip-core
+#   SKIP_SMOKE=0      set 1 to skip intermediate smoke evals
 #   SKIP_FULL_PPL=0   set 1 to also skip the wikitext perplexity in phase 3
 #   EVAL_MODE=        force eval_harness --eval_mode for all evals; set to
 #                     'base' for MAX_CODEBOOK_SIZE=0 control runs (their
@@ -124,6 +125,7 @@ SMOKE_LIMIT=${SMOKE_LIMIT:-200}
 SMOKE_TASKS=${SMOKE_TASKS:-arc_easy,hellaswag,winogrande,gsm8k_boxed}
 TOKENIZER=${TOKENIZER:-microsoft/Phi-3.5-mini-instruct}
 export WANDB_PROJECT=${WANDB_PROJECT:-zip2zip-core}
+SKIP_SMOKE=${SKIP_SMOKE:-0}
 SKIP_FULL_PPL=${SKIP_FULL_PPL:-0}
 FINAL_LIMIT=${FINAL_LIMIT:-}
 
@@ -152,6 +154,7 @@ echo "  OUTPUT_DIR:  $OUTPUT_DIR"
 echo "  DATA_DIR:    $DATA_DIR"
 echo "  STEPS:       $STEPS  SMOKE_EVERY: $SMOKE_EVERY  SMOKE_LIMIT: $SMOKE_LIMIT"
 echo "  SMOKE_TASKS: $SMOKE_TASKS"
+echo "  SKIP_SMOKE:  $SKIP_SMOKE"
 echo "  W&B:         project=$WANDB_PROJECT run_id=$WANDB_ID name=$RUN_NAME"
 echo "  PIPELINE_LOG: $PIPELINE_LOG"
 echo "  git commit:  $(git -C "$PROJECT_DIR" rev-parse --short HEAD)"
@@ -260,33 +263,37 @@ PY
 }
 
 # ---------- phase 2: smoke evals on intermediate checkpoints ----------
-echo "=== phase 2/4: smoke evals (every $SMOKE_EVERY steps, limit $SMOKE_LIMIT) ==="
-step=$SMOKE_EVERY
-while [ "$step" -le "$STEPS" ]; do
-    CKPT="$OUTPUT_DIR/step_$step"
-    if [ -f "$CKPT/model.pt" ]; then
-        echo "--- smoke eval: step_$step ---"
-        SMOKE_JSON="$EVAL_LOG_DIR/results_${RUN_NAME}_step${step}_smoke_${TS}.json"
-        python scripts/eval_harness.py \
-            --ckpt_dir "$CKPT" \
-            --tokenizer "$TOKENIZER" \
-            --preset default \
-            --tasks "$SMOKE_TASKS" \
-            --limit "$SMOKE_LIMIT" \
-            ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
-            ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
-            --no_wandb --resume_wandb_id none \
-            --output_path "$SMOKE_JSON"
-        audit_eval_mode "$SMOKE_JSON"
-        python scripts/log_results_to_wandb.py \
-            --json "$SMOKE_JSON" \
-            --resume_id "$WANDB_ID" --project "$WANDB_PROJECT" \
-            --prefix smoke --step "$step"
-    else
-        echo "--- smoke eval: step_$step skipped (no checkpoint) ---"
-    fi
-    step=$((step + SMOKE_EVERY))
-done
+if [ "$SKIP_SMOKE" = "1" ]; then
+    echo "=== phase 2/4: smoke evals skipped (SKIP_SMOKE=1) ==="
+else
+    echo "=== phase 2/4: smoke evals (every $SMOKE_EVERY steps, limit $SMOKE_LIMIT) ==="
+    step=$SMOKE_EVERY
+    while [ "$step" -le "$STEPS" ]; do
+        CKPT="$OUTPUT_DIR/step_$step"
+        if [ -f "$CKPT/model.pt" ]; then
+            echo "--- smoke eval: step_$step ---"
+            SMOKE_JSON="$EVAL_LOG_DIR/results_${RUN_NAME}_step${step}_smoke_${TS}.json"
+            python scripts/eval_harness.py \
+                --ckpt_dir "$CKPT" \
+                --tokenizer "$TOKENIZER" \
+                --preset default \
+                --tasks "$SMOKE_TASKS" \
+                --limit "$SMOKE_LIMIT" \
+                ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
+                ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
+                --no_wandb --resume_wandb_id none \
+                --output_path "$SMOKE_JSON"
+            audit_eval_mode "$SMOKE_JSON"
+            python scripts/log_results_to_wandb.py \
+                --json "$SMOKE_JSON" \
+                --resume_id "$WANDB_ID" --project "$WANDB_PROJECT" \
+                --prefix smoke --step "$step"
+        else
+            echo "--- smoke eval: step_$step skipped (no checkpoint) ---"
+        fi
+        step=$((step + SMOKE_EVERY))
+    done
+fi
 
 # ---------- phase 3: full eval on the final checkpoint ----------
 echo "=== phase 3/4: full eval on $FINAL_CKPT ==="
