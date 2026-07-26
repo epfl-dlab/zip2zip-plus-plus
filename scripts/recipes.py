@@ -62,6 +62,7 @@ ENV_KEYS = {
     # env var                  train.py arg                kind     off
     "DISABLE_DIGIT_IDS":        ("disable_digit_ids",        "flag",  False),
     "UNTIED_HYPER_ENCODER":     ("untied_hyper_encoder",     "flag",  False),
+    "SHARE_HYPER_ENCODER_WEIGHTS": ("share_hyper_encoder_weights", "flag", False),
     "BASE_TOKEN_POSITIONS":     ("base_token_positions",     "flag",  False),
     "ZERO_INIT_ENCODER_OUTPUT": ("zero_init_encoder_output", "flag",  False),
     "ONLINE_CODEBOOK_MASK":     ("online_codebook_mask",     "flag",  False),
@@ -139,6 +140,15 @@ RECIPES = {
         "env": {"ZERO_INIT_ENCODER_OUTPUT": "1"},
         "notes": "broadest balanced improvement of the line: GSM8K .652 -> .677, "
                  "MC average recovered, best ppl; OBQA/Wino changes within noise.",
+    },
+    "vx0.6.1": {
+        "extends": "v0.6.4",
+        "status": "candidate",
+        "description": "output role re-encodes lm_head rows using shared hyper-encoder weights",
+        "env": {"SHARE_HYPER_ENCODER_WEIGHTS": "1"},
+        "notes": "Xinxian exploratory run: keeps v0.6.4's untied input/output roles, "
+                 "but removes the second trained hyper_output module. Tests whether "
+                 "role-specific hyper-encoders matter",
     },
     "v0.6.5": {
         "extends": "v0.6.4",

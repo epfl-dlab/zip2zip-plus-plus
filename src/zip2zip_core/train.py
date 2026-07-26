@@ -369,8 +369,8 @@ def validate_resume_args(resume_dir, args):
     prev = torch.load(meta_path, map_location="cpu", weights_only=False).get("args", {}) or {}
     hard = ("disable_digit_ids", "max_codebook_size",
             "max_active_codebook_size", "tokenizer",
-            "untied_hyper_encoder", "base_token_positions",
-            "zero_init_encoder_output", "no_encoder_residual",
+            "untied_hyper_encoder", "share_hyper_encoder_weights",
+            "base_token_positions", "zero_init_encoder_output", "no_encoder_residual",
             "token_type_loss_weight", "online_codebook_mask",
             "encoder_dim", "encoder_n_layers",
             "encoder_n_heads", "encoder_intermediate_size")
@@ -383,6 +383,7 @@ def validate_resume_args(resume_dir, args):
     absent_defaults = {
         "disable_digit_ids": False,
         "untied_hyper_encoder": False,
+        "share_hyper_encoder_weights": False,
         "base_token_positions": False,
         "zero_init_encoder_output": False,
         "no_encoder_residual": False,
@@ -610,6 +611,10 @@ def main():
                         help="Use a separate output-role hyper-encoder (reading lm_head "
                              "rows) instead of reusing the input hyper-encoder for logits. "
                              "Matches the released model. Default off = tied (legacy).")
+    parser.add_argument("--share_hyper_encoder_weights", action="store_true",
+                        help="With --untied_hyper_encoder, re-encode the output role from "
+                             "lm_head rows but reuse the input hyper-encoder's weights. "
+                             "Default off = train a separate output encoder.")
     encoder_residual_group = parser.add_mutually_exclusive_group()
     encoder_residual_group.add_argument(
         "--zero_init_encoder_output", action="store_true",
@@ -754,6 +759,8 @@ def main():
         parser.error(
             "--online_codebook_mask requires max_active_codebook_size > 0"
         )
+    if args.share_hyper_encoder_weights and not args.untied_hyper_encoder:
+        parser.error("--share_hyper_encoder_weights requires --untied_hyper_encoder")
     if args.stop_at is None:
         args.stop_at = args.steps
     if args.hyper_lr is None:
@@ -849,6 +856,7 @@ def main():
         # Inverted at the arg boundary: --untied_hyper_encoder (default off) maps
         # to tie_hyper_encoder=False. The adapter applies the same inversion.
         tie_hyper_encoder=not args.untied_hyper_encoder,
+        share_hyper_encoder_weights=args.share_hyper_encoder_weights,
         base_token_positions=args.base_token_positions,
         zero_init_encoder_output=args.zero_init_encoder_output,
         rope=dataclasses.replace(

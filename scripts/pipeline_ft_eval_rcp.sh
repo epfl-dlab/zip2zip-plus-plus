@@ -54,6 +54,9 @@
 #                     (matches the released model). Inherited by the train
 #                     launcher only; evals auto-configure from the checkpoint
 #                     meta.pt (no eval passthrough), so no "0" ambiguity.
+#   SHARE_HYPER_ENCODER_WEIGHTS= with UNTIED_HYPER_ENCODER=1, re-encode lm_head
+#                     rows for the output role but reuse hyper_encoder weights
+#                     instead of training a second hyper_output module.
 #   ENCODER_N_LAYERS= hyper-encoder depth (default 2 = v0.5). Set 4 for the
 #                     v0.6.1 deeper-encoder recipe (negative result — keep 2).
 #                     Inherited by the train launcher; evals auto-configure
@@ -88,7 +91,7 @@ export HF_HOME=${HF_HOME:-$Z2Z_SCRATCH/.cache/huggingface}
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
-PROJECT_DIR=$Z2Z_SCRATCH/code/zip2zip-core
+PROJECT_DIR=${PROJECT_DIR:-$Z2Z_SCRATCH/code/zip2zip-core}
 RUN_NAME=${RUN_NAME:?Must set RUN_NAME (also becomes the W&B run name)}
 
 # Resolve a named recipe HERE, before anything below reads these variables: the

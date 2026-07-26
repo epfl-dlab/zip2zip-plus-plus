@@ -560,6 +560,10 @@ class Zip2ZipLlama3Model(Decoder):
         # a second output-role encoder reading lm_head rows (matches the released
         # model). Checkpoints saved without this field load as tied.
         tie_hyper_encoder: bool = True
+        # Only meaningful when untied: re-encode lm_head rows for the output
+        # role, but reuse hyper_encoder's parameters instead of allocating a
+        # second hyper_output module. Default off preserves v0.6.4.
+        share_hyper_encoder_weights: bool = False
         hyper_encoder_type: str = "flat"
         # RoPE positions follow the UNCOMPRESSED stream: every token sits at the
         # base-space index of its last constituent (base tokens: their own index;
@@ -611,6 +615,8 @@ class Zip2ZipLlama3Model(Decoder):
     def __init__(self, config: Config):
         super().__init__(config)
         self.zip2zip_config = config
+        if config.share_hyper_encoder_weights and config.tie_hyper_encoder:
+            raise ValueError("share_hyper_encoder_weights requires tie_hyper_encoder=False")
 
         # Tie input and output embeddings (Llama-style). Phi-3.5-mini uses
         # untied embeddings, so keep self.output as a separate Linear in that case.
@@ -657,7 +663,7 @@ class Zip2ZipLlama3Model(Decoder):
             model_dim=config.dim,
         )
         self.hyper_encoder = self._build_hyper_encoder(hyper_encoder_kwargs)
-        if config.tie_hyper_encoder:
+        if config.tie_hyper_encoder or config.share_hyper_encoder_weights:
             self.hyper_output = None
         else:
             self.hyper_output = self._build_hyper_encoder(hyper_encoder_kwargs)
@@ -809,10 +815,10 @@ class Zip2ZipLlama3Model(Decoder):
         hyper_embeds = self._encode_codebook_with_weights(
             codebook, self.tok_embeddings.weight
         )  # (B, K, dim)
-        # Output role: untied re-encodes the same entries from lm_head rows with
-        # the second encoder; tied reuses the input tensor. Runs unconditionally
-        # inside the rank-uniform gate at forward() — never behind hyper_mask.any().
-        if self.hyper_output is not None:
+        # Output role: untied re-encodes lm_head rows. Shared-weight mode does
+        # the same computation through hyper_encoder, but owns no hyper_output.
+        compute_out_separately = not self.zip2zip_config.tie_hyper_encoder
+        if compute_out_separately:
             hyper_out_embeds = self._encode_codebook_with_weights(
                 codebook, self.output.weight, encoder=self.hyper_output
             )
@@ -855,7 +861,7 @@ class Zip2ZipLlama3Model(Decoder):
         vocab_size = self.zip2zip_config.vocab_size
         bs = tokens.size(0)
         max_cb = self.zip2zip_config.max_codebook_size
-        untied = self.hyper_output is not None
+        compute_out_separately = not self.zip2zip_config.tie_hyper_encoder
 
         # Lazy-allocate the full-size buffer(s) on first inference step
         if self._hyper_embeds_buf is None:
@@ -870,7 +876,7 @@ class Zip2ZipLlama3Model(Decoder):
             self._hyper_span_buf = torch.zeros(
                 bs, max_cb, dtype=torch.long, device=weight.device,
             )
-            if untied:
+            if compute_out_separately:
                 self._hyper_out_embeds_buf = torch.zeros_like(self._hyper_embeds_buf)
 
         # Scatter new entries into their exact buffer positions (per batch item)
@@ -882,7 +888,7 @@ class Zip2ZipLlama3Model(Decoder):
                 self._encode_codebook_with_weights(
                     codebook_updates, self.output.weight, encoder=self.hyper_output
                 )
-                if untied
+                if compute_out_separately
                 else None
             )
             # The hyper-encoder's padded attention path can upcast to fp32;
@@ -896,13 +902,13 @@ class Zip2ZipLlama3Model(Decoder):
                     )
                     self._hyper_embeds_used[i, ui] = True
                     self._hyper_span_buf[i, ui] = update_spans[i, : len(ui)]
-                    if untied:
+                    if compute_out_separately:
                         self._hyper_out_embeds_buf[i, ui] = new_out_embeds[
                             i, : len(ui)
                         ].to(self._hyper_out_embeds_buf.dtype)
 
         hyper_embeds = self._hyper_embeds_buf  # (B, max_codebook_size, dim)
-        hyper_out_embeds = self._hyper_out_embeds_buf if untied else hyper_embeds
+        hyper_out_embeds = self._hyper_out_embeds_buf if compute_out_separately else hyper_embeds
 
         base_ids = tokens.clamp(max=vocab_size - 1)
         h = self.tok_embeddings(base_ids)  # (B, T, dim)
@@ -927,7 +933,8 @@ class Zip2ZipLlama3Model(Decoder):
             codebook: (B, max_codebook_size, max_subtokens) base token IDs
             weight_matrix: (vocab_size, dim) weight matrix to look up base tokens from
             encoder: hyper-encoder module to run (default: self.hyper_encoder).
-                The untied output role passes self.hyper_output.
+                The untied output role passes self.hyper_output; shared-weight
+                mode passes None and intentionally falls back to hyper_encoder.
 
         Returns:
             (B, max_codebook_size, dim) encoded representations

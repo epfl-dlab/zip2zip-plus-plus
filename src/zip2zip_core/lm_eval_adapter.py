@@ -132,6 +132,9 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
     if train_args.get("untied_hyper_encoder"):
         overrides["tie_hyper_encoder"] = False
         print("[zip2zip-lm-eval] untied hyper-encoder: building separate output encoder")
+    if train_args.get("share_hyper_encoder_weights"):
+        overrides["share_hyper_encoder_weights"] = True
+        print("[zip2zip-lm-eval] shared hyper-encoder weights: no hyper_output module")
     if train_args.get("base_token_positions"):
         # Behavior flag, no weights: compressed-mode evals must position tokens
         # in base space exactly as trained; base-mode evals are unaffected
@@ -173,7 +176,11 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
     # The load is strict=False (LoRA folding leaves benign gaps), so a config that
     # is tied while the checkpoint is untied would SILENTLY leave the output
     # encoder at random init. Hard-fail if the output encoder never got weights.
-    if not cfg.tie_hyper_encoder and any(k.startswith("hyper_output") for k in missing):
+    if (
+        not cfg.tie_hyper_encoder
+        and not cfg.share_hyper_encoder_weights
+        and any(k.startswith("hyper_output") for k in missing)
+    ):
         raise RuntimeError(
             "untied checkpoint is missing hyper_output.* weights after load — the "
             "output encoder would score with random weights. Check the checkpoint "

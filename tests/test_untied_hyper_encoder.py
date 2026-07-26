@@ -24,6 +24,7 @@ Invariants proven:
       OUTPUT encoder and equals the training-path output encoding of the same
       entries; tied path leaves no output buffer.
 """
+import copy
 import dataclasses
 import sys
 
@@ -33,7 +34,7 @@ import torch
 from zip2zip_core.configs import zip2zip_llama_configs
 
 
-def small_cfg(untied: bool):
+def small_cfg(untied: bool, share: bool = False):
     base = zip2zip_llama_configs["Phi3.5-mini"]
     return dataclasses.replace(
         base,
@@ -41,12 +42,13 @@ def small_cfg(untied: bool):
         max_codebook_size=8,
         max_subtokens=4,
         tie_hyper_encoder=not untied,
+        share_hyper_encoder_weights=share,
         rope=dataclasses.replace(base.rope, max_seq_len=64),
     )
 
 
-def build(untied: bool, seed: int = 0):
-    cfg = small_cfg(untied)
+def build(untied: bool, share: bool = False, seed: int = 0):
+    cfg = small_cfg(untied, share)
     return build_model(cfg, seed=seed), cfg
 
 
@@ -80,17 +82,19 @@ def main():
           torch.allclose(logits_untied_equiv, logits_tied, atol=1e-4, rtol=1e-4),
           f"max|d|={maxd(logits_untied_equiv, logits_tied):.2e}")
 
-    # ---- T2: genuinely-untied differs from tied (output tensor is actually used) ----
-    logits_untied_real = fwd(mu, toks, cb)          # untied, real distinct encoders + lm_head
-    saved_ho = mu.hyper_output
-    mu.hyper_output = None
-    logits_forced_tied = fwd(mu, toks, cb)
-    mu.hyper_output = saved_ho
+    # ---- T2: genuinely-untied uses hyper_output in the logits ----
+    logits_untied_real = fwd(mu, toks, cb)
+    saved_out_sd = copy.deepcopy(mu.hyper_output.state_dict())
+    with torch.no_grad():
+        for p in mu.hyper_output.parameters():
+            p.add_(torch.randn_like(p) * 0.1)
+    logits_perturbed = fwd(mu, toks, cb)
+    mu.hyper_output.load_state_dict(saved_out_sd)
     # only the hyper-logit columns should differ; compare over FINITE positions of
     # the 3 real entries (both pad rows AND causal-masked early positions are -inf,
     # and (-inf)-(-inf)=nan pollutes a naive max).
     V = cfg.vocab_size
-    hd = maxd(logits_untied_real[..., V:V + 3], logits_forced_tied[..., V:V + 3])
+    hd = maxd(logits_untied_real[..., V:V + 3], logits_perturbed[..., V:V + 3])
     check("T2_untied_output_tensor_reaches_logits", hd > 1e-3,
           f"max finite real-hyper-logit |d|={hd:.3e} (must be >0)")
 
@@ -158,6 +162,22 @@ def main():
     with torch.no_grad():
         mt._embed_tokens_inference(toks, updates, idx)
     check("T6_tied_no_output_buffer", mt._hyper_out_embeds_buf is None)
+
+    # ---- T7: shared-weight untied mode has no hyper_output but re-encodes output role ----
+    ms, cfgs = build(untied=True, share=True, seed=4)
+    toks_s, cb_s = make_input(cfgs)
+    logits_shared = fwd(ms, toks_s, cb_s)
+    check("T7_shared_weight_no_hyper_output_module", ms.hyper_output is None)
+    check("T7_shared_weight_no_hyper_output_state", not any(
+          k.startswith("hyper_output") for k in ms.state_dict()))
+    old_tie = ms.zip2zip_config.tie_hyper_encoder
+    ms.zip2zip_config.tie_hyper_encoder = True
+    logits_reuse = fwd(ms, toks_s, cb_s)
+    ms.zip2zip_config.tie_hyper_encoder = old_tie
+    hd_shared = maxd(logits_shared[..., cfgs.vocab_size:cfgs.vocab_size + 3],
+                     logits_reuse[..., cfgs.vocab_size:cfgs.vocab_size + 3])
+    check("T7_shared_weight_reencodes_output_role", hd_shared > 1e-3,
+          f"max finite real-hyper-logit |d|={hd_shared:.3e}")
 
     return summarize(results)
 
