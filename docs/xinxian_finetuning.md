@@ -103,3 +103,5 @@ Success criterion: the `MAX_SUBTOKENS=3` hierarchical run should remain
 competitive when evaluated with forced merge size 4. If it does, that would
 support the hypothesis that the hierarchical hyper-encoder learns reusable
 structure rather than overfitting to one merge-size setting.
+
+Implementation: add an eval-time merge-size override, then launch training and evaluation as separate jobs.
