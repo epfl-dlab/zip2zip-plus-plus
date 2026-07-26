@@ -197,6 +197,7 @@ class Zip2ZipLM(LM):
         eval_mode: str = "compressed",
         batch_size: int | str = 1,
         hyper_causal_mask: bool = True,
+        online_codebook_mask: bool | None = None,
         disable_digit_ids: bool = False,
         disable_mathsym_ids: bool = False,
     ):
@@ -308,16 +309,41 @@ class Zip2ZipLM(LM):
         self.eval_mode = eval_mode
         self._batch_size = int(batch_size)
         self.hyper_causal_mask = bool(hyper_causal_mask)
+        # What the CHECKPOINT was trained with (provenance, never overridden).
         self.online_codebook_mask = bool(
             (self.train_args or {}).get("online_codebook_mask")
         )
-        self.online_codebook_mask_active = bool(
+        # What THIS eval scores with. None = follow the checkpoint (the default,
+        # so a v0.6.5 model is scored in its own regime). Setting it explicitly
+        # is for cross-version comparison: v0.1-v0.6.4 were all scored with the
+        # legacy k<=t mask, so reading a v0.6.5 number against that table needs
+        # online_codebook_mask=False. The two flags stay separate on purpose —
+        # the results JSON reports both, so a comparison can never silently mix
+        # regimes.
+        self.online_codebook_mask_requested = (
             self.online_codebook_mask
+            if online_codebook_mask is None
+            else bool(online_codebook_mask)
+        )
+        if self.online_codebook_mask_requested and not self.online_codebook_mask:
+            raise ValueError(
+                "online_codebook_mask=True was requested but this checkpoint was "
+                "not trained with it (meta.pt says online_codebook_mask=False); "
+                "scoring it with the exact mask would not match any training "
+                "regime. Drop the override."
+            )
+        self.online_codebook_mask_active = bool(
+            self.online_codebook_mask_requested
             and self.eval_mode == "compressed"
             and self.hyper_causal_mask
         )
         if self.online_codebook_mask:
-            state = "active" if self.online_codebook_mask_active else "inactive"
+            if self.online_codebook_mask_active:
+                state = "active"
+            elif not self.online_codebook_mask_requested:
+                state = "OVERRIDDEN OFF — scoring with the legacy k<=t mask"
+            else:
+                state = "inactive"
             print(
                 "[zip2zip-lm-eval] decoder-time online codebook mask: "
                 f"enabled from meta.pt ({state} in this eval)"
@@ -379,6 +405,8 @@ class Zip2ZipLM(LM):
                 kwargs[int_key] = int(kwargs[int_key])
         if "hyper_causal_mask" in kwargs:
             kwargs["hyper_causal_mask"] = kwargs["hyper_causal_mask"].lower() in ("1", "true", "yes")
+        if "online_codebook_mask" in kwargs:
+            kwargs["online_codebook_mask"] = kwargs["online_codebook_mask"].lower() in ("1", "true", "yes")
         if additional_config:
             for k in ("batch_size", "device"):
                 if k not in kwargs and additional_config.get(k) is not None:

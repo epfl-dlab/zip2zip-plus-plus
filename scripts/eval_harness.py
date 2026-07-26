@@ -110,6 +110,12 @@ def main():
                         "(matches training distribution). 'base': vanilla LM scoring.")
     p.add_argument("--no_hyper_causal_mask", action="store_true",
                    help="Disable hyper_causal_mask in the model forward.")
+    p.add_argument("--no_online_codebook_mask", action="store_true",
+                   help="For a v0.6.5+ checkpoint, score with the legacy k<=t mask "
+                        "instead of the exact decoder-time mask it was trained with. "
+                        "Use this to compare against v0.1-v0.6.4 numbers, which were "
+                        "all produced with the legacy mask. No effect on older "
+                        "checkpoints or in base mode.")
     p.add_argument("--disable_digit_ids", action="store_true",
                    help="Diagnostic: add digit tokens to disabled_ids so numbers "
                         "are never LZW-merged into hypertokens (compressed mode).")
@@ -161,6 +167,9 @@ def main():
         eval_mode=args.eval_mode,
         batch_size=args.batch_size,
         hyper_causal_mask=not args.no_hyper_causal_mask,
+        # None = follow the checkpoint; False = force the legacy mask for a
+        # like-for-like comparison with pre-v0.6.5 numbers.
+        online_codebook_mask=False if args.no_online_codebook_mask else None,
         disable_digit_ids=args.disable_digit_ids,
         disable_mathsym_ids=args.disable_mathsym_ids,
     )
@@ -172,6 +181,10 @@ def main():
     args.eval_mode = lm.eval_mode
     args.online_codebook_mask = lm.online_codebook_mask
     args.online_codebook_mask_active = lm.online_codebook_mask_active
+    # Distinguishes "inactive because base mode" from "inactive because this eval
+    # deliberately asked for the legacy mask" — otherwise a results JSON cannot
+    # be audited for which regime produced its numbers.
+    args.online_codebook_mask_requested = lm.online_codebook_mask_requested
 
     if preset_info:
         print(f"[eval_harness] preset: {preset_info[0]} — {preset_info[1]}")

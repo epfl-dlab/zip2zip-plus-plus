@@ -100,6 +100,12 @@ DISABLE_DIGIT_IDS=${DISABLE_DIGIT_IDS:-}
 # DISABLE_MATHSYM_IDS=1: triage — also protect math operators/symbols.
 DISABLE_MATHSYM_IDS=${DISABLE_MATHSYM_IDS:-}
 [ "$DISABLE_MATHSYM_IDS" = "0" ] && DISABLE_MATHSYM_IDS=""
+# NO_ONLINE_CODEBOOK_MASK=1: score a v0.6.5+ checkpoint with the LEGACY k<=t mask
+# instead of the exact decoder-time mask it trained with. This is the setting for
+# comparing against v0.1-v0.6.4, whose numbers were all produced with the legacy
+# mask. "0" normalizes to off so it cannot half-trigger the :+ passthrough.
+NO_ONLINE_CODEBOOK_MASK=${NO_ONLINE_CODEBOOK_MASK:-}
+[ "$NO_ONLINE_CODEBOOK_MASK" = "0" ] && NO_ONLINE_CODEBOOK_MASK=""
 WANDB=${WANDB:-0}
 WANDB_NAME=${WANDB_NAME:-}
 WANDB_PROJECT=${WANDB_PROJECT:-}
@@ -181,6 +187,7 @@ if [ -n "$CKPT_DIR" ]; then
         ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
         ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
         ${DISABLE_MATHSYM_IDS:+--disable_mathsym_ids} \
+        ${NO_ONLINE_CODEBOOK_MASK:+--no_online_codebook_mask} \
         $WANDB_ARGS \
         $LIMIT_ARG \
         $TASKS_ARG
@@ -194,6 +201,7 @@ else
         ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
         ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
         ${DISABLE_MATHSYM_IDS:+--disable_mathsym_ids} \
+        ${NO_ONLINE_CODEBOOK_MASK:+--no_online_codebook_mask} \
         $WANDB_ARGS \
         $LIMIT_ARG \
         $TASKS_ARG
