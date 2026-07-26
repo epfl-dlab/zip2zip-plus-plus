@@ -51,11 +51,14 @@ Three things worth knowing about how it behaves:
 - **Measured negative results are marked `!`** and print a loud warning: `v0.6`
   (warm-start), `v0.6.1` (deeper encoder) and `v0.6.5` (exact decoder-time mask).
   They stay selectable purely so the experiment is reproducible.
-- **Unmeasured candidates are marked `+`**. `v0.7` is the candidate on the main
-  `v0.x` line; it does not replace the validated v0.6.4 standard until it is
-  measured. The `vx0.6.x` names are a separate exploratory track owned by
-  Xinxian: they also branch off v0.6.4, but they are not part of the `v0.x`
-  ledger and are never the baseline a `v0.x` result is compared against.
+- **Unmeasured mainline candidates are marked `+`**. `v0.7` is the candidate on
+  the main `v0.x` line; it does not replace the validated v0.6.4 standard until
+  it is measured.
+- **Exploratory `vx<base>.N` runs are marked `x`**. They are owned by
+  Xinxian; the `v<base>` portion before the final `.N` names the mainline recipe
+  they branch from (for example, `vx0.6.4.1` branches from `v0.6.4`). They are
+  not part of the `v0.x` ledger or the baseline a `v0.x` result is compared
+  against.
 - **An unknown name is a fatal error**, never a silent fallback to "no levers".
   Both launchers print the resolved `RECIPE=` in their banner, and `meta.pt`
   records every resolved flag, so the effective experimental levers are

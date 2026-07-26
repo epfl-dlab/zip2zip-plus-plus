@@ -75,7 +75,7 @@ ENV_KEYS = {
     "ENCODER_N_LAYERS":         ("encoder_n_layers",         "int",   2),
 }
 
-# status: current | candidate | superseded | negative (a measured negative result)
+# status: current | candidate | exploratory | superseded | negative (a measured negative result)
 RECIPES = {
     "v0.2": {
         "extends": None,
@@ -144,38 +144,42 @@ RECIPES = {
         "notes": "broadest balanced improvement of the line: GSM8K .652 -> .677, "
                  "MC average recovered, best ppl; OBQA/Wino changes within noise.",
     },
-    "vx0.6.1": {
+    "vx0.6.4.1": {
         "extends": "v0.6.4",
-        "status": "candidate",
+        "status": "exploratory",
         "description": "output role re-encodes lm_head rows using shared hyper-encoder weights",
         "env": {"SHARE_HYPER_ENCODER_WEIGHTS": "1"},
         "notes": "Xinxian exploratory run: keeps v0.6.4's untied input/output roles, "
                  "but removes the second trained hyper_output module. Tests whether "
                  "role-specific hyper-encoders matter",
     },
-    "vx0.6.2": {
+    "vx0.6.4.2": {
         "extends": "v0.6.4",
-        "status": "candidate",
+        "status": "exploratory",
         "description": "flat hyper-encoder without the residual path",
         "env": {"ZERO_INIT_ENCODER_OUTPUT": "0", "NO_ENCODER_RESIDUAL": "1"},
         "notes": "Xinxian exploratory run: removes the first-token residual from "
                  "the flat hyper-encoder. ZERO_INIT_ENCODER_OUTPUT is forced off "
                  "because train.py intentionally rejects zero-init without the residual.",
     },
-    "vx0.6.3": {
+    "vx0.6.4.3": {
         "extends": "v0.6.4",
-        "status": "candidate",
+        "status": "exploratory",
         "description": "hierarchical hyper-encoder under the v0.6.4 recipe",
         "env": {"HYPER_ENCODER_TYPE": "hierarchical"},
         "notes": "Xinxian exploratory run: replaces the flat hyper-encoder with "
                  "the left-fold hierarchical composer while keeping every other "
                  "v0.6.4 lever fixed.",
     },
-    "vx0.6.4": {
-        "extends": "vx0.6.3",
-        "status": "candidate",
+    "vx0.6.4.4": {
+        "extends": "v0.6.4",
+        "status": "exploratory",
         "description": "hierarchical hyper-encoder without the residual path",
-        "env": {"ZERO_INIT_ENCODER_OUTPUT": "0", "NO_ENCODER_RESIDUAL": "1"},
+        "env": {
+            "HYPER_ENCODER_TYPE": "hierarchical",
+            "ZERO_INIT_ENCODER_OUTPUT": "0",
+            "NO_ENCODER_RESIDUAL": "1",
+        },
         "notes": "Xinxian exploratory run: tests whether the first-token residual "
                  "interferes with the recurrent pattern learned by the hierarchical composer.",
     },
@@ -363,13 +367,14 @@ def _cmd_list():
         mark = {
             "current": "*",
             "candidate": "+",
+            "exploratory": "x",
             "negative": "!",
             "superseded": " ",
         }[spec["status"]]
         print(f"{mark} {name:<{width}}  {spec['status']:<10}  {spec['description']}")
     print(
         f"\n* = current standard recipe ({CURRENT})   "
-        "+ = unmeasured candidate   ! = measured negative result"
+        "+ = mainline candidate   x = exploratory track   ! = measured negative result"
     )
 
 
@@ -442,6 +447,10 @@ def main(argv):
     elif status == "candidate":
         print(f"[recipe] note: {name} is an UNMEASURED CANDIDATE; the current "
               f"standard recipe remains {CURRENT}", file=sys.stderr)
+    elif status == "exploratory":
+        print(f"[recipe] note: {name} is an EXPLORATORY recipe outside the main "
+              f"v0.x line; the current standard recipe remains {CURRENT}",
+              file=sys.stderr)
     elif name != CURRENT:
         print(f"[recipe] note: {name} is superseded; the current standard recipe "
               f"is {CURRENT}", file=sys.stderr)
