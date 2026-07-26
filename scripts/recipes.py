@@ -170,6 +170,14 @@ RECIPES = {
                  "the left-fold hierarchical composer while keeping every other "
                  "v0.6.4 lever fixed.",
     },
+    "vx0.6.4": {
+        "extends": "vx0.6.3",
+        "status": "candidate",
+        "description": "hierarchical hyper-encoder without the residual path",
+        "env": {"ZERO_INIT_ENCODER_OUTPUT": "0", "NO_ENCODER_RESIDUAL": "1"},
+        "notes": "Xinxian exploratory run: tests whether the first-token residual "
+                 "interferes with the recurrent pattern learned by the hierarchical composer.",
+    },
     "v0.6.5": {
         "extends": "v0.6.4",
         "status": "negative",
