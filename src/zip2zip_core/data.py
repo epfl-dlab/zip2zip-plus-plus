@@ -607,39 +607,73 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         else:
             yield from self._iter_lm(shards, self.mask_files)
 
-    def state_dict(self):
-        """Position in this rank's data stream, for an exact resume.
+    def _shard_identity(self):
+        """What this rank's stream IS, not merely how long it is.
 
-        `mode` and `n_shards` are recorded so a resume can REFUSE a state that
-        describes a different stream instead of seeking to a meaningless spot.
+        A shard COUNT cannot tell two corpora apart: every dataset in this
+        project has 8 shards, so at world_size=4 they all report 2 and a resume
+        onto a different DATA_DIR would seek into unrelated files without
+        complaint. Basenames identify the corpus; sizes catch a regenerated
+        dataset that kept the filenames.
         """
+        return [
+            (os.path.basename(path), os.path.getsize(path))
+            for path in self.shard_files
+        ]
+
+    def state_dict(self):
+        """Position in this rank's data stream, for an exact resume."""
         return {
             "shard_idx": self._shard_idx,
             "offset": self._offset,
             "mode": self.mode,
-            "n_shards": len(self.shard_files),
+            "shards": self._shard_identity(),
         }
 
-    def load_state_dict(self, state_dict):
+    def check_state_dict(self, state_dict):
+        """Raise if `state_dict` describes a different stream. Never mutates.
+
+        Split out from load_state_dict so the caller can decide what to do about
+        a mismatch collectively, instead of some ranks raising while others
+        proceed into the next collective and hang.
+        """
         saved_mode = state_dict.get("mode", self.mode)
         if saved_mode != self.mode:
             raise ValueError(
-                f"data position was saved in mode={saved_mode!r} but this run is "
+                f"position was saved in mode={saved_mode!r} but this run is "
                 f"mode={self.mode!r}; the two iterate shards differently, so the "
                 "saved offset does not transfer"
             )
-        saved_shards = state_dict.get("n_shards", len(self.shard_files))
-        if saved_shards != len(self.shard_files):
+        current = self._shard_identity()
+        saved_shards = state_dict.get("shards")
+        if saved_shards is None:
             raise ValueError(
-                f"data position was saved with {saved_shards} shards for this rank "
-                f"but this run has {len(self.shard_files)}; shard_idx would point "
-                "at a different file (changed DATA_DIR or world_size)"
+                "position records no shard identity (written by an older build); "
+                "it cannot be proven to belong to this dataset"
+            )
+        saved_shards = [tuple(entry) for entry in saved_shards]
+        if saved_shards != current:
+            saved_names = [name for name, _ in saved_shards]
+            current_names = [name for name, _ in current]
+            detail = (
+                f"names {saved_names} vs {current_names}"
+                if saved_names != current_names
+                else "same names but different file sizes (dataset regenerated)"
+            )
+            raise ValueError(
+                f"position belongs to a different dataset for this rank: {detail}. "
+                f"Check DATA_DIR (currently {self.data_dir})"
             )
         if not 0 <= state_dict["shard_idx"] < len(self.shard_files):
             raise ValueError(
                 f"saved shard_idx={state_dict['shard_idx']} is out of range for "
                 f"{len(self.shard_files)} shards"
             )
+        if state_dict["offset"] < 0:
+            raise ValueError(f"saved offset={state_dict['offset']} is negative")
+
+    def load_state_dict(self, state_dict):
+        self.check_state_dict(state_dict)
         self._shard_idx = state_dict["shard_idx"]
         self._offset = state_dict["offset"]
 

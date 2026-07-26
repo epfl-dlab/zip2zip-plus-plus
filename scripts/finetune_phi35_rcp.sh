@@ -271,6 +271,18 @@ if [ -n "$RESUME_FROM" ]; then
     RESUME_FLAG="--resume_from $RESUME_FROM"
 fi
 
+# ALLOW_DATA_REPLAY=1: resume even though the checkpoint's data position cannot
+# be restored (old checkpoint, changed world_size, or NUM_WORKERS>0). The run
+# then re-reads the shards from the start while the step counter continues, so
+# it trains on repeated data and never sees the tail — its numbers are NOT
+# comparable to a clean baseline. Without this the resume is a hard error, which
+# is the point: the replay used to happen silently.
+ALLOW_DATA_REPLAY=${ALLOW_DATA_REPLAY:-}
+ALLOW_DATA_REPLAY_FLAG=""
+if [ -n "$ALLOW_DATA_REPLAY" ] && [ "$ALLOW_DATA_REPLAY" != "0" ]; then
+    ALLOW_DATA_REPLAY_FLAG="--allow_data_replay"
+fi
+
 RESET_STEP_FLAG=""
 if [ -n "$RESET_STEP" ]; then
     RESET_STEP_FLAG="--reset_step"
@@ -394,6 +406,7 @@ fi
     $LORA_FLAG \
     $NO_ENCODER_RESIDUAL_FLAG \
     $RESUME_FLAG \
+    $ALLOW_DATA_REPLAY_FLAG \
     $RESET_STEP_FLAG \
     $DEBUG_FIRST_STEPS_FLAG \
     $HYPER_LR_FLAG \

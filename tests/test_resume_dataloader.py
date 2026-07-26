@@ -82,6 +82,30 @@ def make_dataset(data_dir, mode="lm"):
     )
 
 
+def _error_text(train_mod, loader, args, position):
+    """Run _restore_loader_state against a checkpoint holding `position`.
+
+    Returns the ValueError text, or None when the restore was accepted.
+    """
+    with tempfile.TemporaryDirectory() as ckpt_dir:
+        torch.save(
+            {
+                "step": 10,
+                "loader_state": {
+                    "world_size": 1,
+                    "num_workers": 0,
+                    "ranks": [position],
+                },
+            },
+            os.path.join(ckpt_dir, "meta.pt"),
+        )
+        try:
+            train_mod._restore_loader_state(ckpt_dir, loader, args)
+        except ValueError as exc:
+            return str(exc)
+    return None
+
+
 def take(dataset, n):
     """First n samples plus the position recorded after each."""
     out = []
@@ -195,15 +219,57 @@ def main():
             "an lm position cannot be applied to a compress run",
         )
         check(
-            "D4_shard_count_mismatch_refused",
-            refuses({**good, "n_shards": 7}, "shard_idx would point"),
-            "a changed DATA_DIR or world_size is caught",
-        )
-        check(
             "D4_out_of_range_shard_refused",
             refuses({**good, "shard_idx": 99}, "out of range"),
             "a corrupt index fails loudly",
         )
+        check(
+            "D4_negative_offset_refused",
+            refuses({**good, "offset": -1}, "negative"),
+            "a corrupt offset fails loudly",
+        )
+        check(
+            "D4_check_state_dict_does_not_mutate",
+            (
+                lambda ds: (
+                    refuses({**good, "shard_idx": 99}, "out of range")
+                    and ds.state_dict()["shard_idx"] == 0
+                    and ds.state_dict()["offset"] == 0
+                )
+            )(make_dataset(data_dir)),
+            "a refused state leaves the stream untouched, so the caller can "
+            "decide collectively instead of some ranks having already moved",
+        )
+
+        # ---- D7: a shard COUNT cannot identify a corpus (review finding) ----
+        # Every dataset in the project has 8 shards, so at world_size=4 they all
+        # report 2. Counting was the original guard and it let a resume onto a
+        # different DATA_DIR seek into unrelated files in silence.
+        # Same shard COUNT and the same file NAMES (both use shard_000.npy), so
+        # only the recorded size separates them — which is what the guard uses.
+        # Honest limit: a corpus with identical names AND identical byte sizes
+        # but different content would still pass; catching that needs a content
+        # hash, i.e. reading every shard at save time.
+        with tempfile.TemporaryDirectory() as other_dir:
+            write_shards(other_dir, n_shards=2, tokens_per_shard=2400)
+            other = make_dataset(other_dir)
+            same_count = len(other.shard_files) == len(
+                make_dataset(data_dir).shard_files
+            )
+            same_names = [
+                os.path.basename(p) for p in other.shard_files
+            ] == [os.path.basename(p) for p in make_dataset(data_dir).shard_files]
+            corpus_refused = False
+            try:
+                other.load_state_dict(good)
+            except ValueError as exc:
+                corpus_refused = "different dataset" in str(exc)
+            check(
+                "D7_same_shard_count_different_corpus_refused",
+                same_count and same_names and corpus_refused,
+                "identical shard count and identical file names, told apart by "
+                "size — the count-only guard would have accepted this silently",
+            )
 
         # ---- D5/D6: the train.py guards ----
         import zip2zip_core.train as train_mod
@@ -287,6 +353,129 @@ def main():
                 ).get("world_size") == 1,
                 "the default single-process loader is recoverable",
             )
+            check(
+                "D6_worker_error_names_the_remedy",
+                "NUM_WORKERS=0"
+                in (
+                    _error_text(
+                        train_mod, loader, args_for(num_workers=2), position=good
+                    )
+                    or ""
+                ),
+                "the message tells the operator how to get a resumable run "
+                "instead of only saying it is impossible",
+            )
+
+            # ---- D10: only a resume that CONTINUES a training stream is gated ----
+            # Review finding: the guard fired for --eval too, so
+            # scripts/eval_lm.sh (fixed argument list, no way to pass an
+            # override) hard-errored on every checkpoint; and when the restore
+            # succeeded, eval started mid-stream so different checkpoints of the
+            # same run were scored on different data.
+            def gate(**overrides):
+                values = dict(reset_step=False, eval=False)
+                values.update(overrides)
+                return train_mod._should_restore_data_position(
+                    "/some/step_100", types.SimpleNamespace(**values)
+                )
+
+            check(
+                "D10_training_resume_is_gated",
+                gate() is True,
+                "the case the fix exists for still goes through the guard",
+            )
+            check(
+                "D10_eval_is_exempt",
+                gate(eval=True) is False
+                and gate(eval=True, reset_step=True) is False,
+                "scripts/eval_lm.sh scores every checkpoint from shard 0 and "
+                "cannot be blocked by a position it never needed",
+            )
+            check(
+                "D10_reset_step_is_exempt",
+                gate(reset_step=True) is False,
+                "a fresh LR schedule is a new run over the data",
+            )
+            check(
+                "D10_fresh_run_is_exempt",
+                train_mod._should_restore_data_position(
+                    None, types.SimpleNamespace(reset_step=False, eval=False)
+                )
+                is False,
+                "no resume, nothing to restore",
+            )
+
+            # ---- D8: --allow_data_replay must cover stream-identity failures ----
+            # Review finding: these were raised inside load_state_dict, past the
+            # only place the flag is consulted, so the documented escape hatch
+            # did not exist for a changed DATA_DIR.
+            wrong_corpus = {**good, "mode": "compress"}
+            identity_refused = (
+                _error_text(
+                    train_mod, loader, args_for(), position=wrong_corpus
+                )
+                or ""
+            )
+            check(
+                "D8_identity_mismatch_is_a_hard_error",
+                "iterate shards differently" in identity_refused,
+                "a mismatched stream is refused with the reason quoted",
+            )
+            check(
+                "D8_allow_data_replay_covers_identity_mismatch",
+                _error_text(
+                    train_mod,
+                    loader,
+                    args_for(allow_data_replay=True),
+                    position=wrong_corpus,
+                )
+                is None,
+                "the flag reaches the identity checks too, so the escape hatch "
+                "the docs promise actually exists",
+            )
+
+            # ---- D9: the decision is rank-uniform ----
+            # Review finding: the identity checks are per-rank (each rank owns a
+            # different shard slice), so one rank could raise while the others
+            # restored and entered the next collective — a hang, not a failure.
+            four = types.SimpleNamespace(
+                get_rank=lambda: 0,
+                get_world_size=lambda: 4,
+                all_gather_object=None,
+            )
+
+            def gather_with_one_bad(out_list, obj):
+                # rank 0 is happy; rank 2 reports a problem
+                out_list[0] = obj
+                out_list[1] = None
+                out_list[2] = "rank 2 owns different shards"
+                out_list[3] = None
+
+            four.all_gather_object = gather_with_one_bad
+            train_mod.dist = four
+            with tempfile.TemporaryDirectory() as ckpt_dir:
+                torch.save(
+                    {
+                        "step": 10,
+                        "loader_state": {
+                            "world_size": 4,
+                            "num_workers": 0,
+                            "ranks": [good] * 4,
+                        },
+                    },
+                    os.path.join(ckpt_dir, "meta.pt"),
+                )
+                uniform = False
+                try:
+                    train_mod._restore_loader_state(ckpt_dir, loader, args_for())
+                except ValueError as exc:
+                    uniform = "rank 2" in str(exc)
+                check(
+                    "D9_one_bad_rank_aborts_every_rank",
+                    uniform,
+                    "a rank-local mismatch becomes a job-wide failure instead of "
+                    "a partial restore that deadlocks the next collective",
+                )
         finally:
             train_mod.dist = saved_dist
 

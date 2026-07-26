@@ -259,7 +259,10 @@ def _gather_loader_state(dataloader, args):
         return None
     if args.num_workers > 0:
         # __iter__ runs inside worker processes; the position it advances there
-        # never reaches this object, so state_dict() here is a stale zero.
+        # never reaches this object, so state_dict() here is a stale zero. Every
+        # launcher in this repo defaults NUM_WORKERS to 1 or 4, so this is the
+        # COMMON case, not a corner: such a run is simply not resumable, and the
+        # startup banner says so before the GPUs are spent.
         return None
     gathered = [None] * dist.get_world_size()
     dist.all_gather_object(gathered, dataset.state_dict())
@@ -268,6 +271,20 @@ def _gather_loader_state(dataloader, args):
         "num_workers": args.num_workers,
         "ranks": gathered,
     }
+
+
+def _should_restore_data_position(resume_dir, args):
+    """Whether this resume must seek the data stream back to the checkpoint.
+
+    Not every --resume_from continues a training stream:
+      --reset_step  a fresh LR schedule is a NEW run that happens to warm-start
+                    its weights, so it reads the data from the beginning.
+      --eval        scores a checkpoint and writes nothing. Every checkpoint of a
+                    run must be scored on the SAME data (from shard 0) or per-step
+                    curves compare different samples — and scripts/eval_lm.sh has
+                    a fixed argument list, so it could not opt out of a restore.
+    """
+    return resume_dir is not None and not args.reset_step and not args.eval
 
 
 def _restore_loader_state(resume_dir, dataloader, args):
@@ -295,7 +312,7 @@ def _restore_loader_state(resume_dir, dataloader, args):
     if saved is None:
         problem = (
             f"{resume_dir} records no data-stream position (checkpoint predates "
-            "the fix, or was written with --num_workers > 0)"
+            "this feature, or was written with --num_workers > 0)"
         )
     elif saved.get("world_size") != dist.get_world_size():
         problem = (
@@ -306,16 +323,35 @@ def _restore_loader_state(resume_dir, dataloader, args):
     elif args.num_workers > 0:
         problem = (
             f"--num_workers={args.num_workers} keeps the data position inside "
-            "worker processes, where it cannot be restored"
+            "worker processes, where it cannot be restored; set NUM_WORKERS=0 "
+            "(launcher) or --num_workers 0 for a resumable run"
         )
+    else:
+        # Dry-run the stream-identity checks (mode, shard files, index range) so
+        # their failures go through the same decision below instead of escaping
+        # as a bare ValueError that --allow_data_replay cannot reach.
+        try:
+            dataset.check_state_dict(saved["ranks"][rank])
+        except ValueError as exc:
+            problem = str(exc)
 
-    if problem is not None:
+    # The decision must be RANK-UNIFORM. check_state_dict compares this rank's
+    # own shard list, so ranks can disagree; letting some raise while the rest
+    # restore and march into the next collective would hang the job instead of
+    # failing it.
+    verdicts = [None] * dist.get_world_size()
+    dist.all_gather_object(verdicts, problem)
+    failed = [(r, p) for r, p in enumerate(verdicts) if p is not None]
+
+    if failed:
+        detail = "; ".join(f"rank {r}: {p}" for r, p in failed[:4])
         message = (
-            f"cannot restore the data-stream position: {problem}. Resuming anyway "
+            f"cannot restore the data-stream position: {detail}. Resuming anyway "
             "would REPLAY the shards from the beginning while the step counter "
             "continues, so this run would train on repeated data and never see "
             "the tail — its numbers would not be comparable to a clean baseline. "
-            "Start from step 0, or pass --allow_data_replay to accept it."
+            "Start from step 0, or pass --allow_data_replay (ALLOW_DATA_REPLAY=1 "
+            "in the launchers) to accept it."
         )
         if not args.allow_data_replay:
             raise ValueError(message)
@@ -324,11 +360,14 @@ def _restore_loader_state(resume_dir, dataloader, args):
         return
 
     dataset.load_state_dict(saved["ranks"][rank])
-    position = dataset.state_dict()
-    print(
-        f"[resume] rank {rank} data stream restored to "
-        f"shard_idx={position['shard_idx']} offset={position['offset']}"
-    )
+    positions = [None] * dist.get_world_size()
+    dist.all_gather_object(positions, dataset.state_dict())
+    if rank == 0:
+        summary = ", ".join(
+            f"rank{r}=(shard {p['shard_idx']}, offset {p['offset']})"
+            for r, p in enumerate(positions)
+        )
+        print(f"[resume] data stream restored: {summary}")
 
 
 def save_checkpoint(model, optimizer, step, args, output_dir, hf_repo=None,
@@ -1155,8 +1194,27 @@ def main():
 
     # Reposition the data stream to match the checkpoint. Must happen here: the
     # dataloader does not exist yet when load_checkpoint() runs above.
-    if resume_dir is not None and not args.reset_step:
+    #   --reset_step: a fresh LR schedule is a new run that happens to warm-start
+    #     its weights, so it starts the data from the beginning by design.
+    #   --eval: scores a checkpoint and writes nothing. It must read the SAME data
+    #     for every checkpoint (from shard 0), or per-step curves compare
+    #     different samples; and scripts/eval_lm.sh cannot pass an override.
+    if _should_restore_data_position(resume_dir, args):
         _restore_loader_state(resume_dir, dataloader, args)
+    elif rank == 0 and resume_dir is not None:
+        reason = "--eval" if args.eval else "--reset_step"
+        print(f"[resume] data stream starts at shard 0 ({reason})")
+
+    if rank == 0 and not args.eval:
+        if args.num_workers > 0:
+            print(
+                f"[checkpoint] NOT RESUMABLE: --num_workers={args.num_workers} keeps "
+                "the data position in worker processes. If this run is preempted, "
+                "resuming it would replay data. Use --num_workers 0 "
+                "(NUM_WORKERS=0) for a resumable run."
+            )
+        else:
+            print("[checkpoint] resumable: checkpoints will record the data position")
 
     use_token_type_head = args.token_type_loss_weight > 0
 

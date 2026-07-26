@@ -787,24 +787,48 @@ steps' data and never sees the tail, which silently destroys comparability with
 a clean baseline. That was measured on 2026-07-26, when a preempted v0.7 run
 fed at step 6000 the exact batch the original had seen at step 500.
 
-What to expect:
+**A resumable run needs `NUM_WORKERS=0`.** This is the part that decides
+everything else. With workers the iteration runs in child processes and the
+position they advance never reaches the parent, so it cannot be recorded — and
+every launcher here defaults `NUM_WORKERS` to 1 or 4. Those runs are simply not
+resumable. The startup banner says which kind of run you launched, before the
+GPUs are spent:
 
-- Every checkpoint's `meta.pt` carries `loader_state` — per-rank `shard_idx` and
-  `offset`. `save_checkpoint` says which position it stored; a resume prints
-  `[resume] rank N data stream restored to shard_idx=... offset=...`. If you do
-  not see that line, the stream was **not** repositioned.
-- **A checkpoint whose position cannot be restored is a hard error.** That covers
-  checkpoints written before this existed, a changed `world_size` (shards are
-  split `rank::world_size`, so the position does not transfer), a changed
-  `DATA_DIR`, and `--num_workers > 0` (the position lives in worker processes and
-  cannot be read back from the parent). Restart from step 0, or pass
-  `--allow_data_replay` to accept the replay deliberately — a run that used it is
-  not comparable to a clean baseline and must be labelled as such.
-- `--reset_step` intentionally starts the data from the beginning: a fresh LR
-  schedule is a new run that happens to warm-start its weights, so no position is
-  restored and no error is raised.
+```
+[checkpoint] resumable: checkpoints will record the data position
+[checkpoint] NOT RESUMABLE: --num_workers=1 keeps the data position in worker processes...
+```
+
+Set `NUM_WORKERS=0` for a run you may need to resume — a preemptible Run:AI
+workload, or anything longer than an hour. The cost is that LZW compression then
+shares the main process with the training step; measure it on your config before
+adopting it as a default.
+
+The rest:
+
+- A checkpoint written with `NUM_WORKERS=0` carries `loader_state` in `meta.pt` —
+  per-rank `shard_idx` and `offset`. `save_checkpoint` prints the position it
+  stored, and a resume prints `[resume] data stream restored: rank0=(shard N,
+  offset M), ...`. No such line means the stream was **not** repositioned.
+- **A resume whose position cannot be restored is a hard error**, covering: a
+  checkpoint from a `NUM_WORKERS>0` run or from before this existed; a changed
+  `world_size` (shards are split `rank::world_size`); and a changed corpus — the
+  position records each shard's name and size, so pointing `DATA_DIR` at a
+  different dataset is refused even when the shard count matches. Restart from
+  step 0, or pass `--allow_data_replay` (`ALLOW_DATA_REPLAY=1` in the launchers)
+  to accept the replay deliberately. A run that used it is not comparable to a
+  clean baseline and must be labelled as such.
+- The decision is rank-uniform: the per-rank verdicts are gathered, and one bad
+  rank fails the job. Otherwise that rank would abort while the others restored
+  and entered the next collective, turning a clear failure into a hang.
+- **`--eval` and `--reset_step` never restore a position.** An eval scores a
+  checkpoint and writes nothing; every checkpoint of a run must be read from
+  shard 0 or per-step curves compare different samples, and `scripts/eval_lm.sh`
+  has a fixed argument list with no way to opt out. `--reset_step` is a fresh LR
+  schedule, i.e. a new run that happens to warm-start its weights.
 
 This matters most under preemption. Run:AI evicts an over-quota workload at any
 moment and recreates the pod with the same command, so a long run can be
 interrupted several times; each interruption used to scramble the data
-composition a little more. `tests/test_resume_dataloader.py` pins the invariants.
+composition a little more. `tests/test_resume_dataloader.py` pins the invariants,
+including the four regressions found reviewing the first version of this fix.
