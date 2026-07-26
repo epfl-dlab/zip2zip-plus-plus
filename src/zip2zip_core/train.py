@@ -247,7 +247,92 @@ def _debug_rank_log(enabled: bool, rank: int, step: int, micro_step: int, messag
         now = time.strftime("%H:%M:%S")
         print(f"[debug {now}] [rank{rank}] [step {step}] [micro {micro_step}] {message}", flush=True)
 
-def save_checkpoint(model, optimizer, step, args, output_dir, hf_repo=None):
+def _gather_loader_state(dataloader, args):
+    """Every rank's position in its own data stream, gathered onto all ranks.
+
+    Returns None when the position cannot be trusted, so a later resume can say
+    so loudly instead of seeking to a wrong spot. COLLECTIVE: every rank must
+    reach the all_gather below, so call this outside any rank-0-only block.
+    """
+    dataset = getattr(dataloader, "dataset", None)
+    if dataset is None or not hasattr(dataset, "state_dict"):
+        return None
+    if args.num_workers > 0:
+        # __iter__ runs inside worker processes; the position it advances there
+        # never reaches this object, so state_dict() here is a stale zero.
+        return None
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, dataset.state_dict())
+    return {
+        "world_size": dist.get_world_size(),
+        "num_workers": args.num_workers,
+        "ranks": gathered,
+    }
+
+
+def _restore_loader_state(resume_dir, dataloader, args):
+    """Seek this rank's data stream back to where the checkpoint left it.
+
+    Without this a resumed run continues the LR schedule and optimizer from step
+    N but re-reads the shards from the beginning: it then trains twice on the
+    first steps' data and never sees the tail. That is silent — no exception, no
+    log line — and it destroys comparability with a clean baseline, so a
+    checkpoint that cannot be positioned is a hard error unless the operator
+    explicitly accepts the replay.
+    """
+    rank = dist.get_rank()
+    dataset = getattr(dataloader, "dataset", None)
+    if dataset is None or not hasattr(dataset, "load_state_dict"):
+        return
+    meta_path = os.path.join(resume_dir, "meta.pt")
+    saved = None
+    if os.path.exists(meta_path):
+        saved = torch.load(meta_path, map_location="cpu", weights_only=False).get(
+            "loader_state"
+        )
+
+    problem = None
+    if saved is None:
+        problem = (
+            f"{resume_dir} records no data-stream position (checkpoint predates "
+            "the fix, or was written with --num_workers > 0)"
+        )
+    elif saved.get("world_size") != dist.get_world_size():
+        problem = (
+            f"position was saved for world_size={saved.get('world_size')} but this "
+            f"run has {dist.get_world_size()}; shards are split rank::world_size, "
+            "so each rank would resume inside a different file"
+        )
+    elif args.num_workers > 0:
+        problem = (
+            f"--num_workers={args.num_workers} keeps the data position inside "
+            "worker processes, where it cannot be restored"
+        )
+
+    if problem is not None:
+        message = (
+            f"cannot restore the data-stream position: {problem}. Resuming anyway "
+            "would REPLAY the shards from the beginning while the step counter "
+            "continues, so this run would train on repeated data and never see "
+            "the tail — its numbers would not be comparable to a clean baseline. "
+            "Start from step 0, or pass --allow_data_replay to accept it."
+        )
+        if not args.allow_data_replay:
+            raise ValueError(message)
+        if rank == 0:
+            print(f"[resume] WARNING: {message}")
+        return
+
+    dataset.load_state_dict(saved["ranks"][rank])
+    position = dataset.state_dict()
+    print(
+        f"[resume] rank {rank} data stream restored to "
+        f"shard_idx={position['shard_idx']} offset={position['offset']}"
+    )
+
+
+def save_checkpoint(model, optimizer, step, args, output_dir, hf_repo=None,
+                    dataloader=None):
     """Save a consolidated (full, unsharded) checkpoint.
 
     The model is FSDP-sharded, so we gather the full state via DCP's
@@ -261,6 +346,9 @@ def save_checkpoint(model, optimizer, step, args, output_dir, hf_repo=None):
     )
     rank = dist.get_rank()
     ckpt_dir = os.path.join(output_dir, f"step_{step}")
+
+    # Collective, like the state gather below: keep it out of the rank-0 block.
+    loader_state = _gather_loader_state(dataloader, args) if dataloader is not None else None
 
     # Collective: every rank must participate in gathering the full state.
     opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -279,8 +367,16 @@ def save_checkpoint(model, optimizer, step, args, output_dir, hf_repo=None):
         torch.save(model_sd, os.path.join(ckpt_dir, "model.pt"))
         if optim_sd is not None:
             torch.save(optim_sd, os.path.join(ckpt_dir, "optimizer.pt"))
-        torch.save({"step": step, "args": vars(args)}, os.path.join(ckpt_dir, "meta.pt"))
-        print(f"[Rank 0] Saved checkpoint at step {step}")
+        torch.save(
+            {"step": step, "args": vars(args), "loader_state": loader_state},
+            os.path.join(ckpt_dir, "meta.pt"),
+        )
+        if loader_state is None:
+            print(f"[Rank 0] Saved checkpoint at step {step} "
+                  f"(WITHOUT a data position — a resume from it will replay data)")
+        else:
+            print(f"[Rank 0] Saved checkpoint at step {step} "
+                  f"(data position: {loader_state['ranks'][0]} on rank 0)")
 
         if hf_repo:
             import threading
@@ -672,6 +768,12 @@ def main():
                         help="Permit resuming with recipe-critical args (data/compression "
                              "semantics, architecture, objective, or initialization lineage) "
                              "that differ from the checkpoint's meta.pt. Off = hard error.")
+    parser.add_argument("--allow_data_replay", action="store_true",
+                        help="Permit resuming from a checkpoint whose data-stream position "
+                             "cannot be restored. The run then re-reads the shards from the "
+                             "start while the step counter continues, so it trains on repeated "
+                             "data and never sees the tail — its numbers are NOT comparable to "
+                             "a clean baseline. Off = hard error.")
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Local checkpoint dir, or 'latest' to auto-find latest step_* in output_dir")
     parser.add_argument("--resume_from_hf", type=str, default=None,
@@ -972,8 +1074,10 @@ def main():
             weight_decay=args.weight_decay,
         )
 
-    # Resume if specified
+    # Resume if specified. resume_dir stays None when starting fresh; the data
+    # stream is repositioned after the dataloader exists (see below).
     start_step = 0
+    resume_dir = None
     if args.resume_from_hf:
         if rank == 0:
             print(f"Downloading checkpoint from HuggingFace: {args.resume_from_hf}")
@@ -1048,6 +1152,11 @@ def main():
         online_codebook_mask=args.online_codebook_mask,
         debug_samples=max(0, args.debug_first_steps * max(1, args.gradient_accumulation_steps)),
     )
+
+    # Reposition the data stream to match the checkpoint. Must happen here: the
+    # dataloader does not exist yet when load_checkpoint() runs above.
+    if resume_dir is not None and not args.reset_step:
+        _restore_loader_state(resume_dir, dataloader, args)
 
     use_token_type_head = args.token_type_loss_weight > 0
 
@@ -1689,7 +1798,8 @@ def main():
 
         # Save checkpoint
         if step % args.save_freq == 0:
-            save_checkpoint(model, optimizer, step, args, args.output_dir)
+            save_checkpoint(model, optimizer, step, args, args.output_dir,
+                            dataloader=dataloader)
 
         # Profiler step
         if profiler is not None:
@@ -1777,7 +1887,8 @@ def main():
                     for ck, cv in kids:
                         print_entry(ck, cv, indent=1, ref=parent_val)
     else:
-        save_checkpoint(model, optimizer, step, args, args.output_dir, hf_repo=args.hf_repo)
+        save_checkpoint(model, optimizer, step, args, args.output_dir, hf_repo=args.hf_repo,
+                        dataloader=dataloader)
 
     if rank == 0:
         torch.cuda.synchronize()

@@ -333,8 +333,12 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                 mask_shard = np.load(mask_shards[shard_idx]) if mask_shards is not None else None
                 if mask_shard is not None and len(mask_shard) != len(shard):
                     raise ValueError(f"Mask length mismatch for {shards[shard_idx]}")
+                # self._offset is the RESUME position and must keep tracking the
+                # live one: it is synced to `offset` at every yield below and
+                # zeroed only once this shard is exhausted. Zeroing it here (the
+                # historical behaviour) made state_dict() always report offset=0,
+                # so a resumed run silently replayed the shard from its start.
                 offset = self._offset
-                self._offset = 0
                 self._debug_log(
                     f"loaded lm shard idx={shard_idx} tokens={len(shard)} "
                     f"has_mask={mask_shard is not None} start_offset={offset}"
@@ -457,7 +461,14 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                     if self.online_codebook_mask:
                         sample["codebook_counts"] = available_counts
                         sample["online_skipped_targets"] = online_skipped_targets
+                    # Publish the resume position. A checkpoint can only be taken
+                    # between yields, so syncing here is exactly sufficient: it
+                    # names the first chunk this shard has NOT yet emitted.
+                    self._offset = offset
                     yield sample, y
+
+                # Shard exhausted: the next one starts at its own beginning.
+                self._offset = 0
 
             # Loop
             self._shard_idx = 0
@@ -484,8 +495,9 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                     f"resume_offset={self._offset}"
                 )
                 shard = self._load_token_shard(shards[shard_idx])
+                # Same contract as _iter_lm: synced at every yield, zeroed only
+                # once the shard is exhausted.
                 offset = self._offset
-                self._offset = 0
                 self._debug_log(
                     f"loaded compress shard idx={shard_idx} tokens={len(shard)} start_offset={offset}"
                 )
@@ -565,7 +577,11 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                             f"base_count={base_count} comp_len={comp_len}"
                         )
                     self._debug_samples_emitted += 1
+                    self._offset = offset
                     yield {"input": x, "codebook": cb, "n_base_tokens": base_count}, y
+
+                # Shard exhausted: the next one starts at its own beginning.
+                self._offset = 0
 
             # Loop
             self._shard_idx = 0
@@ -592,9 +608,38 @@ class Zip2ZipDataset(IterableDataset, Stateful):
             yield from self._iter_lm(shards, self.mask_files)
 
     def state_dict(self):
-        return {"shard_idx": self._shard_idx, "offset": self._offset}
+        """Position in this rank's data stream, for an exact resume.
+
+        `mode` and `n_shards` are recorded so a resume can REFUSE a state that
+        describes a different stream instead of seeking to a meaningless spot.
+        """
+        return {
+            "shard_idx": self._shard_idx,
+            "offset": self._offset,
+            "mode": self.mode,
+            "n_shards": len(self.shard_files),
+        }
 
     def load_state_dict(self, state_dict):
+        saved_mode = state_dict.get("mode", self.mode)
+        if saved_mode != self.mode:
+            raise ValueError(
+                f"data position was saved in mode={saved_mode!r} but this run is "
+                f"mode={self.mode!r}; the two iterate shards differently, so the "
+                "saved offset does not transfer"
+            )
+        saved_shards = state_dict.get("n_shards", len(self.shard_files))
+        if saved_shards != len(self.shard_files):
+            raise ValueError(
+                f"data position was saved with {saved_shards} shards for this rank "
+                f"but this run has {len(self.shard_files)}; shard_idx would point "
+                "at a different file (changed DATA_DIR or world_size)"
+            )
+        if not 0 <= state_dict["shard_idx"] < len(self.shard_files):
+            raise ValueError(
+                f"saved shard_idx={state_dict['shard_idx']} is out of range for "
+                f"{len(self.shard_files)} shards"
+            )
         self._shard_idx = state_dict["shard_idx"]
         self._offset = state_dict["offset"]
 

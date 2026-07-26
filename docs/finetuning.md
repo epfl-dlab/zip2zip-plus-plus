@@ -777,3 +777,34 @@ torchrun ... --resume_from /path/to/phase1_checkpoint \
 ```
 
 On phase transition, `load_checkpoint()` automatically pads `hyper_encoder.pos_embed` to accommodate the larger window and skips optimizer state loading (fresh optimizer for the new phase).
+
+## Resuming and the data stream
+
+A checkpoint records **where each rank was in its shards**, and a resume seeks
+back to it. Without that, a resume restores step, weights and optimizer but
+re-reads the shards from the beginning: the run then trains twice on the first
+steps' data and never sees the tail, which silently destroys comparability with
+a clean baseline. That was measured on 2026-07-26, when a preempted v0.7 run
+fed at step 6000 the exact batch the original had seen at step 500.
+
+What to expect:
+
+- Every checkpoint's `meta.pt` carries `loader_state` — per-rank `shard_idx` and
+  `offset`. `save_checkpoint` says which position it stored; a resume prints
+  `[resume] rank N data stream restored to shard_idx=... offset=...`. If you do
+  not see that line, the stream was **not** repositioned.
+- **A checkpoint whose position cannot be restored is a hard error.** That covers
+  checkpoints written before this existed, a changed `world_size` (shards are
+  split `rank::world_size`, so the position does not transfer), a changed
+  `DATA_DIR`, and `--num_workers > 0` (the position lives in worker processes and
+  cannot be read back from the parent). Restart from step 0, or pass
+  `--allow_data_replay` to accept the replay deliberately — a run that used it is
+  not comparable to a clean baseline and must be labelled as such.
+- `--reset_step` intentionally starts the data from the beginning: a fresh LR
+  schedule is a new run that happens to warm-start its weights, so no position is
+  restored and no error is raised.
+
+This matters most under preemption. Run:AI evicts an over-quota workload at any
+moment and recreates the pod with the same command, so a long run can be
+interrupted several times; each interruption used to scramble the data
+composition a little more. `tests/test_resume_dataloader.py` pins the invariants.
