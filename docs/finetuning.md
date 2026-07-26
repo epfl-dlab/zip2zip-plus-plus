@@ -48,9 +48,9 @@ Three things worth knowing about how it behaves:
 - **Older lever sets are selectable by name** (`RECIPE=v0.5`). Selecting a
   superseded recipe prints a note; selecting one of the two measured *negative*
   results (`v0.6` warm-start, `v0.6.1` deeper encoder) prints a loud warning.
-- **An unmeasured candidate is marked `+`**. `RECIPE=v0.6.5` is available for
-  verification and launch, but v0.6.4 remains the current standard until the
-  paired full evaluation is complete.
+- **Measured negative results are marked `!`** and print a loud warning: `v0.6`
+  (warm-start), `v0.6.1` (deeper encoder) and `v0.6.5` (exact decoder-time mask).
+  They stay selectable purely so the experiment is reproducible.
 - **An unknown name is a fatal error**, never a silent fallback to "no levers".
   Both launchers print the resolved `RECIPE=` in their banner, and `meta.pt`
   records every resolved flag, so the effective experimental levers are
@@ -526,11 +526,46 @@ to compression was this bug. **Recommendation: keep
 low-level default-off behavior.** This applies the correctness fix to new runs
 without changing frozen v0.1–v0.6.3 commands.
 
-## Exact decoder-time codebook mask (v0.6.5 candidate)
+## Exact decoder-time codebook mask (v0.6.5 — NEGATIVE, archived)
 
-**Definition: `v0.6.5 = v0.6.4 + ONLINE_CODEBOOK_MASK=1`.** This is an
-unmeasured candidate. v0.6.4 remains the current standard until v0.6.5 finishes
-the same 8k training and paired full evaluation.
+**Definition: `v0.6.5 = v0.6.4 + ONLINE_CODEBOOK_MASK=1`.**
+
+**Outcome (2026-07-26): measured NEGATIVE — the fix made the model worse.**
+Scored under the legacy `k <= t` mask, exactly like every earlier version, so
+the comparison is like-for-like (`--no_online_codebook_mask`; the results JSON
+records `online_codebook_mask_active: false`):
+
+| | GSM8K | ARC-c | ARC-e | HellaSwag | OBQA | PIQA | WinoGrande |
+|---|---|---|---|---|---|---|---|
+| v0.6.4 | **.6770** | **.5700** | **.8304** | **.7233** | **.4660** | **.8003** | .7443 |
+| v0.6.5 | .6528 | .5503 | .8157 | .7117 | .4580 | .7982 | **.7490** |
+| delta | −2.4pt | −2.0 | −1.5 | −1.2 | −0.8 | −0.2 | +0.5 |
+
+Worse on 6 of 7, landing back at the v0.6.2/v0.6.3 level. The direction is
+consistent across metrics, so this is not noise. The leak documented below is
+real and was measured precisely — removing it simply does not help, and the
+most plausible reading is that exposing not-yet-installed rows acted as a mild
+regularizer. That is an interpretation, not a measurement.
+
+**v0.6.4 remains the standard recipe.** The v0.6.5 code stays in the tree,
+default-off and `status=negative` in the registry, for the same reason v0.6 and
+v0.6.1 did: the question came from outside the team as a "real and convincing
+defect", and keeping the implementation plus this verdict means nobody has to
+re-derive it. Everything below documents the mechanism, which is sound; only
+the training outcome was negative.
+
+Two operational lessons from the run, both already fixed in the scripts:
+
+- The eval-side guard that refuses to skip an unavailable target **aborts the
+  whole evaluation**, and the case occurs about once per 13,700 loglikelihood
+  requests — so a full compressed eval of a v0.6.5 checkpoint is *certain* to
+  hit it. Use `--no_online_codebook_mask` (env `NO_ONLINE_CODEBOOK_MASK=1`) to
+  score with the legacy mask, which is also the only comparable option.
+- A crashed pipeline that Run:AI retries leaves several **short pipeline logs,
+  each with its own freshly generated `run_id` that was never created in W&B**.
+  Taking the id from the newest log resumes into a nonexistent run and fails
+  *after* the eval, which Run:AI then retries — ~6 GPU-hours lost this way.
+  `eval_ckpt_rcp.sh` now verifies the resume target exists before starting.
 
 The legacy teacher-forced path receives the final LZW codebook, including rows
 created later in the sequence, and approximates availability with `row k <=

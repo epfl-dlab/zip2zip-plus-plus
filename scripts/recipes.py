@@ -142,11 +142,16 @@ RECIPES = {
     },
     "v0.6.5": {
         "extends": "v0.6.4",
-        "status": "candidate",
+        "status": "negative",
         "description": "decoder-time codebook availability during teacher forcing",
         "env": {"ONLINE_CODEBOOK_MASK": "1"},
-        "notes": "unmeasured candidate; removes train-generation vocabulary "
-                 "leakage while preserving v0.6.4 as the current standard",
+        "notes": "MEASURED NEGATIVE (2026-07-26): removing the train/generation "
+                 "vocabulary leak made the model WORSE on 6 of 7 metrics — GSM8K "
+                 ".677 -> .653, ARC-c .570 -> .550, ARC-e .830 -> .816, HellaSwag "
+                 ".723 -> .712 (scored under the legacy mask, like every earlier "
+                 "version, so the comparison is like-for-like). The leak was real "
+                 "and measurable but apparently acted as a regularizer. v0.6.4 "
+                 "remains the standard. Do not revisit without a new argument.",
     },
 }
 

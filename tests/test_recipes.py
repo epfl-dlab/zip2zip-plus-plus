@@ -96,10 +96,12 @@ def main():
     check("R2_current_resolves_to_five_levers",
           R.resolve("v0.6.4") == EXPECTED_V064,
           f"{sorted(R.resolve('v0.6.4').items())}")
+    # v0.6.5 ran on 2026-07-26 and lost on 6 of 7 metrics: it is archived as a
+    # measured negative, still selectable so the experiment stays reproducible.
     check("R2_v065_is_v064_plus_online_mask",
           R.resolve("v0.6.5") == EXPECTED_V065
           and R.RECIPES["v0.6.5"]["extends"] == "v0.6.4"
-          and R.RECIPES["v0.6.5"]["status"] == "candidate",
+          and R.RECIPES["v0.6.5"]["status"] == "negative",
           f"{sorted(R.resolve('v0.6.5').items())}")
 
     # ---- R3: ledger property — each version = parent + its own env block ----
@@ -169,16 +171,16 @@ def main():
     check("R6_negative_recipe_warns_but_works",
           neg.returncode == 0 and "WARNING" in neg.stderr and "WARMSTART_STEPS" in neg.stdout,
           "a measured-negative recipe still resolves, loudly")
-    candidate = subprocess.run(
+    archived = subprocess.run(
         [sys.executable, RECIPES_PY, "v0.6.5"],
         capture_output=True,
         text=True,
     )
-    check("R6_candidate_warns_but_works",
-          candidate.returncode == 0
-          and "UNMEASURED CANDIDATE" in candidate.stderr
-          and "ONLINE_CODEBOOK_MASK" in candidate.stdout,
-          "candidate resolves, but cannot be mistaken for the current standard")
+    check("R6_archived_negative_warns_but_works",
+          archived.returncode == 0
+          and "MEASURED NEGATIVE" in archived.stderr
+          and "ONLINE_CODEBOOK_MASK" in archived.stdout,
+          "the archived v0.6.5 still resolves, but warns it lost to v0.6.4")
 
     # ---- R7: identify() round-trip, for EVERY recipe ----
     wrong = []

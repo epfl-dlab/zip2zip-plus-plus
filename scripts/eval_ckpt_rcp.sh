@@ -118,6 +118,7 @@ if [ -n "$RESUME_WANDB_ID" ] && [ -z "${WANDB_API_KEY:-}" ]; then
     exit 1
 fi
 
+
 if [ -n "$CKPT_DIR" ]; then
     MODEL_SHORT=$(echo "$(basename "$(dirname "$CKPT_DIR")")_$(basename "$CKPT_DIR")" | tr -d '()')
 else
@@ -136,6 +137,31 @@ if [ ! -f "$VENV_DIR/bin/activate" ]; then
 fi
 source "$VENV_DIR/bin/activate"
 pip install --quiet "lm-eval==0.4.9" "huggingface_hub" wandb
+
+# Verify the resume target EXISTS before spending an hour of GPU. The upload runs
+# LAST, so a wrong id used to surface only after the whole eval had finished — and
+# Run:AI then retried the job, re-burning the GPU on every attempt (this cost ~6
+# GPU-hours on 2026-07-26). The id must come from the pipeline log that actually
+# contains training steps: a crashed pipeline that Run:AI retried leaves several
+# short logs, each with its OWN freshly-generated run_id that was never created.
+if [ -n "$RESUME_WANDB_ID" ]; then
+    python - "$RESUME_WANDB_ID" "${WANDB_PROJECT:-zip2zip-core}" "${WANDB_ENTITY:-epfl-dlab}" <<'PY' || exit 1
+import sys
+import wandb
+run_id, project, entity = sys.argv[1:4]
+try:
+    wandb.Api().run(f"{entity}/{project}/{run_id}")
+except Exception as exc:
+    sys.exit(
+        f"[eval_ckpt] FATAL: RESUME_WANDB_ID={run_id} does not exist in "
+        f"{entity}/{project} ({type(exc).__name__}). Refusing to run the eval: it "
+        f"would take an hour and then fail on resume. Get the id with\n"
+        f"  grep -l 'step=' $Z2Z_SCRATCH/logs/pipeline/pipeline_<RUN_NAME>_*.log\n"
+        f"then read 'run_id=' from THAT log, or copy it from the W&B URL."
+    )
+print(f"[eval_ckpt] W&B resume target {entity}/{project}/{run_id} exists")
+PY
+fi
 
 # ---------- run ----------
 cd "$PROJECT_DIR"
