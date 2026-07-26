@@ -157,6 +157,11 @@ could restore:
   checkpoint; its absence means the eval positioned tokens by compressed index
   instead of base index, i.e. a geometry the checkpoint never trained on. Base-mode
   evals are unaffected either way (an uncompressed stream is `arange` regardless).
+- `two-axis RoPE: enabled from meta.pt` — additionally required for a v0.7
+  checkpoint. It confirms that even complex pairs use base-stream positions and
+  odd pairs use compressed-token positions in every decoder layer. The results
+  JSON records `base_token_positions` and `two_axis_rope`, and the pipeline
+  audits the latter when `RECIPE=v0.7`.
 - `hyper-encoder residual: disabled from meta.pt` — for a checkpoint trained with
   `NO_ENCODER_RESIDUAL=1` (an ablation; no production run uses it). This is the one
   line that appears only in the *non-default* case, so its absence is normal and

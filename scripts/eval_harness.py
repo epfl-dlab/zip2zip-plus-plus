@@ -111,7 +111,7 @@ def main():
     p.add_argument("--no_hyper_causal_mask", action="store_true",
                    help="Disable hyper_causal_mask in the model forward.")
     p.add_argument("--no_online_codebook_mask", action="store_true",
-                   help="For a v0.6.5+ checkpoint, score with the legacy k<=t mask "
+                   help="For a v0.6.5 checkpoint, score with the legacy k<=t mask "
                         "instead of the exact decoder-time mask it was trained with. "
                         "Use this to compare against v0.1-v0.6.4 numbers, which were "
                         "all produced with the legacy mask. No effect on older "
@@ -179,6 +179,8 @@ def main():
     args.disable_digit_ids = lm.disable_digit_ids
     args.disable_mathsym_ids = lm.disable_mathsym_ids
     args.eval_mode = lm.eval_mode
+    args.base_token_positions = lm.cfg.base_token_positions
+    args.two_axis_rope = lm.cfg.two_axis_rope
     args.online_codebook_mask = lm.online_codebook_mask
     args.online_codebook_mask_active = lm.online_codebook_mask_active
     # Distinguishes "inactive because base mode" from "inactive because this eval
@@ -191,6 +193,10 @@ def main():
     print(f"[eval_harness] checkpoint:   {ckpt_dir}")
     print(f"[eval_harness] tasks:        {tasks}")
     print(f"[eval_harness] eval_mode:    {args.eval_mode}")
+    print(
+        f"[eval_harness] decoder RoPE: base_positions="
+        f"{args.base_token_positions} two_axis={args.two_axis_rope}"
+    )
     print(
         f"[eval_harness] online mask:  checkpoint={args.online_codebook_mask} "
         f"active={args.online_codebook_mask_active}"

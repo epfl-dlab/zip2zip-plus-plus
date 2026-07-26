@@ -100,7 +100,7 @@ DISABLE_DIGIT_IDS=${DISABLE_DIGIT_IDS:-}
 # DISABLE_MATHSYM_IDS=1: triage — also protect math operators/symbols.
 DISABLE_MATHSYM_IDS=${DISABLE_MATHSYM_IDS:-}
 [ "$DISABLE_MATHSYM_IDS" = "0" ] && DISABLE_MATHSYM_IDS=""
-# NO_ONLINE_CODEBOOK_MASK=1: score a v0.6.5+ checkpoint with the LEGACY k<=t mask
+# NO_ONLINE_CODEBOOK_MASK=1: score a v0.6.5 checkpoint with the LEGACY k<=t mask
 # instead of the exact decoder-time mask it trained with. This is the setting for
 # comparing against v0.1-v0.6.4, whose numbers were all produced with the legacy
 # mask. "0" normalizes to off so it cannot half-trigger the :+ passthrough.

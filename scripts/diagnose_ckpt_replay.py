@@ -263,7 +263,14 @@ def main():
     )
     log(f"cfg: vocab={lm.cfg.vocab_size} max_codebook={lm.cfg.max_codebook_size} "
         f"max_subtokens={lm.cfg.max_subtokens} pad={lm.cfg.pad_token_id}")
-    log(f"train_args from meta.pt: { {k: lm.train_args.get(k) for k in ('model_config', 'seq_len', 'max_subtokens', 'max_codebook_size', 'max_active_codebook_size', 'lora_rank', 'lora_alpha', 'hyper_causal_mask', 'online_codebook_mask', 'no_remap_codebook', 'data_dir', 'tokenizer')} }")
+    replay_arg_keys = (
+        "model_config", "seq_len", "max_subtokens", "max_codebook_size",
+        "max_active_codebook_size", "lora_rank", "lora_alpha",
+        "hyper_causal_mask", "base_token_positions", "two_axis_rope",
+        "online_codebook_mask", "no_remap_codebook", "data_dir", "tokenizer",
+    )
+    replay_args = {key: lm.train_args.get(key) for key in replay_arg_keys}
+    log(f"train_args from meta.pt: {replay_args}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     special = set(tokenizer.all_special_ids or [])

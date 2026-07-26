@@ -66,6 +66,9 @@
 #   BASE_TOKEN_POSITIONS= set 1 for uncompressed-stream RoPE positions
 #                     (v0.6.2 recipe). Inherited by the train launcher; evals
 #                     auto-configure from meta.pt like the untied flag.
+#   TWO_AXIS_ROPE=    set 1 to split complex RoPE pairs between base-stream
+#                     and compressed-token positions (v0.7 candidate). Requires
+#                     BASE_TOKEN_POSITIONS=1; evals auto-configure from meta.pt.
 #   TOKEN_TYPE_LOSS_WEIGHT= auxiliary base-vs-hyper type loss weight
 #                     (v0.6.3 recipe, 0.05). 0/off = v0.6.2 behavior. Inherited
 #                     by the train launcher; evals auto-configure from meta.pt.
@@ -219,11 +222,12 @@ audit_eval_mode() {
     [ -z "${EVAL_MODE:-}" ] \
         && [ -z "${DISABLE_DIGIT_IDS:-}" ] \
         && [ -z "${ONLINE_CODEBOOK_MASK:-}" ] \
+        && [ -z "${TWO_AXIS_ROPE:-}" ] \
         && return 0
     python - "$1" "${EVAL_MODE:-}" "${DISABLE_DIGIT_IDS:-}" \
-        "${ONLINE_CODEBOOK_MASK:-}" <<'PY'
+        "${ONLINE_CODEBOOK_MASK:-}" "${TWO_AXIS_ROPE:-}" <<'PY'
 import json, sys
-path, want_mode, want_digits, want_online_raw = sys.argv[1:5]
+path, want_mode, want_digits, want_online_raw, want_two_axis_raw = sys.argv[1:6]
 args = json.load(open(path))["args"]
 if want_mode:
     got = args["eval_mode"]
@@ -243,6 +247,13 @@ if want_online_raw:
     assert got_active is want_active, (
         f"online-mask audit FAILED: {path} recorded "
         f"online_codebook_mask_active={got_active!r}, expected {want_active!r}"
+    )
+if want_two_axis_raw:
+    want_two_axis = want_two_axis_raw != "0"
+    got = args.get("two_axis_rope")
+    assert got is want_two_axis, (
+        f"two-axis RoPE audit FAILED: {path} recorded "
+        f"two_axis_rope={got!r}, expected {want_two_axis!r}"
     )
 print(f"[pipeline] eval-flags audit OK: {path}")
 PY

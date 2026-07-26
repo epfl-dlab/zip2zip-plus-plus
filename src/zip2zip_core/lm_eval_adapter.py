@@ -8,9 +8,9 @@ Two scoring modes:
 
 * "compressed" (default): apply LZW compression over (context + continuation),
   then sum the logprobs of compressed tokens whose base-position span is at or
-  after the continuation boundary. v0.1-v0.6.4 checkpoints use the historical
-  `k <= t` codebook mask. A v0.6.5+ checkpoint records the exact decoder-time
-  mask in `meta.pt`, and this adapter restores it automatically.
+  after the continuation boundary. v0.1-v0.6.4 and v0.7 checkpoints use the
+  historical `k <= t` codebook mask. The branched v0.6.5 checkpoint records the
+  exact decoder-time mask in `meta.pt`, and this adapter restores it automatically.
 
 * "base": skip compression, feed raw base tokens with no codebook (vanilla LM
   path of the model), and read logprobs from the base-vocab logits. This is OOD
@@ -141,6 +141,9 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
         # (uncompressed stream, positions == arange either way).
         overrides["base_token_positions"] = True
         print("[zip2zip-lm-eval] base-token RoPE positions: enabled from meta.pt")
+    if train_args.get("two_axis_rope"):
+        overrides["two_axis_rope"] = True
+        print("[zip2zip-lm-eval] two-axis RoPE: enabled from meta.pt")
     if overrides:
         cfg = dataclasses.replace(cfg, **overrides)
 

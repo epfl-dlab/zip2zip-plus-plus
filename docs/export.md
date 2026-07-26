@@ -62,6 +62,13 @@ export(
 )
 ```
 
+Checkpoints whose `meta.pt` records `base_token_positions` or `two_axis_rope`
+are intentionally refused by both export paths. The external HuggingFace
+runtime currently assigns one compressed-index RoPE position to every decoder
+token; exporting either geometry would load successfully but evaluate with the
+wrong attention. Use the in-core evaluation/inference paths until equivalent
+runtime support exists.
+
 ### Batch export
 
 Export multiple checkpoints at once:

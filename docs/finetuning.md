@@ -46,11 +46,13 @@ Three things worth knowing about how it behaves:
   single-variable experiment on top of the standard recipe is
   `RECIPE=v0.6.4 ENCODER_N_LAYERS=4` — no need to restate the other five.
 - **Older lever sets are selectable by name** (`RECIPE=v0.5`). Selecting a
-  superseded recipe prints a note; selecting one of the two measured *negative*
+  superseded recipe prints a note; selecting a measured *negative*
   results (`v0.6` warm-start, `v0.6.1` deeper encoder) prints a loud warning.
 - **Measured negative results are marked `!`** and print a loud warning: `v0.6`
   (warm-start), `v0.6.1` (deeper encoder) and `v0.6.5` (exact decoder-time mask).
   They stay selectable purely so the experiment is reproducible.
+- **Unmeasured candidates are marked `+`**. `v0.7` is the current candidate;
+  it does not replace the validated v0.6.4 standard until it is measured.
 - **An unknown name is a fatal error**, never a silent fallback to "no levers".
   Both launchers print the resolved `RECIPE=` in their banner, and `meta.pt`
   records every resolved flag, so the effective experimental levers are
@@ -678,6 +680,50 @@ smoke checkpoint before the full 8k pipeline. Record wall-clock time and inspect
 `online_replay_us_per_token`. The run must complete with zero
 `online_skipped_targets`; otherwise its MC score is rejected rather than
 reported.
+
+## Two-axis RoPE (v0.7 — candidate, unmeasured)
+
+**Definition: `v0.7 = v0.6.4 + TWO_AXIS_ROPE=1`.** It deliberately branches
+from v0.6.4, not from the measured-negative v0.6.5. The current standard remains
+v0.6.4.
+
+Every decoder attention head keeps the original complex RoPE pairs, but assigns
+their coordinates alternately:
+
+- even complex pairs use the token's end-anchored position in the uncompressed
+  base-token stream;
+- odd complex pairs use its index in the compressed decoder stream.
+
+This is a 50/50 split across the full frequency spectrum in every main-decoder
+layer. It is not layer alternation, and it does not touch the hyper-encoder,
+whose own learned subtoken positional embedding remains unchanged.
+
+The implementation constructs one per-forward mixed RoPE cache and feeds it,
+with synthetic lookup indices, through the existing Torchtitan attention. It
+adds no weights, changes no state-dict keys, and does not modify Torchtitan.
+The cache is shared by all decoder layers, including activation recomputation.
+For ordinary all-base input, the two coordinates are identical and the mixed
+path is bypassed completely, preserving the v0.6.4 call path bit-for-bit.
+
+`TWO_AXIS_ROPE` and the low-level `--two_axis_rope` flag are default-off.
+Enabling them requires `BASE_TOKEN_POSITIONS=1`; the model also fails fast
+unless decoder RoPE is complex, enabled, and has a head dimension divisible by
+four. The flag is resume-hard, so an older lineage cannot silently change
+geometry mid-run. Evaluation and compressed inference restore it automatically
+from `meta.pt`; results JSON records `two_axis_rope`. HF export is refused
+because the external runtime does not implement this geometry.
+
+Select the candidate with:
+
+```bash
+RECIPE=v0.7 bash scripts/pipeline_ft_eval_rcp.sh
+```
+
+Before a full run, require the complete CPU invariant suite and a 20-step,
+four-GPU smoke checking finite forward/backward values, the resolved
+`TWO_AXIS_ROPE=1` banner, eval restoration, and throughput. A cluster job is not
+started by implementing or selecting the recipe; launch remains an explicit
+operator action.
 
 ## Canonical RCP locations and run conventions
 

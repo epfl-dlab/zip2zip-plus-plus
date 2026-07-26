@@ -65,6 +65,7 @@ ENV_KEYS = {
     "SHARE_HYPER_ENCODER_WEIGHTS": ("share_hyper_encoder_weights", "flag", False),
     "HYPER_ENCODER_TYPE":       ("hyper_encoder_type",       "str",   "flat"),
     "BASE_TOKEN_POSITIONS":     ("base_token_positions",     "flag",  False),
+    "TWO_AXIS_ROPE":            ("two_axis_rope",            "flag",  False),
     "ZERO_INIT_ENCODER_OUTPUT": ("zero_init_encoder_output", "flag",  False),
     "NO_ENCODER_RESIDUAL":      ("no_encoder_residual",      "flag",  False),
     "ONLINE_CODEBOOK_MASK":     ("online_codebook_mask",     "flag",  False),
@@ -190,6 +191,15 @@ RECIPES = {
                  "version, so the comparison is like-for-like). The leak was real "
                  "and measurable but apparently acted as a regularizer. v0.6.4 "
                  "remains the standard. Do not revisit without a new argument.",
+    },
+    "v0.7": {
+        "extends": "v0.6.4",
+        "status": "candidate",
+        "description": "two-axis RoPE over base and compressed positions",
+        "env": {"TWO_AXIS_ROPE": "1"},
+        "notes": "UNMEASURED: even complex RoPE pairs use base-stream positions "
+                 "and odd pairs use compressed-token positions in every decoder "
+                 "layer. The all-base path is unchanged.",
     },
 }
 

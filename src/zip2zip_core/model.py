@@ -35,6 +35,55 @@ def rope_cache_len(seq_len: int, max_subtokens: int, base_token_positions: bool)
     return seq_len * (max_subtokens if base_token_positions else 1)
 
 
+def build_two_axis_rope_inputs(
+    freqs_cis: torch.Tensor,
+    base_positions: torch.Tensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build an interleaved two-axis complex RoPE cache.
+
+    Even complex pairs use base-stream positions; odd pairs use compressed-token
+    positions. Flattening the per-sample cache and returning synthetic lookup
+    positions lets the unchanged Torchtitan attention consume the mixed cache.
+    """
+    if not torch.is_complex(freqs_cis) or freqs_cis.ndim != 2:
+        raise ValueError("two_axis_rope requires a 2D complex RoPE cache")
+    n_complex_pairs = freqs_cis.shape[-1]
+    if n_complex_pairs % 2:
+        raise ValueError(
+            "two_axis_rope requires an even number of complex RoPE pairs "
+            "(attention head_dim must be divisible by 4)"
+        )
+    if freqs_cis.shape[0] < seq_len:
+        raise ValueError(
+            f"two_axis_rope needs at least {seq_len} compressed-position cache "
+            f"rows, got {freqs_cis.shape[0]}"
+        )
+    if base_positions.shape == (1, seq_len):
+        base_positions = base_positions.expand(batch_size, -1)
+    elif base_positions.shape != (batch_size, seq_len):
+        raise ValueError(
+            f"two_axis_rope base positions must have shape (1, {seq_len}) or "
+            f"({batch_size}, {seq_len}), got {tuple(base_positions.shape)}"
+        )
+
+    base_freqs = freqs_cis[base_positions]
+    compressed_freqs = freqs_cis[:seq_len].unsqueeze(0).expand(batch_size, -1, -1)
+    use_base_axis = (
+        torch.arange(n_complex_pairs, device=freqs_cis.device) % 2 == 0
+    ).view(1, 1, n_complex_pairs)
+    mixed_freqs = torch.where(use_base_axis, base_freqs, compressed_freqs)
+
+    # GQAttention accepts a shared 2D cache plus per-sample lookup positions.
+    # Give every (batch, token) row its own pre-mixed cache entry.
+    lookup_positions = torch.arange(
+        batch_size * seq_len, device=freqs_cis.device, dtype=torch.long
+    ).view(batch_size, seq_len)
+    return mixed_freqs.reshape(batch_size * seq_len, n_complex_pairs), lookup_positions
+
+
 def restore_encoder_residual(model: nn.Module, train_args: dict) -> bool:
     """Restore the checkpoint's behavior-only encoder residual setting."""
     enabled = not bool(train_args.get("no_encoder_residual", False))
@@ -573,6 +622,11 @@ class Zip2ZipLlama3Model(Decoder):
         # meant in pretraining regardless of local compression ratio. Off = one
         # position per compressed token (v0.5 and released-model behavior).
         base_token_positions: bool = False
+        # Split each attention head's complex RoPE pairs equally between two
+        # coordinates: even pairs use the uncompressed/base-stream position,
+        # odd pairs use the compressed-token index. Requires
+        # base_token_positions=True. Off preserves the single-axis path exactly.
+        two_axis_rope: bool = False
         # Guarantee the hyper-encoder emits EXACTLY zero at init, so the first
         # hypertoken embedding equals its first base token's embedding (the
         # documented intent of the encoder_residual design). The existing
@@ -615,6 +669,33 @@ class Zip2ZipLlama3Model(Decoder):
             )
 
     def __init__(self, config: Config):
+        if config.two_axis_rope:
+            if not config.base_token_positions:
+                raise ValueError(
+                    "two_axis_rope requires base_token_positions=True"
+                )
+            attention_config = config.layer.attention
+            if (
+                config.rope.backend != "complex"
+                or getattr(attention_config, "rope_backend", None) != "complex"
+                or not getattr(attention_config, "use_rope", False)
+            ):
+                raise ValueError(
+                    "two_axis_rope requires complex RoPE enabled in the decoder attention"
+                )
+            head_dim = (
+                getattr(attention_config, "head_dim", None)
+                or config.dim // attention_config.n_heads
+            )
+            if config.rope.dim != head_dim:
+                raise ValueError(
+                    "two_axis_rope requires rope.dim to match the decoder "
+                    f"attention head_dim ({config.rope.dim} != {head_dim})"
+                )
+            if head_dim % 4:
+                raise ValueError(
+                    "two_axis_rope requires attention head_dim divisible by 4"
+                )
         super().__init__(config)
         self.zip2zip_config = config
         if config.share_hyper_encoder_weights and config.tie_hyper_encoder:
@@ -642,6 +723,11 @@ class Zip2ZipLlama3Model(Decoder):
         # alongside the embed buffers so base_token_positions can be computed
         # in incremental inference where only codebook UPDATES are visible.
         self._hyper_span_buf: torch.Tensor | None = None
+        # How many forwards actually built the two-axis cache. A v0.7 run whose
+        # mixed path never fires is an expensive duplicate of v0.6.4, and the
+        # config banner alone cannot tell the two apart. Plain int: never reaches
+        # the state dict or FSDP.
+        self.two_axis_forwards: int = 0
         # Which module(s) init_weights() zeroed per encoder role, so a zero-init
         # that silently matches nothing is visible. Populated by
         # _init_hyper_encoder; plain dict, so it never reaches the state dict or
@@ -1008,6 +1094,8 @@ class Zip2ZipLlama3Model(Decoder):
                 rows after each input token. Takes precedence over the legacy
                 position-based hyper causal mask.
         """
+        positions_were_provided = positions is not None
+
         if codebook_counts is not None:
             if codebook is None:
                 raise ValueError("codebook_counts requires a full training codebook")
@@ -1038,6 +1126,41 @@ class Zip2ZipLlama3Model(Decoder):
                 hyper_out_embeds = None
 
         # === Transformer layers ===
+        layer_freqs_cis = self.freqs_cis
+        layer_positions = positions
+        # With implicit positions and no hypertokens the two coordinates are
+        # identical. Keep that exact historical path (including positions=None
+        # in plain/base mode) so the experiment is bit-identical on ordinary
+        # uncompressed input. Explicit positions define the base axis and still
+        # need mixing against compressed arange positions.
+        if (
+            self.zip2zip_config.two_axis_rope
+            and (
+                positions_were_provided
+                or bool((tokens >= self.zip2zip_config.vocab_size).any())
+            )
+        ):
+            if positions is None:
+                raise RuntimeError(
+                    "two_axis_rope requires base-space positions for compressed input"
+                )
+            layer_freqs_cis, layer_positions = build_two_axis_rope_inputs(
+                self.freqs_cis,
+                positions,
+                batch_size=tokens.shape[0],
+                seq_len=tokens.shape[1],
+            )
+            self.two_axis_forwards += 1
+            if self.two_axis_forwards == 1:
+                # Report the dtype too: the whole scheme rides on the cache
+                # staying complex. Any upstream .to(real_dtype) would have
+                # already tripped the is_complex check in the helper, so this
+                # line is the positive confirmation in the run log.
+                print(
+                    f"[two_axis_rope] mixed cache active: "
+                    f"{tuple(layer_freqs_cis.shape)} {layer_freqs_cis.dtype}"
+                )
+
         use_ac = getattr(self, "gradient_checkpointing", False) and self.training
         with torch.profiler.record_function("Main LM"):
             for layer_id, layer in enumerate(self.layers.values()):
@@ -1045,11 +1168,17 @@ class Zip2ZipLlama3Model(Decoder):
                     if use_ac:
                         # Recompute layer activations in backward to save memory.
                         h = torch.utils.checkpoint.checkpoint(
-                            layer, h, self.freqs_cis, attention_masks, positions,
+                            layer,
+                            h,
+                            layer_freqs_cis,
+                            attention_masks,
+                            layer_positions,
                             use_reentrant=False,
                         )
                     else:
-                        h = layer(h, self.freqs_cis, attention_masks, positions)
+                        h = layer(
+                            h, layer_freqs_cis, attention_masks, layer_positions
+                        )
 
         h = self.norm(h) if self.norm is not None else h
 

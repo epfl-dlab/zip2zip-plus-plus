@@ -68,17 +68,24 @@ def _lora_scaling_from_meta(ckpt_dir: str) -> float:
 
 
 def refuse_base_token_positions(ckpt_dir: str) -> None:
-    """Hard-fail on exporting a base_token_positions checkpoint.
+    """Hard-fail on exporting unsupported decoder RoPE position schemes.
 
     The ext/zip2zip HF runtime assigns one RoPE position per compressed token;
-    a checkpoint trained with base-space positions would load fine and silently
-    score with the wrong geometry. Export support is a separate task.
+    a checkpoint trained with base-space or two-axis positions would load fine
+    and silently score with the wrong geometry. Export support is a separate task.
     """
     meta_pt = os.path.join(ckpt_dir, "meta.pt")
     if not os.path.exists(meta_pt):
         return
     meta = torch.load(meta_pt, map_location="cpu", weights_only=False)
     train_args = meta.get("args", {}) if isinstance(meta, dict) else {}
+    if train_args and train_args.get("two_axis_rope"):
+        raise NotImplementedError(
+            "this checkpoint was trained with --two_axis_rope; the ext/zip2zip "
+            "HF runtime has no two-axis RoPE path, so an export would silently "
+            "compute wrong attention geometry. Evaluate it through the in-core "
+            "adapter instead."
+        )
     if train_args and train_args.get("base_token_positions"):
         raise NotImplementedError(
             "this checkpoint was trained with --base_token_positions; the "

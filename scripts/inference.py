@@ -60,12 +60,19 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
         # behavior flag (no weights): compressed generation must position tokens
         # in base space exactly as trained.
         base_token_positions=bool(args.get("base_token_positions", False)),
+        # behavior-only two-axis geometry must also be restored from meta.pt.
+        two_axis_rope=bool(args.get("two_axis_rope", False)),
         # builds the (eval-unused) token_type_head so its checkpoint weights
         # have a home and the strict load below does not fail on them.
         token_type_loss_weight=float(args.get("token_type_loss_weight") or 0.0),
         **enc_overrides,
     )
     model = Zip2ZipLlama3Model(cfg)
+    print(
+        "[inference] decoder RoPE: "
+        f"base_positions={cfg.base_token_positions} "
+        f"two_axis={cfg.two_axis_rope}"
+    )
     if not restore_encoder_residual(model, args):
         print("[inference] hyper-encoder residual: disabled from meta.pt")
     model = model.to(device)

@@ -370,7 +370,8 @@ def validate_resume_args(resume_dir, args):
     hard = ("disable_digit_ids", "max_codebook_size",
             "max_active_codebook_size", "tokenizer",
             "untied_hyper_encoder", "share_hyper_encoder_weights",
-            "base_token_positions", "zero_init_encoder_output", "no_encoder_residual",
+            "base_token_positions", "two_axis_rope",
+            "zero_init_encoder_output", "no_encoder_residual",
             "token_type_loss_weight", "online_codebook_mask",
             "hyper_encoder_type", "encoder_dim", "encoder_n_layers",
             "encoder_n_heads", "encoder_intermediate_size")
@@ -385,6 +386,7 @@ def validate_resume_args(resume_dir, args):
         "untied_hyper_encoder": False,
         "share_hyper_encoder_weights": False,
         "base_token_positions": False,
+        "two_axis_rope": False,
         "zero_init_encoder_output": False,
         "no_encoder_residual": False,
         "token_type_loss_weight": 0.0,
@@ -631,6 +633,13 @@ def main():
                              "instead of one position per compressed token, so relative "
                              "distances keep their pretrained meaning. Default off = "
                              "compressed-index positions (v0.5 and released behavior).")
+    parser.add_argument(
+        "--two_axis_rope",
+        action="store_true",
+        help="Split complex RoPE pairs 50/50 between base-stream positions "
+             "(even pairs) and compressed-token positions (odd pairs). Requires "
+             "--base_token_positions. Default off preserves single-axis RoPE.",
+    )
     parser.add_argument("--seq_len", type=int, default=4096)
     parser.add_argument("--local_batch_size", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
@@ -749,6 +758,8 @@ def main():
 
     if args.no_compile:
         args.compile = False
+    if args.two_axis_rope and not args.base_token_positions:
+        parser.error("--two_axis_rope requires --base_token_positions")
     if args.online_codebook_mask and not args.no_remap_codebook:
         parser.error("--online_codebook_mask requires --no_remap_codebook")
     if args.online_codebook_mask and args.mode != "lm":
@@ -858,6 +869,7 @@ def main():
         tie_hyper_encoder=not args.untied_hyper_encoder,
         share_hyper_encoder_weights=args.share_hyper_encoder_weights,
         base_token_positions=args.base_token_positions,
+        two_axis_rope=args.two_axis_rope,
         zero_init_encoder_output=args.zero_init_encoder_output,
         rope=dataclasses.replace(
             config.rope,
@@ -1279,6 +1291,11 @@ def main():
             print(f"[base_token_positions] enabled: RoPE positions follow the "
                   f"uncompressed stream (rope cache = seq_len*max_subtokens = "
                   f"{args.seq_len * args.max_subtokens} positions)")
+        if args.two_axis_rope:
+            print(
+                "[two_axis_rope] enabled: even complex pairs use base-stream "
+                "positions; odd pairs use compressed-token positions"
+            )
         if args.warmstart_steps:
             print(f"[warmstart] enabled: decoder-LoRA frozen for first {args.warmstart_steps} steps")
             if args.warmstart_steps >= args.warmup_steps:
