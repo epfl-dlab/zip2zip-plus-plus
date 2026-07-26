@@ -372,7 +372,7 @@ def validate_resume_args(resume_dir, args):
             "untied_hyper_encoder", "share_hyper_encoder_weights",
             "base_token_positions", "zero_init_encoder_output", "no_encoder_residual",
             "token_type_loss_weight", "online_codebook_mask",
-            "encoder_dim", "encoder_n_layers",
+            "hyper_encoder_type", "encoder_dim", "encoder_n_layers",
             "encoder_n_heads", "encoder_intermediate_size")
     soft = ("max_subtokens", "seq_len", "data_dir", "warmstart_steps")
     # Hard keys whose ABSENCE from an old meta.pt has an unambiguous meaning:

@@ -345,7 +345,9 @@ class PairwiseHyperEncoder(nn.Module):
 
         if self.proj_out is not None:
             result = self.proj_out(result)
-        return result
+        # LayerNorm may stay fp32 under autocast; hierarchical writes into an
+        # input-dtype buffer, so preserve the pair input dtype.
+        return result.to(pair_embeddings.dtype)
 
 
 class HierarchicalHyperEncoder(nn.Module):

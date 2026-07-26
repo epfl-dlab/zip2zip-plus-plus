@@ -52,6 +52,7 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
         cfg,
         max_subtokens=args["max_subtokens"],
         max_codebook_size=args["max_codebook_size"],
+        hyper_encoder_type=args.get("hyper_encoder_type", "flat"),
         # untied checkpoints carry a second hyper_output encoder; without this the
         # strict load below fails on unexpected hyper_output.* keys.
         tie_hyper_encoder=not args.get("untied_hyper_encoder", False),

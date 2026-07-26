@@ -57,6 +57,8 @@
 #   SHARE_HYPER_ENCODER_WEIGHTS= with UNTIED_HYPER_ENCODER=1, re-encode lm_head
 #                     rows for the output role but reuse hyper_encoder weights
 #                     instead of training a second hyper_output module.
+#   HYPER_ENCODER_TYPE= flat by default; set hierarchical for the left-fold
+#                     composer experiment. Eval restores it from meta.pt.
 #   ENCODER_N_LAYERS= hyper-encoder depth (default 2 = v0.5). Set 4 for the
 #                     v0.6.1 deeper-encoder recipe (negative result — keep 2).
 #                     Inherited by the train launcher; evals auto-configure

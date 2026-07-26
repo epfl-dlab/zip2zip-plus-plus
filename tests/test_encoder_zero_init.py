@@ -263,6 +263,14 @@ def main():
     check("Z8_hierarchical_zeroed", e_h == 0.0
           and mh.zero_init_report["hyper_encoder"] == ["pair_encoder.norm"],
           f"||enc_out||={e_h} report={mh.zero_init_report['hyper_encoder']}")
+    pair = mh.hyper_encoder.pair_encoder
+    x32 = torch.randn(2, 2, DIM)
+    x = x32.to(torch.bfloat16)
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        out = pair(x)
+    check("Z8_hierarchical_pair_encoder_preserves_autocast_dtype",
+          out.dtype == x.dtype,
+          f"out dtype={out.dtype}, input dtype={x.dtype}")
 
     # ---- Z9: direct model use without residual does not zero the full embedding ----
     cfg_nr = small_cfg(zero_init=True)
@@ -308,7 +316,7 @@ def main():
                 disable_digit_ids=True, max_codebook_size=4096,
                 tokenizer="microsoft/Phi-3.5", untied_hyper_encoder=True,
                 base_token_positions=True, token_type_loss_weight=0.05,
-                encoder_n_layers=2, encoder_n_heads=32,
+                hyper_encoder_type="flat", encoder_n_layers=2, encoder_n_heads=32,
                 encoder_intermediate_size=12288, max_subtokens=4,
                 seq_len=2048, data_dir="/data", warmstart_steps=0,
                 allow_resume_mismatch=False,
@@ -350,6 +358,18 @@ def main():
             check("Z11_no_residual_is_resume_hard",
                   guard_rejects(args_nores, rec_nores),
                   "behavior-only residual mode cannot change silently")
+
+            args_hier = types.SimpleNamespace(
+                **common, zero_init_encoder_output=True,
+                no_encoder_residual=False, encoder_dim=3072,
+            )
+            args_hier.hyper_encoder_type = "hierarchical"
+            rec_hier = dict(vars(args_hier))
+            del rec_hier["allow_resume_mismatch"]
+            rec_hier["hyper_encoder_type"] = "flat"
+            check("Z11_hyper_encoder_type_is_resume_hard",
+                  guard_rejects(args_hier, rec_hier),
+                  "flat and hierarchical checkpoints cannot share a lineage")
 
             rec_match = dict(vars(args_zero))
             del rec_match["allow_resume_mismatch"]

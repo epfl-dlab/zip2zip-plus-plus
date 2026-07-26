@@ -63,6 +63,7 @@ ENV_KEYS = {
     "DISABLE_DIGIT_IDS":        ("disable_digit_ids",        "flag",  False),
     "UNTIED_HYPER_ENCODER":     ("untied_hyper_encoder",     "flag",  False),
     "SHARE_HYPER_ENCODER_WEIGHTS": ("share_hyper_encoder_weights", "flag", False),
+    "HYPER_ENCODER_TYPE":       ("hyper_encoder_type",       "str",   "flat"),
     "BASE_TOKEN_POSITIONS":     ("base_token_positions",     "flag",  False),
     "ZERO_INIT_ENCODER_OUTPUT": ("zero_init_encoder_output", "flag",  False),
     "NO_ENCODER_RESIDUAL":      ("no_encoder_residual",      "flag",  False),
@@ -142,6 +143,15 @@ RECIPES = {
         "notes": "broadest balanced improvement of the line: GSM8K .652 -> .677, "
                  "MC average recovered, best ppl; OBQA/Wino changes within noise.",
     },
+    "vx0.6.1": {
+        "extends": "v0.6.4",
+        "status": "candidate",
+        "description": "output role re-encodes lm_head rows using shared hyper-encoder weights",
+        "env": {"SHARE_HYPER_ENCODER_WEIGHTS": "1"},
+        "notes": "Xinxian exploratory run: keeps v0.6.4's untied input/output roles, "
+                 "but removes the second trained hyper_output module. Tests whether "
+                 "role-specific hyper-encoders matter",
+    },
     "vx0.6.2": {
         "extends": "v0.6.4",
         "status": "candidate",
@@ -151,14 +161,14 @@ RECIPES = {
                  "the flat hyper-encoder. ZERO_INIT_ENCODER_OUTPUT is forced off "
                  "because train.py intentionally rejects zero-init without the residual.",
     },
-    "vx0.6.1": {
+    "vx0.6.3": {
         "extends": "v0.6.4",
         "status": "candidate",
-        "description": "output role re-encodes lm_head rows using shared hyper-encoder weights",
-        "env": {"SHARE_HYPER_ENCODER_WEIGHTS": "1"},
-        "notes": "Xinxian exploratory run: keeps v0.6.4's untied input/output roles, "
-                 "but removes the second trained hyper_output module. Tests whether "
-                 "role-specific hyper-encoders matter",
+        "description": "hierarchical hyper-encoder under the v0.6.4 recipe",
+        "env": {"HYPER_ENCODER_TYPE": "hierarchical"},
+        "notes": "Xinxian exploratory run: replaces the flat hyper-encoder with "
+                 "the left-fold hierarchical composer while keeping every other "
+                 "v0.6.4 lever fixed.",
     },
     "v0.6.5": {
         "extends": "v0.6.4",
@@ -252,6 +262,8 @@ def _as_arg_value(kind, raw):
         return float(raw)
     if kind == "int":
         return int(raw)
+    if kind == "str":
+        return str(raw)
     raise RecipeError(f"unknown kind {kind!r}")
 
 
