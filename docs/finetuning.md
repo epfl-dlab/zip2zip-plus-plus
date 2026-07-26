@@ -543,9 +543,28 @@ records `online_codebook_mask_active: false`):
 
 Worse on 6 of 7, landing back at the v0.6.2/v0.6.3 level. The direction is
 consistent across metrics, so this is not noise. The leak documented below is
-real and was measured precisely — removing it simply does not help, and the
-most plausible reading is that exposing not-yet-installed rows acted as a mild
-regularizer. That is an interpretation, not a measurement.
+real and was measured precisely — removing it simply does not help.
+
+**Why it backfired.** Not a vague "it acted as a regularizer": two measurements
+say the fix did exactly what it was designed to do, and that is the problem.
+The model got *better* at hyper-tokens — final `hyper_token_acc` 0.420 → 0.504
+(peaking 0.559 at step 6000) — and final train loss improved 1.434 → 1.376. It
+then acted on that confidence: `gen_compression_ratio` rose **1.2536 → 1.3107**,
+i.e. v0.6.5 merges ~4.6% more of its own output, while
+`input_compression_ratio` is identical (1.0772) — so the shift is entirely in
+what the model *chooses to emit*, not in what it is fed.
+
+More merging on generated math is precisely what destroys arithmetic: that is
+the v0.4 digit lesson (+23pt GSM8K came from *forbidding* merges on numbers),
+now arriving from the opposite direction. Removing the phantom rows made
+hyper-tokens look more reliable to the model, it leaned into compression, and
+the math accuracy paid for it. Note this also means the comparison is not
+perfectly like-for-like on task difficulty — v0.6.5 is solving GSM8K under more
+self-imposed compression — but as a recipe question (same budget, which gives
+the better GSM8K?) the −2.4pt stands.
+
+The causal link from "emits more hyper-tokens" to "loses math accuracy" is
+still an inference; the two compression/accuracy numbers above are measured.
 
 **v0.6.4 remains the standard recipe.** The v0.6.5 code stays in the tree,
 default-off and `status=negative` in the registry, for the same reason v0.6 and
