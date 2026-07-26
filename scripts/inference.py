@@ -191,9 +191,14 @@ def main():
 
     print("Loading model...")
     model, train_args = load_model(cli.ckpt_dir, device)
-    # to bf16 for faster inference (if not already in that dtype)
+    # Cast to bf16 for faster inference, but parameters and REAL buffers only.
+    # A blanket .half()/.to(dtype) also converts the complex64 RoPE cache
+    # (freqs_cis) to a real dtype, silently discarding the imaginary part and
+    # destroying position encoding. Mirrors the eval adapter's cast.
     if device == "cuda":
-        model = model.half()
+        model._apply(
+            lambda t: t.to(torch.bfloat16) if t.is_floating_point() else t
+        )
     cfg = model.zip2zip_config
     print(f"  max_subtokens={cfg.max_subtokens}  max_codebook_size={cfg.max_codebook_size}")
 

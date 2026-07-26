@@ -22,7 +22,9 @@ def build_model(cfg, seed=0):
     model = cfg.build()
     with torch.no_grad():
         model.init_weights()
-    model = model.to(device=DEV, dtype=torch.float32).eval()
+    # Parameters are already fp32. Passing dtype=torch.float32 here would also
+    # cast the complex64 RoPE buffers to real and silently discard their phase.
+    model = model.to(device=DEV).eval()
     # force the CPU/GPU-safe padded attention path (flash-attn varlen is CUDA-only)
     model.hyper_encoder.disable_varlen = True
     if getattr(model, "hyper_output", None) is not None:
