@@ -206,9 +206,17 @@ def main():
         # ---- D4: a state from a different stream is refused ----
         good = dict(reference[0][2])
 
-        def refuses(state, text):
+        def refuses(state, text, subject=None):
+            """Whether load_state_dict rejects `state` with `text` in the message.
+
+            `subject` lets the caller keep the dataset the call actually touched,
+            so a post-condition can inspect IT — an earlier version of this helper
+            built its own throwaway dataset, which made the non-mutation check
+            below tautological.
+            """
+            target = make_dataset(data_dir) if subject is None else subject
             try:
-                make_dataset(data_dir).load_state_dict(state)
+                target.load_state_dict(state)
             except ValueError as exc:
                 return text in str(exc)
             return False
@@ -228,17 +236,22 @@ def main():
             refuses({**good, "offset": -1}, "negative"),
             "a corrupt offset fails loudly",
         )
+        # The subject is advanced FIRST, so "unchanged" is a real claim about a
+        # non-zero position rather than a tautology about a virgin object.
+        mutation_subject = make_dataset(data_dir)
+        mutation_subject.load_state_dict(reference[2][2])
+        before = dict(mutation_subject.state_dict())
         check(
             "D4_check_state_dict_does_not_mutate",
-            (
-                lambda ds: (
-                    refuses({**good, "shard_idx": 99}, "out of range")
-                    and ds.state_dict()["shard_idx"] == 0
-                    and ds.state_dict()["offset"] == 0
-                )
-            )(make_dataset(data_dir)),
-            "a refused state leaves the stream untouched, so the caller can "
-            "decide collectively instead of some ranks having already moved",
+            before["offset"] > 0
+            and refuses(
+                {**good, "shard_idx": 99}, "out of range", subject=mutation_subject
+            )
+            and mutation_subject.state_dict()["shard_idx"] == before["shard_idx"]
+            and mutation_subject.state_dict()["offset"] == before["offset"],
+            f"a refused state leaves the stream at {before['offset']} instead of "
+            "half-applying it — the --allow_data_replay path returns without "
+            "restoring and assumes exactly that",
         )
 
         # ---- D7: a shard COUNT cannot identify a corpus (review finding) ----
@@ -270,6 +283,77 @@ def main():
                 "identical shard count and identical file names, told apart by "
                 "size — the count-only guard would have accepted this silently",
             )
+
+        # ---- D11: worker slicing keeps shards and masks paired ----
+        # Pre-existing defect found while reviewing this work: __iter__ sliced the
+        # token shards per worker but handed the iterator the rank-level mask
+        # list, so worker w's j-th shard was paired with mask j. Both files are
+        # full size, so the length check never fired: the run simply trained on
+        # another shard's loss mask, silently.
+        import types as _types
+
+        four_shard_dir = tempfile.mkdtemp()
+        try:
+            write_shards(four_shard_dir, n_shards=4, tokens_per_shard=400)
+            ds = make_dataset(four_shard_dir)
+            seen = {}
+
+            def iter_as_worker(worker_id, n_workers):
+                """Collect the (shard, mask) pairing __iter__ builds for a worker."""
+                import zip2zip_core.data as data_mod
+
+                real = data_mod.get_worker_info
+                data_mod.get_worker_info = lambda: _types.SimpleNamespace(
+                    id=worker_id, num_workers=n_workers
+                )
+                captured = {}
+                real_iter_lm = ds._iter_lm
+
+                def spy(shards, mask_shards=None):
+                    captured["shards"] = list(shards)
+                    captured["masks"] = list(mask_shards or [])
+                    return iter(())
+
+                ds._iter_lm = spy
+                try:
+                    list(ds.__iter__())
+                finally:
+                    ds._iter_lm = real_iter_lm
+                    data_mod.get_worker_info = real
+                return captured
+
+            for wid in (0, 1):
+                seen[wid] = iter_as_worker(wid, 2)
+            paired = all(
+                [os.path.basename(s).replace("shard_", "mask_") for s in c["shards"]]
+                == [os.path.basename(m) for m in c["masks"]]
+                for c in seen.values()
+            )
+            check(
+                "D11_worker_slicing_keeps_masks_aligned",
+                paired
+                and len(seen[0]["shards"]) == 2
+                and seen[0]["shards"] != seen[1]["shards"],
+                f"worker0={[os.path.basename(s) for s in seen[0]['shards']]} "
+                f"masks={[os.path.basename(m) for m in seen[0]['masks']]}",
+            )
+
+            # 4 shards, 8 workers: ids 0-3 each get one, ids 4-7 get NOTHING.
+            empty_refused = False
+            try:
+                iter_as_worker(5, 8)
+            except ValueError as exc:
+                empty_refused = "got no shards" in str(exc)
+            check(
+                "D11_empty_worker_slice_fails_instead_of_hanging",
+                empty_refused,
+                "more workers than shards used to spin forever in an empty "
+                "range inside while True, stalling the rank",
+            )
+        finally:
+            import shutil
+
+            shutil.rmtree(four_shard_dir, ignore_errors=True)
 
         # ---- D5/D6: the train.py guards ----
         import zip2zip_core.train as train_mod

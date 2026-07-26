@@ -808,11 +808,14 @@ def main():
                              "semantics, architecture, objective, or initialization lineage) "
                              "that differ from the checkpoint's meta.pt. Off = hard error.")
     parser.add_argument("--allow_data_replay", action="store_true",
+                        default=os.environ.get("ALLOW_DATA_REPLAY", "") not in ("", "0"),
                         help="Permit resuming from a checkpoint whose data-stream position "
                              "cannot be restored. The run then re-reads the shards from the "
                              "start while the step counter continues, so it trains on repeated "
                              "data and never sees the tail — its numbers are NOT comparable to "
-                             "a clean baseline. Off = hard error.")
+                             "a clean baseline. Off = hard error. Also settable as "
+                             "ALLOW_DATA_REPLAY=1 in the environment, so the launchers that do "
+                             "not forward extra arguments can still opt out.")
     parser.add_argument("--resume_from", type=str, default=None,
                         help="Local checkpoint dir, or 'latest' to auto-find latest step_* in output_dir")
     parser.add_argument("--resume_from_hf", type=str, default=None,

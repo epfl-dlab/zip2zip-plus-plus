@@ -589,9 +589,27 @@ class Zip2ZipDataset(IterableDataset, Stateful):
 
     def __iter__(self):
         worker_info = get_worker_info()
+        masks = self.mask_files
         if worker_info is not None:
             self._debug_worker_id = worker_info.id
             shards = self.shard_files[worker_info.id :: worker_info.num_workers]
+            # The masks MUST be sliced the same way. Passing the rank-level list
+            # while the shards are worker-sliced pairs worker w's j-th shard with
+            # mask j: right only while num_workers <= 1, and silently wrong after
+            # that — both files are full-size, so the length check never fires and
+            # the run trains on another shard's loss mask.
+            if masks is not None:
+                masks = masks[worker_info.id :: worker_info.num_workers]
+            if not shards:
+                # An empty slice makes `for shard_idx in range(0, 0)` inside
+                # `while True` spin without ever yielding, which stalls the
+                # DataLoader's in-order fetch and hangs the rank instead of
+                # failing it.
+                raise ValueError(
+                    f"worker {worker_info.id} of {worker_info.num_workers} got no "
+                    f"shards: this rank owns only {len(self.shard_files)}. Use at "
+                    f"most --num_workers {len(self.shard_files)}"
+                )
         else:
             self._debug_worker_id = 0
             shards = self.shard_files
@@ -605,7 +623,7 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         if self.mode == "compress":
             yield from self._iter_compress(shards)
         else:
-            yield from self._iter_lm(shards, self.mask_files)
+            yield from self._iter_lm(shards, masks)
 
     def _shard_identity(self):
         """What this rank's stream IS, not merely how long it is.

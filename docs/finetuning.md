@@ -815,9 +815,15 @@ The rest:
   `world_size` (shards are split `rank::world_size`); and a changed corpus — the
   position records each shard's name and size, so pointing `DATA_DIR` at a
   different dataset is refused even when the shard count matches. Restart from
-  step 0, or pass `--allow_data_replay` (`ALLOW_DATA_REPLAY=1` in the launchers)
-  to accept the replay deliberately. A run that used it is not comparable to a
+  step 0, or accept the replay deliberately with `--allow_data_replay`. Most
+  launchers do not forward extra arguments, so the flag also reads
+  `ALLOW_DATA_REPLAY=1` straight from the environment and therefore works from
+  every script without editing it. A run that used it is not comparable to a
   clean baseline and must be labelled as such.
+- **`--num_workers` above 1 needs care for a different reason.** Each worker takes
+  a slice of this rank's shards, and the loss masks are sliced to match; asking
+  for more workers than the rank owns shards is refused instead of hanging a
+  worker on an empty slice. With 8 shards over 4 ranks that ceiling is 2.
 - The decision is rank-uniform: the per-rank verdicts are gathered, and one bad
   rank fails the job. Otherwise that rank would abort while the others restored
   and entered the next collective, turning a clear failure into a hang.
