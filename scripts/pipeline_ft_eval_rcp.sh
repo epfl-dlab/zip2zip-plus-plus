@@ -70,6 +70,8 @@
 #   ZERO_INIT_ENCODER_OUTPUT= set 1 to start the hyper-encoder at exactly zero
 #                     (v0.6.4 recipe — fixes a silent init no-op). Training-only
 #                     (init), so evals need nothing.
+#   NO_ENCODER_RESIDUAL= set 1 to remove the first-token residual from the
+#                     hyper-encoder. Eval/inference restore this from meta.pt.
 #   ONLINE_CODEBOOK_MASK= set 1 to train with decoder-time codebook availability
 #                     instead of the k<=t approximation (v0.6.5 candidate).
 #                     The checkpoint records it so compressed offline eval

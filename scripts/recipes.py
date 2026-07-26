@@ -65,6 +65,7 @@ ENV_KEYS = {
     "SHARE_HYPER_ENCODER_WEIGHTS": ("share_hyper_encoder_weights", "flag", False),
     "BASE_TOKEN_POSITIONS":     ("base_token_positions",     "flag",  False),
     "ZERO_INIT_ENCODER_OUTPUT": ("zero_init_encoder_output", "flag",  False),
+    "NO_ENCODER_RESIDUAL":      ("no_encoder_residual",      "flag",  False),
     "ONLINE_CODEBOOK_MASK":     ("online_codebook_mask",     "flag",  False),
     "TOKEN_TYPE_LOSS_WEIGHT":   ("token_type_loss_weight",   "float", 0.0),
     "WARMSTART_STEPS":          ("warmstart_steps",          "int",   0),
@@ -140,6 +141,15 @@ RECIPES = {
         "env": {"ZERO_INIT_ENCODER_OUTPUT": "1"},
         "notes": "broadest balanced improvement of the line: GSM8K .652 -> .677, "
                  "MC average recovered, best ppl; OBQA/Wino changes within noise.",
+    },
+    "vx0.6.2": {
+        "extends": "v0.6.4",
+        "status": "candidate",
+        "description": "flat hyper-encoder without the residual path",
+        "env": {"ZERO_INIT_ENCODER_OUTPUT": "0", "NO_ENCODER_RESIDUAL": "1"},
+        "notes": "Xinxian exploratory run: removes the first-token residual from "
+                 "the flat hyper-encoder. ZERO_INIT_ENCODER_OUTPUT is forced off "
+                 "because train.py intentionally rejects zero-init without the residual.",
     },
     "vx0.6.1": {
         "extends": "v0.6.4",
