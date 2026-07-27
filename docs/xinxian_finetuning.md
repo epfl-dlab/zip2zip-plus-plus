@@ -24,7 +24,7 @@ Comparison: `v0.6.4` vs `vx0.6.4.1`.
 Single change: use a shared hyper-encoder instead of the untied input/output
 hyper-encoders in `v0.6.4`.
 
-Question: does separating the input-embedding role from the output-logit role
+**Question**: does separating the input-embedding role from the output-logit role
 matter in practice?
 
 Interpretation goal: understand whether the input and output hyper-encoders are
@@ -57,12 +57,12 @@ Comparison: `v0.6.4` vs `vx0.6.4.2`.
 
 Single change: remove residual initialization.
 
-Question: does residual initialization actually help in the flat hyper-encoder?
+**Question**: does residual initialization actually help in the flat hyper-encoder?
 
-Motivation: although residual initialization really helps early training, current embedding analysis suggests that hypertoken embeddings may
-have unusually high similarity to the first base token in the merged span (next section). This
-run tests whether that behavior is helpful structure or an initialization
-artifact.
+Motivation: although residual initialization really helps early training,
+current embedding analysis suggests that hypertoken embeddings may have
+unusually high similarity to the first base token in the merged span. This run
+tests whether that behavior is helpful structure or an initialization artifact.
 
 Result: comparison between `v0.6.4` and `vx0.6.4.2`.
 
@@ -100,10 +100,33 @@ Comparison: `v0.6.4` vs `vx0.6.4.3`.
 Single change: replace the flat hyper-encoder with the hierarchical
 hyper-encoder.
 
-Question: does the hierarchical hyper-encoder improve performance under the
+**Question**: does the hierarchical hyper-encoder improve performance under the
 standard recipe?
 
 Default setting: keep `MAX_SUBTOKENS=4`, matching the current recipe line.
+
+Result: compare the flat baseline against the hierarchical encoder with
+residual initialization.
+
+| Version | Encoder | ARC-c | ARC-e | HellaSwag | OBQA | PIQA | WinoGrande | GSM8K strict \| flexible | Wiki byte_ppl↓ | gen_compression_ratio |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `v0.6.4` | flat | **0.5700** | 0.8304 | 0.7233 | **0.4660** | **0.8003** | **0.7443** | **0.215** \| **0.6770** | **1.6574** | **1.2593** |
+| `vx0.6.4.3` | hierarchical | 0.5597 | **0.8359** | **0.7252** | 0.4640 | **0.8003** | 0.7348 | 0.201 \| 0.6308 | 1.6586 | 1.2490 |
+
+Takeaway: the hierarchical encoder slightly improves ARC-e and HellaSwag and
+roughly matches PIQA and Wiki byte-ppl, but it is weaker on ARC-c, WinoGrande,
+GSM8K, and generation compression.
+
+It is not a broad improvement over the flat
+`v0.6.4` baseline, especially once training cost is included: in the local logs,
+`vx0.6.4.3` averaged 1.41s/step and took 3h26m for 8k steps, while the flat
+`vx0.6.4.2` ablation averaged 1.00s/step and took 2h17m under the same 8k-step
+setup.
+
+One possible explanation is that the hierarchical pairwise composer is
+simpler and more structured, but less expressive than the flat encoder. Its
+main remaining advantage is that the recurrent structure might transfer across
+merge sizes, which is what `vx0.6.4.5` will test.
 
 ### `vx0.6.4.4`: hierarchical hyper-encoder without residual initialization
 
@@ -112,23 +135,63 @@ Comparison: `vx0.6.4.3` vs `vx0.6.4.4`.
 Single change: remove residual initialization from the hierarchical
 hyper-encoder.
 
-Question: does adding the first base-token embedding interfere with the
+**Question**: does adding the first base-token embedding interfere with the
 recurrent pattern that the hierarchical hyper-encoder is supposed to learn?
+
+Motivation: in the current residual design, the first base-token embedding
+reaches the final hypertoken representation through two paths:
+
+`h_hyper = PairwiseHyperEncoder(e_1, ..., e_k) + e_1`
+
+The first token is both an input to the pairwise composer and an external
+residual added to the output. This may overemphasize `e_1` and force the
+pairwise composer to learn a counter-correction instead of only learning how to
+combine subtokens.
+
+Possible interventions:
+
+- **Remove the residual path entirely** (`vx0.6.4.4`):
+  `h_hyper = PairwiseHyperEncoder(e_1, ..., e_k)`.
+  This is the simplest test and the only one implemented here. The downside is
+  that the model loses the stable first-token starting point, which may need
+  longer training time.
+- **Keep the residual path, but remove the first base token from the
+  hyper-encoder input**:
+  `h_hyper = PairwiseHyperEncoder(e_2, ..., e_k) + e_1`.
+  This avoids double-counting the first token, but may hide useful composition
+  information from the composer.
+- **Remove the permanent residual path, but initialize the composer to behave
+  like a first-token mapping at step 0**:
+  `h_hyper = PairwiseHyperEncoder(e_1, ..., e_k)`, with
+  `h_hyper^(0) ~= e_1`.
+  This keeps the good initialization behavior without forcing a fixed skip
+  connection throughout training.
 
 Decision rule: compare against `vx0.6.4.3` first. If removing residual
 initialization helps, use `vx0.6.4.4` as the base for the merge-size transfer
 experiment below; otherwise use `vx0.6.4.3`.
 
+Result: compare the two hierarchical variants.
+
+| Version | Residual init | ARC-c | ARC-e | HellaSwag | OBQA | PIQA | WinoGrande | GSM8K strict \| flexible | Wiki byte_ppl↓ | gen_compression_ratio |
+|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `vx0.6.4.3` | yes | **0.5597** | **0.8359** | **0.7252** | **0.4640** | **0.8003** | 0.7348 | **0.201** \| **0.6308** | **1.6586** | 1.2490 |
+| `vx0.6.4.4` | no | 0.5478 | 0.8304 | 0.7051 | 0.4620 | 0.7965 | **0.7356** | 0.134 \| 0.6141 | 1.7128 | **1.2567** |
+
+Takeaway: removing the residual path hurts the hierarchical encoder broadly,
+especially Wiki byte-ppl and GSM8K. `vx0.6.4.3` is the cleaner base for any
+merge-size transfer test.
+
 ### `vx0.6.4.5`: merge-size transfer test
 
-Base: whichever is better between `vx0.6.4.3` and `vx0.6.4.4`.
+Base: `vx0.6.4.3`, the better hierarchical variant.
 
 Single change: train with `MAX_SUBTOKENS=3` instead of `MAX_SUBTOKENS=4`.
 
 Evaluation: evaluate the checkpoint both normally and with forced
 `MAX_SUBTOKENS=4`.
 
-Question: does the hierarchical hyper-encoder learn transferable recurrent
+**Question**: does the hierarchical hyper-encoder learn transferable recurrent
 patterns across merge sizes?
 
 Success criterion: the `MAX_SUBTOKENS=3` hierarchical run should remain
