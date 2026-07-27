@@ -74,14 +74,17 @@
 #                     and compressed-token positions (v0.7 negative result).
 #                     Requires
 #                     BASE_TOKEN_POSITIONS=1; evals auto-configure from meta.pt.
-#   GATED_COMPRESSED_ROPE= set 1 for v0.7.1's zero-initialized learned
-#                     compressed-position delta. Mutually exclusive with
-#                     TWO_AXIS_ROPE; eval restores it from meta.pt.
+#   GATED_COMPRESSED_ROPE= v0.7.1 sets the single named profile
+#                     lowfreq_all_layers: a zero-initialized learned compressed-
+#                     position delta. Mutually exclusive with TWO_AXIS_ROPE;
+#                     eval restores the resolved geometry from meta.pt.
 #   GATED_ROPE_START_LAYER= first decoder layer using the learned delta
-#                     (v0.7.1: 16, so only layers 16-31 in Phi-3.5).
+#                     (v0.7.1: 0, so all 32 Phi-3.5 layers are learnable).
+#   GATED_ROPE_START_PAIR= first complex frequency pair using the delta
+#                     (v0.7.1: 32, so only low-frequency pairs 32-47).
 #   BASE_VIEW_REPLAY_PROB= fraction of training microbatches replayed as
-#                     ordinary base-token views (v0.7.1: 0.25). Training-only;
-#                     recorded in meta.pt and deterministic across ranks/resume.
+#                     ordinary base-token views (v0.6.6: 0.25; v0.7.1: 0).
+#                     Training-only; recorded in meta.pt and deterministic.
 #   TOKEN_TYPE_LOSS_WEIGHT= auxiliary base-vs-hyper type loss weight
 #                     (v0.6.3 recipe, 0.05). 0/off = v0.6.2 behavior. Inherited
 #                     by the train launcher; evals auto-configure from meta.pt.
@@ -131,6 +134,26 @@ if [ -n "$RECIPE" ]; then
     eval "$_recipe_env"
     unset _recipe_env _py
 fi
+
+# Resolve the gated profile in this parent process as well as in the finetune
+# child. The parent owns the post-training eval audit, so it must retain the
+# same effective geometry that the child records in meta.pt. Manual `1` keeps
+# the generic all-pair default; v0.7.1's named profile selects Phi pairs 32-47.
+case "${GATED_COMPRESSED_ROPE:-}" in
+    ""|0|1)
+        export GATED_ROPE_START_LAYER=${GATED_ROPE_START_LAYER:-0}
+        export GATED_ROPE_START_PAIR=${GATED_ROPE_START_PAIR:-0}
+        ;;
+    lowfreq_all_layers)
+        export GATED_ROPE_START_LAYER=${GATED_ROPE_START_LAYER:-0}
+        export GATED_ROPE_START_PAIR=${GATED_ROPE_START_PAIR:-32}
+        ;;
+    *)
+        echo "FATAL: unknown GATED_COMPRESSED_ROPE profile '${GATED_COMPRESSED_ROPE}' (expected 0, 1, or lowfreq_all_layers)" >&2
+        exit 1
+        ;;
+esac
+
 export RECIPE
 export DATA_DIR=${DATA_DIR:-$Z2Z_SCRATCH/datasets/phi-1B-sft-8shards-eosfix}
 export STEPS=${STEPS:-8000}
@@ -275,7 +298,8 @@ audit_eval_mode() {
         && return 0
     python - "$1" "${EVAL_MODE:-}" "${DISABLE_DIGIT_IDS:-}" \
         "${ONLINE_CODEBOOK_MASK:-}" "${TWO_AXIS_ROPE:-}" \
-        "${GATED_COMPRESSED_ROPE:-}" "${GATED_ROPE_START_LAYER:-16}" <<'PY'
+        "${GATED_COMPRESSED_ROPE:-}" "${GATED_ROPE_START_LAYER:-0}" \
+        "${GATED_ROPE_START_PAIR:-0}" <<'PY'
 import json, sys
 (
     path,
@@ -285,7 +309,8 @@ import json, sys
     want_two_axis_raw,
     want_gated_raw,
     want_start_raw,
-) = sys.argv[1:8]
+    want_pair_raw,
+) = sys.argv[1:9]
 args = json.load(open(path))["args"]
 if want_mode:
     got = args["eval_mode"]
@@ -325,6 +350,12 @@ if want_gated_raw:
     assert got_start == want_start, (
         f"gated-RoPE audit FAILED: {path} recorded "
         f"gated_rope_start_layer={got_start!r}, expected {want_start!r}"
+    )
+    got_pair = args.get("gated_rope_start_pair")
+    want_pair = int(want_pair_raw)
+    assert got_pair == want_pair, (
+        f"gated-RoPE audit FAILED: {path} recorded "
+        f"gated_rope_start_pair={got_pair!r}, expected {want_pair!r}"
     )
 print(f"[pipeline] eval-flags audit OK: {path}")
 PY

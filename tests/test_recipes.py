@@ -9,8 +9,8 @@ under pytest.
 Invariants proven:
   R1  the registry is internally consistent: exactly one status=current, CURRENT
       points at it, every `extends` resolves, no inheritance cycles.
-  R2  v0.6.4 resolves to the five validated levers; the archived experiments
-      and v0.7.1 resolve to their exact declared deltas.
+  R2  v0.6.4 resolves to the five validated levers; v0.6.6 and v0.7.1 are
+      independent one-axis children with exact declared deltas.
   R3  the ledger property: every recipe differs from its parent by exactly the
       keys in its own `env` block (so the file reads as "parent + one change").
   R4  every env key any recipe sets is ACTUALLY CONSUMED by both launchers — the
@@ -81,8 +81,10 @@ EXPECTED_V07 = {
 }
 EXPECTED_V071 = {
     **EXPECTED_V064,
-    "GATED_COMPRESSED_ROPE": "1",
-    "GATED_ROPE_START_LAYER": "16",
+    "GATED_COMPRESSED_ROPE": "lowfreq_all_layers",
+}
+EXPECTED_V066 = {
+    **EXPECTED_V064,
     "BASE_VIEW_REPLAY_PROB": "0.25",
 }
 
@@ -120,11 +122,22 @@ def main():
           and R.RECIPES["v0.7"]["extends"] == "v0.6.4"
           and R.RECIPES["v0.7"]["status"] == "negative",
           f"{sorted(R.resolve('v0.7').items())}")
-    check("R2_v071_is_v064_plus_gated_rope_and_replay",
+    check("R2_v066_is_v064_plus_base_replay_only",
+          R.resolve("v0.6.6") == EXPECTED_V066
+          and R.RECIPES["v0.6.6"]["env"]
+              == {"BASE_VIEW_REPLAY_PROB": "0.25"}
+          and R.RECIPES["v0.6.6"]["axis"] == "data"
+          and "GATED_COMPRESSED_ROPE" not in R.resolve("v0.6.6"),
+          f"{sorted(R.resolve('v0.6.6').items())}")
+    check("R2_v071_is_v064_plus_gated_rope_only",
           R.resolve("v0.7.1") == EXPECTED_V071
           and R.RECIPES["v0.7.1"]["extends"] == "v0.6.4"
           and R.RECIPES["v0.7.1"]["status"] == "candidate"
-          and "TWO_AXIS_ROPE" not in R.resolve("v0.7.1"),
+          and R.RECIPES["v0.7.1"]["env"]
+              == {"GATED_COMPRESSED_ROPE": "lowfreq_all_layers"}
+          and R.RECIPES["v0.7.1"]["axis"] == "positions"
+          and "TWO_AXIS_ROPE" not in R.resolve("v0.7.1")
+          and "BASE_VIEW_REPLAY_PROB" not in R.resolve("v0.7.1"),
           f"{sorted(R.resolve('v0.7.1').items())}")
 
     # ---- R2b: resume-hard coverage for levers that live OUTSIDE ENV_KEYS ----
@@ -151,6 +164,7 @@ def main():
             "no_remap_codebook",
             "gated_compressed_rope",
             "gated_rope_start_layer",
+            "gated_rope_start_pair",
             "base_view_replay_prob",
             "gradient_accumulation_steps",
         )
@@ -173,6 +187,68 @@ def main():
     check("R3_each_recipe_is_parent_plus_its_own_env", not offenders,
           "every recipe's diff vs its parent equals its declared env block"
           if not offenders else f"offenders={offenders}")
+    mainline_delta_offenders = []
+    for name, spec in R.RECIPES.items():
+        parent = spec.get("extends")
+        if parent is None or name.startswith("vx"):
+            continue
+        parent_env, child_env = R.resolve(parent), R.resolve(name)
+        env_delta = {
+            key
+            for key in parent_env.keys() | child_env.keys()
+            if parent_env.get(key) != child_env.get(key)
+        }
+        data_changed = R.resolve_data(name) != R.resolve_data(parent)
+        axes = {R.ENV_AXES[key] for key in env_delta}
+        if data_changed:
+            axes.add("data")
+        if (
+            set(spec.get("env", {})) != env_delta
+            or len(env_delta) + int(data_changed) != 1
+            or axes != {spec.get("axis")}
+        ):
+            mainline_delta_offenders.append(
+                (name, spec.get("axis"), env_delta, data_changed, axes)
+            )
+    recipes_source = open(RECIPES_PY).read()
+    check(
+        "R3_mainline_children_have_exactly_one_concrete_delta",
+        not mainline_delta_offenders
+        and "vX.Y = parent + exactly one change" in recipes_source,
+        "the registry enforces the original one-change convention"
+        if not mainline_delta_offenders
+        else f"offenders={mainline_delta_offenders}",
+    )
+    for bad_name, bad_env in (
+        (
+            "v9.9-two-same-axis-changes",
+            {"TWO_AXIS_ROPE": "1", "GATED_COMPRESSED_ROPE": "1"},
+        ),
+        (
+            "v9.9-no-effective-change",
+            {"BASE_TOKEN_POSITIONS": "1"},
+        ),
+    ):
+        R.RECIPES[bad_name] = {
+            "extends": "v0.6.4",
+            "status": "candidate",
+            "description": "temporary malformed test recipe",
+            "axis": "positions",
+            "env": bad_env,
+        }
+        try:
+            R._validate_registry()
+        except R.RecipeError:
+            rejected = True
+        else:
+            rejected = False
+        finally:
+            del R.RECIPES[bad_name]
+        check(
+            f"R3_rejects_{bad_name.removeprefix('v9.9-')}",
+            rejected,
+            "same-axis bundling and no-op declarations are not concrete changes",
+        )
 
     # ---- R4: the typo guard — launchers really consume every key ----
     launcher_src = "\n".join(open(p).read() for p in LAUNCHERS)
@@ -225,11 +301,12 @@ def main():
     v071_cmd = (
         f'R=$({sys.executable} scripts/recipes.py v0.7.1 2>/dev/null); '
         'GATED_COMPRESSED_ROPE=0; BASE_VIEW_REPLAY_PROB=0.10; '
-        'eval "$R"; printf "%s|%s|%s|%s" "$GATED_COMPRESSED_ROPE" '
-        '"$GATED_ROPE_START_LAYER" "$BASE_VIEW_REPLAY_PROB" "${TWO_AXIS_ROPE-unset}"'
+        'eval "$R"; printf "%s|%s|%s|%s|%s" "$GATED_COMPRESSED_ROPE" '
+        '"${GATED_ROPE_START_LAYER:-0}" "${GATED_ROPE_START_PAIR:-0}" '
+        '"$BASE_VIEW_REPLAY_PROB" "${TWO_AXIS_ROPE-unset}"'
     )
     check("R5_v071_explicit_overrides_win",
-          bash(v071_cmd).stdout.strip() == "0|16|0.10|unset",
+          bash(v071_cmd).stdout.strip() == "0|0|0|0.10|unset",
           "explicit gate-off/replay override wins and legacy two-axis stays unset")
 
     # ---- R6: unknown name is fatal ----
@@ -272,8 +349,19 @@ def main():
           v071.returncode == 0
           and "UNMEASURED CANDIDATE" in v071.stderr
           and "GATED_COMPRESSED_ROPE" in v071.stdout
-          and "BASE_VIEW_REPLAY_PROB" in v071.stdout,
-          "v0.7.1 resolves all levers and remains explicitly unmeasured")
+          and "BASE_VIEW_REPLAY_PROB" not in v071.stdout,
+          "v0.7.1 resolves only its position-axis lever")
+    v066 = subprocess.run(
+        [sys.executable, RECIPES_PY, "v0.6.6"],
+        capture_output=True,
+        text=True,
+    )
+    check("R6_v066_candidate_warns_but_works",
+          v066.returncode == 0
+          and "UNMEASURED CANDIDATE" in v066.stderr
+          and "BASE_VIEW_REPLAY_PROB" in v066.stdout
+          and "GATED_COMPRESSED_ROPE" not in v066.stdout,
+          "v0.6.6 resolves only its data-axis lever")
 
     # ---- R7: identify() round-trip, for EVERY recipe ----
     wrong = []
@@ -333,6 +421,7 @@ def main():
     required_cli = {
         "--gated_compressed_rope",
         '--gated_rope_start_layer "$GATED_ROPE_START_LAYER"',
+        '--gated_rope_start_pair "$GATED_ROPE_START_PAIR"',
         '--base_view_replay_prob "$BASE_VIEW_REPLAY_PROB"',
         '--seed "$SEED"',
     }
@@ -343,7 +432,11 @@ def main():
           if not missing_cli else f"missing launcher fragments: {missing_cli}")
 
     pipeline_src = open(LAUNCHERS[1]).read()
-    audit_fields = ("gated_compressed_rope", "gated_rope_start_layer")
+    audit_fields = (
+        "gated_compressed_rope",
+        "gated_rope_start_layer",
+        "gated_rope_start_pair",
+    )
     missing_audit = [field for field in audit_fields if field not in pipeline_src]
     check("R9_pipeline_audits_gated_eval_geometry", not missing_audit,
           "final/smoke JSONs audit the restored gated geometry"

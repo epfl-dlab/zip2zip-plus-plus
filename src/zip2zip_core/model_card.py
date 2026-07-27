@@ -21,7 +21,12 @@ def write_model_card(path: str, repo_id: str, step: int, train_args: dict):
     lr = train_args.get("lr", "?")
     max_tokens = train_args.get("max_tokens", "?")
     gated_rope = bool(train_args.get("gated_compressed_rope", False))
-    gated_rope_start = train_args.get("gated_rope_start_layer", 16)
+    gated_rope_start = train_args.get("gated_rope_start_layer", 0)
+    gated_rope_pair = train_args.get("gated_rope_start_pair")
+    if gated_rope_pair is None:
+        # Pre-suffix gated checkpoints covered every pair and did not record
+        # this field.  Keep generated cards truthful for that legacy format.
+        gated_rope_pair = 0
     base_replay = train_args.get("base_view_replay_prob", 0.0)
 
     lines = [
@@ -51,6 +56,7 @@ def write_model_card(path: str, repo_id: str, step: int, train_args: dict):
         f"| max_tokens | {max_tokens} |",
         f"| gated_compressed_rope | {gated_rope} |",
         f"| gated_rope_start_layer | {gated_rope_start} |",
+        f"| gated_rope_start_pair | {gated_rope_pair} |",
         f"| base_view_replay_prob | {base_replay} |",
         f"| step | {step} |",
         f"| data | `{os.path.basename(str(data_dir))}` |",

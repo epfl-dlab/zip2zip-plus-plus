@@ -27,6 +27,75 @@ _LORA_SUFFIXES = (
 )
 
 
+def resolve_gated_rope_start_pair(
+    train_args: Mapping[str, object] | None,
+    state_dict: Mapping[str, torch.Tensor] | None,
+    *,
+    n_complex_pairs: int,
+    default: int,
+) -> int:
+    """Recover the gated RoPE pair suffix from metadata or saved weights.
+
+    Early gated-RoPE checkpoints predate ``gated_rope_start_pair`` and gated
+    every complex pair.  New checkpoints record the field explicitly.  When
+    metadata is absent, the saved gate width is authoritative and also makes
+    synthetic/small configurations safe; if the tensor is unavailable, pair
+    zero is the historical fallback.
+    """
+    args = train_args or {}
+    recorded = args.get("gated_rope_start_pair")
+    gate_tensors = [
+        value
+        for key, value in (state_dict or {}).items()
+        if key.split(".")[-1] == "compressed_rope_gate"
+    ]
+    if len(gate_tensors) > 1:
+        raise ValueError(
+            "checkpoint contains multiple compressed_rope_gate tensors"
+        )
+
+    inferred: int | None = None
+    if gate_tensors:
+        gate = gate_tensors[0]
+        if not isinstance(gate, torch.Tensor) or gate.ndim != 2:
+            raise ValueError(
+                "compressed_rope_gate must be a rank-2 tensor, got "
+                f"{type(gate).__name__} shape={getattr(gate, 'shape', None)}"
+            )
+        width = int(gate.shape[1])
+        inferred = n_complex_pairs - width
+        if not 0 <= inferred < n_complex_pairs:
+            raise ValueError(
+                "compressed_rope_gate width is incompatible with the decoder "
+                f"RoPE geometry: width={width}, pairs={n_complex_pairs}"
+            )
+
+    if recorded is not None:
+        if not isinstance(recorded, int) or isinstance(recorded, bool):
+            raise ValueError(
+                "gated_rope_start_pair in meta.pt must be an integer, got "
+                f"{recorded!r}"
+            )
+        resolved = recorded
+        if inferred is not None and inferred != resolved:
+            raise ValueError(
+                "gated RoPE metadata/tensor mismatch: meta.pt records "
+                f"start_pair={resolved}, but the saved gate width implies "
+                f"start_pair={inferred}"
+            )
+    elif args.get("gated_compressed_rope"):
+        resolved = inferred if inferred is not None else 0
+    else:
+        resolved = default
+
+    if not 0 <= resolved < n_complex_pairs:
+        raise ValueError(
+            "gated_rope_start_pair must be in "
+            f"[0, {n_complex_pairs}), got {resolved}"
+        )
+    return resolved
+
+
 def strip_wrapper_prefixes(
     state_dict: Mapping[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:

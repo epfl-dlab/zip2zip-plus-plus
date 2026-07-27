@@ -167,11 +167,10 @@ could restore:
   audits the latter when `RECIPE=v0.7`.
 - `gated compressed-coordinate RoPE: enabled ... from meta.pt` — required for a v0.7.1
   checkpoint. It confirms that the learned compressed-coordinate delta was
-  restored and reports its first active decoder layer (16 for the named
-  recipe). Results JSON records `gated_compressed_rope` and
-  `gated_rope_start_layer`; the pipeline audits both after every smoke, final,
-  and WikiText evaluation. `base_view_replay_prob` is training provenance in
-  `meta.pt`, not an evaluation switch.
+  restored and reports its first active decoder layer and frequency pair (0 and
+  32 for the named recipe). Results JSON records `gated_compressed_rope`,
+  `gated_rope_start_layer`, and `gated_rope_start_pair`; the pipeline audits all
+  three after every smoke, final, and WikiText evaluation.
 - `hyper-encoder residual: disabled from meta.pt` — for a checkpoint trained with
   `NO_ENCODER_RESIDUAL=1` (an ablation; no production run uses it). This is the one
   line that appears only in the *non-default* case, so its absence is normal and

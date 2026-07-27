@@ -89,17 +89,19 @@ def build_gated_rope_inputs(
     base_positions: torch.Tensor,
     gate: torch.Tensor,
     *,
+    start_pair: int,
     batch_size: int,
     seq_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build one layer's gated base/compressed RoPE cache.
 
-    For complex pair ``i`` the phase is
+    For gated complex pair ``i`` the phase is
 
       base_phase + gate[i] * (compressed_phase - base_phase).
 
     ``gate == 0`` therefore preserves base-position RoPE exactly, while
-    ``gate == 1`` reaches compressed-index RoPE.  The inverse frequencies are
+    ``gate == 1`` reaches compressed-index RoPE. Pairs below ``start_pair`` are
+    copied from the base-position cache unchanged. The inverse frequencies are
     recovered from cache row 1, whose phases are all in ``[0, 1]`` radians for
     the supported RoPE configurations, so no phase unwrapping is needed.
     """
@@ -112,10 +114,16 @@ def build_gated_rope_inputs(
         )
 
     n_complex_pairs = freqs_cis.shape[-1]
-    if gate.ndim != 1 or gate.shape[0] != n_complex_pairs:
+    if not 0 <= start_pair < n_complex_pairs:
+        raise ValueError(
+            "gated_rope_start_pair must be in "
+            f"[0, {n_complex_pairs}), got {start_pair}"
+        )
+    n_gated_pairs = n_complex_pairs - start_pair
+    if gate.ndim != 1 or gate.shape[0] != n_gated_pairs:
         raise ValueError(
             "gated_compressed_rope gate must have shape "
-            f"({n_complex_pairs},), got {tuple(gate.shape)}"
+            f"({n_gated_pairs},), got {tuple(gate.shape)}"
         )
     if base_positions.shape == (1, seq_len):
         base_positions = base_positions.expand(batch_size, -1)
@@ -134,14 +142,17 @@ def build_gated_rope_inputs(
 
     # Row 1 is exp(i * inv_freq). Multiplying the base cache by the delta
     # rotation avoids reconstructing/wrapping the absolute base phase.
-    inv_freq = torch.angle(freqs_cis[1]).to(device=gate.device)
+    inv_freq = torch.angle(freqs_cis[1, start_pair:]).to(device=gate.device)
     delta_phase = (
         delta_positions.to(dtype=inv_freq.dtype).unsqueeze(-1)
-        * inv_freq.view(1, 1, n_complex_pairs)
-        * gate.to(dtype=inv_freq.dtype).view(1, 1, n_complex_pairs)
+        * inv_freq.view(1, 1, n_gated_pairs)
+        * gate.to(dtype=inv_freq.dtype).view(1, 1, n_gated_pairs)
     )
     delta_rotation = torch.polar(torch.ones_like(delta_phase), delta_phase)
-    gated_freqs = base_freqs * delta_rotation
+    gated_suffix = base_freqs[..., start_pair:] * delta_rotation
+    gated_freqs = torch.cat(
+        (base_freqs[..., :start_pair], gated_suffix), dim=-1
+    )
 
     lookup_positions = torch.arange(
         batch_size * seq_len, device=freqs_cis.device, dtype=torch.long
@@ -695,12 +706,15 @@ class Zip2ZipLlama3Model(Decoder):
         # odd pairs use the compressed-token index. Requires
         # base_token_positions=True. Off preserves the single-axis path exactly.
         two_axis_rope: bool = False
-        # Learn a per-layer/per-complex-pair interpolation from pretrained
-        # base-stream RoPE (gate=0) toward compressed-index RoPE (gate=1).
-        # Only layers at or above gated_rope_start_layer are changed. This is
+        # Learn a per-layer interpolation from pretrained base-stream RoPE
+        # (gate=0) toward compressed-index RoPE (gate=1). The generic config
+        # gates every pair; v0.7.1's named launcher profile uses every decoder
+        # layer but only Phi's lowest-frequency third (pairs 32-47), leaving the
+        # high-frequency pairs exactly on the pretrained base axis. This is
         # mutually exclusive with the fixed 50/50 two-axis experiment.
         gated_compressed_rope: bool = False
-        gated_rope_start_layer: int = 16
+        gated_rope_start_layer: int = 0
+        gated_rope_start_pair: int = 0
         # Guarantee the hyper-encoder emits EXACTLY zero at init, so the first
         # hypertoken embedding equals its first base token's embedding (the
         # documented intent of the encoder_residual design). The existing
@@ -784,6 +798,14 @@ class Zip2ZipLlama3Model(Decoder):
                     "gated_rope_start_layer must be in "
                     f"[0, {config.n_layers}), got {config.gated_rope_start_layer}"
                 )
+            n_complex_pairs = head_dim // 2
+            if config.gated_compressed_rope and not (
+                0 <= config.gated_rope_start_pair < n_complex_pairs
+            ):
+                raise ValueError(
+                    "gated_rope_start_pair must be in "
+                    f"[0, {n_complex_pairs}), got {config.gated_rope_start_pair}"
+                )
         super().__init__(config)
         self.zip2zip_config = config
         head_dim = (
@@ -794,7 +816,7 @@ class Zip2ZipLlama3Model(Decoder):
             self.compressed_rope_gate = nn.Parameter(
                 torch.zeros(
                     config.n_layers - config.gated_rope_start_layer,
-                    head_dim // 2,
+                    head_dim // 2 - config.gated_rope_start_pair,
                 )
             )
         else:
@@ -1281,6 +1303,8 @@ class Zip2ZipLlama3Model(Decoder):
                     "[gated_compressed_rope] active: "
                     f"layers={self.zip2zip_config.gated_rope_start_layer}-"
                     f"{self.zip2zip_config.n_layers - 1} "
+                    f"pairs={self.zip2zip_config.gated_rope_start_pair}-"
+                    f"{self.freqs_cis.shape[-1] - 1} "
                     f"gate_shape={tuple(self.compressed_rope_gate.shape)}"
                 )
 
@@ -1302,6 +1326,7 @@ class Zip2ZipLlama3Model(Decoder):
                                 self.freqs_cis,
                                 positions,
                                 gate_row,
+                                start_pair=self.zip2zip_config.gated_rope_start_pair,
                                 batch_size=tokens.shape[0],
                                 seq_len=tokens.shape[1],
                             )

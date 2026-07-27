@@ -144,7 +144,10 @@ Documents are concatenated end-to-end with `<bos>` and `<eos>` boundaries. The d
 Each batch contains:
 - `input_ids`: `(B, seq_len)` — mixed base + hypertoken IDs
 - `codebook`: `(B, max_active_codebook_size, max_subtokens)` — padded codebook entries
-- `n_base_tokens`: `(B,)` — number of base tokens represented by the compressed sequence
+- `n_base_tokens`: `(B,)` — legacy reporting denominator: base-token expansion
+  of the complete compressed `T+1` window, retained for historical curves
+- `target_n_base_tokens`: `(B,)` — corrected reporting denominator: base-token
+  expansion of only unmasked target labels
 - `labels`: `(B, seq_len)` — target token IDs (`-100` for masked positions)
 
 ## Shard distribution

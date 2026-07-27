@@ -92,6 +92,142 @@ def base_view_replay_microsteps(
     return frozenset(range(count))
 
 
+_VIEW_METRIC_FIELDS = (
+    "nll_sum",
+    "valid_count",
+    "legacy_base_count",
+    "target_base_count",
+    "correct",
+    "base_correct",
+    "base_count",
+    "hyper_correct",
+    "hyper_count",
+    "relaxed_hyper_correct",
+    "type_nll_sum",
+    "type_count",
+    "type_correct",
+    "base_type_correct",
+    "base_type_count",
+    "hyper_type_correct",
+    "hyper_type_count",
+    "micro_count",
+    # Historical per-rank-microbatch ratios. These preserve the established
+    # top-level W&B weighting formula when replay is disabled (minor reduction
+    # rounding can differ), and become compressed-only averages when replay is
+    # enabled. For class-specific compatibility metrics, a rank-microbatch with
+    # no such class contributes zero, matching the old accumulator behavior.
+    # The canonical raw-count metrics above instead exclude absent classes from
+    # their class-specific denominators.
+    "compat_backward_loss_sum",
+    "compat_loss_legacy_sum",
+    "compat_loss_target_sum",
+    "compat_compression_legacy_sum",
+    "compat_compression_target_sum",
+    "compat_acc_sum",
+    "compat_base_acc_sum",
+    "compat_hyper_acc_sum",
+    "compat_relaxed_hyper_acc_sum",
+    "compat_type_loss_sum",
+    "compat_type_acc_sum",
+    "compat_base_type_acc_sum",
+    "compat_hyper_type_acc_sum",
+    "compat_hyper_ratio_sum",
+)
+
+
+def new_view_metric_sums() -> dict[str, float]:
+    """Empty raw-count bucket for one input view."""
+    return {field: 0.0 for field in _VIEW_METRIC_FIELDS}
+
+
+def finalize_view_metric_sums(sums: dict[str, float]) -> dict[str, float]:
+    """Turn one all-reduced raw-count bucket into safe view-specific metrics."""
+
+    def ratio(num: str, den: str) -> float:
+        denominator = sums[den]
+        return sums[num] / denominator if denominator else 0.0
+
+    micro_count = sums["micro_count"]
+
+    def micro(field: str) -> float:
+        return sums[field] / micro_count if micro_count else 0.0
+
+    return {
+        "loss_legacy_base_token": ratio("nll_sum", "legacy_base_count"),
+        "loss_target_base_token": ratio("nll_sum", "target_base_count"),
+        "loss_per_valid_token": ratio("nll_sum", "valid_count"),
+        "compression_legacy": ratio("legacy_base_count", "valid_count"),
+        "compression_target": ratio("target_base_count", "valid_count"),
+        "acc": ratio("correct", "valid_count"),
+        "base_token_acc": ratio("base_correct", "base_count"),
+        "hyper_token_acc": ratio("hyper_correct", "hyper_count"),
+        "relaxed_hyper_acc": ratio(
+            "relaxed_hyper_correct", "hyper_count"
+        ),
+        "relaxed_acc": (
+            (sums["base_correct"] + sums["relaxed_hyper_correct"])
+            / sums["valid_count"]
+            if sums["valid_count"]
+            else 0.0
+        ),
+        "type_loss": ratio("type_nll_sum", "type_count"),
+        "type_acc": ratio("type_correct", "type_count"),
+        "base_type_acc": ratio("base_type_correct", "base_type_count"),
+        "hyper_type_acc": ratio(
+            "hyper_type_correct", "hyper_type_count"
+        ),
+        "hyper_ratio": ratio("hyper_type_count", "type_count"),
+        "micro_count": micro_count,
+        "compat_backward_loss": micro("compat_backward_loss_sum"),
+        "compat_loss_legacy": micro("compat_loss_legacy_sum"),
+        "compat_loss_target": micro("compat_loss_target_sum"),
+        "compat_compression_legacy": micro(
+            "compat_compression_legacy_sum"
+        ),
+        "compat_compression_target": micro(
+            "compat_compression_target_sum"
+        ),
+        "compat_acc": micro("compat_acc_sum"),
+        "compat_base_acc": micro("compat_base_acc_sum"),
+        "compat_hyper_acc": micro("compat_hyper_acc_sum"),
+        "compat_relaxed_hyper_acc": micro(
+            "compat_relaxed_hyper_acc_sum"
+        ),
+        "compat_type_loss": micro("compat_type_loss_sum"),
+        "compat_type_acc": micro("compat_type_acc_sum"),
+        "compat_base_type_acc": micro("compat_base_type_acc_sum"),
+        "compat_hyper_type_acc": micro("compat_hyper_type_acc_sum"),
+        "compat_hyper_ratio": micro("compat_hyper_ratio_sum"),
+    }
+
+
+def finalize_mixed_objective(
+    *view_sums: dict[str, float],
+) -> float:
+    """Mean backward objective over all all-reduced view rank-microbatches."""
+    objective_sum = sum(
+        sums["compat_backward_loss_sum"] for sums in view_sums
+    )
+    rank_microbatches = sum(sums["micro_count"] for sums in view_sums)
+    return (
+        objective_sum / rank_microbatches
+        if rank_microbatches
+        else 0.0
+    )
+
+
+def _all_reduce_view_metric_sums(
+    sums: dict[str, float], device: torch.device
+) -> dict[str, float]:
+    values = torch.tensor(
+        [sums[field] for field in _VIEW_METRIC_FIELDS],
+        device=device,
+        dtype=torch.float64,
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    return dict(zip(_VIEW_METRIC_FIELDS, values.tolist()))
+
+
 def _unwrap_model(model):
     """Unwrap DDP and torch.compile wrappers to get the raw model.
 
@@ -541,6 +677,7 @@ def validate_resume_args(resume_dir, args):
             "untied_hyper_encoder", "share_hyper_encoder_weights",
             "base_token_positions", "two_axis_rope",
             "gated_compressed_rope", "gated_rope_start_layer",
+            "gated_rope_start_pair",
             "base_view_replay_prob",
             "zero_init_encoder_output", "no_encoder_residual",
             "token_type_loss_weight", "online_codebook_mask",
@@ -571,7 +708,10 @@ def validate_resume_args(resume_dir, args):
         "base_token_positions": False,
         "two_axis_rope": False,
         "gated_compressed_rope": False,
-        "gated_rope_start_layer": 16,
+        "gated_rope_start_layer": 0,
+        # The first gated-RoPE implementation covered every complex pair and
+        # predates this metadata field. Absence therefore means pair 0.
+        "gated_rope_start_pair": 0,
         "base_view_replay_prob": 0.0,
         "zero_init_encoder_output": False,
         "no_encoder_residual": False,
@@ -839,16 +979,24 @@ def main():
     parser.add_argument(
         "--gated_compressed_rope",
         action="store_true",
-        help="For upper decoder layers, learn a per-frequency interpolation from "
-             "base-stream RoPE (exact at zero initialization) toward compressed-"
-             "index RoPE. Requires --base_token_positions and is incompatible "
-             "with --two_axis_rope.",
+        help="Learn a per-layer interpolation from base-stream RoPE (exact at "
+             "zero initialization) toward compressed-index RoPE for the "
+             "configured low-frequency pair suffix. Requires "
+             "--base_token_positions and is incompatible with --two_axis_rope.",
     )
     parser.add_argument(
         "--gated_rope_start_layer",
         type=int,
-        default=16,
+        default=0,
         help="Zero-based first decoder layer using gated compressed RoPE.",
+    )
+    parser.add_argument(
+        "--gated_rope_start_pair",
+        type=int,
+        default=0,
+        help="Zero-based first complex RoPE pair with a learned gate. The "
+             "generic default gates every pair; v0.7.1's named launcher "
+             "profile sets 32 for Phi-3.5's lowest-frequency third.",
     )
     parser.add_argument(
         "--base_view_replay_prob",
@@ -1036,6 +1184,18 @@ def main():
             "--gated_rope_start_layer must be in "
             f"[0, {_cfg_defaults.n_layers}) for {args.model_config}"
         )
+    _head_dim = (
+        getattr(_cfg_defaults.layer.attention, "head_dim", None)
+        or _cfg_defaults.dim // _cfg_defaults.layer.attention.n_heads
+    )
+    _n_rope_pairs = _head_dim // 2
+    if args.gated_compressed_rope and not (
+        0 <= args.gated_rope_start_pair < _n_rope_pairs
+    ):
+        parser.error(
+            "--gated_rope_start_pair must be in "
+            f"[0, {_n_rope_pairs}) for {args.model_config}"
+        )
     for _f in ("encoder_dim", "encoder_n_layers", "encoder_n_heads",
                "encoder_intermediate_size"):
         if getattr(args, _f) is None:
@@ -1124,6 +1284,7 @@ def main():
         two_axis_rope=args.two_axis_rope,
         gated_compressed_rope=args.gated_compressed_rope,
         gated_rope_start_layer=args.gated_rope_start_layer,
+        gated_rope_start_pair=args.gated_rope_start_pair,
         zero_init_encoder_output=args.zero_init_encoder_output,
         rope=dataclasses.replace(
             config.rope,
@@ -1359,6 +1520,7 @@ def main():
         total_loss_sum = 0.0
         total_valid_tokens = 0
         total_base_tokens = 0
+        total_target_base_tokens = 0
         total_target_bytes = 0
         total_correct = 0
         total_base_correct = 0
@@ -1385,6 +1547,9 @@ def main():
                 if codebook_counts is not None:
                     codebook_counts = codebook_counts.to(device)
                 n_base_tokens = input_dict["n_base_tokens"].to(device)
+                target_n_base_tokens = input_dict["target_n_base_tokens"].to(
+                    device
+                )
                 labels = labels.to(device)
                 if args.online_codebook_mask:
                     total_online_skipped += int(
@@ -1412,6 +1577,7 @@ def main():
                 total_loss_sum += per_token_loss.sum().item()
                 total_valid_tokens += valid_mask.sum().item()
                 total_base_tokens += n_base_tokens.sum().item()
+                total_target_base_tokens += target_n_base_tokens.sum().item()
                 total_target_bytes += _count_target_bytes(
                     labels, cb, config.vocab_size, config.pad_token_id, byte_tokenizer
                 )
@@ -1465,7 +1631,8 @@ def main():
 
         # All-reduce across ranks
         stats = torch.tensor([
-            total_loss_sum, total_valid_tokens, total_base_tokens, total_target_bytes,
+            total_loss_sum, total_valid_tokens, total_base_tokens,
+            total_target_base_tokens, total_target_bytes,
             total_correct, total_base_correct, total_base_count,
             total_hyper_correct, total_hyper_count, total_relaxed_hyper_correct,
             total_relaxed_loss_sum, total_online_skipped,
@@ -1479,17 +1646,25 @@ def main():
         mc = merge_stats[: max_ms + 1].tolist()
         mn = merge_stats[max_ms + 1 :].tolist()
 
-        loss_sum, valid_tok, base_tok, target_bytes, correct, base_correct, base_count, hyper_correct, hyper_count, relaxed_hyper_correct, relaxed_loss_sum, online_skipped = stats.tolist()
+        (
+            loss_sum, valid_tok, base_tok, target_base_tok, target_bytes,
+            correct, base_correct, base_count, hyper_correct, hyper_count,
+            relaxed_hyper_correct, relaxed_loss_sum, online_skipped,
+        ) = stats.tolist()
 
         if rank == 0:
             avg_loss = loss_sum / valid_tok
             base_loss = loss_sum / base_tok
             ppl = math.exp(base_loss)
+            target_base_loss = loss_sum / target_base_tok
+            target_base_ppl = math.exp(target_base_loss)
             byte_ppl = math.exp(loss_sum / target_bytes)
             bpb = loss_sum / (target_bytes * math.log(2))
             relaxed_loss_valid = relaxed_loss_sum / valid_tok
             relaxed_loss = relaxed_loss_sum / base_tok
             relaxed_ppl = math.exp(relaxed_loss)
+            target_relaxed_loss = relaxed_loss_sum / target_base_tok
+            target_relaxed_ppl = math.exp(target_relaxed_loss)
             relaxed_byte_ppl = math.exp(relaxed_loss_sum / target_bytes)
             relaxed_bpb = relaxed_loss_sum / (target_bytes * math.log(2))
             acc = correct / valid_tok
@@ -1498,16 +1673,21 @@ def main():
             relaxed_hyper_acc = relaxed_hyper_correct / hyper_count if hyper_count > 0 else 0.0
             relaxed_acc = (base_correct + relaxed_hyper_correct) / valid_tok
             compression = base_tok / valid_tok
+            target_compression = target_base_tok / valid_tok
 
             print("=" * 60)
             print("Eval Results:")
-            print(f"  loss (per base token) = {base_loss:.4f}")
-            print(f"  ppl                   = {ppl:.2f}")
+            print(f"  loss (legacy base-token denominator) = {base_loss:.4f}")
+            print(f"  ppl (legacy denominator)             = {ppl:.2f}")
+            print(f"  loss (target base token)              = {target_base_loss:.4f}")
+            print(f"  ppl (target base token)               = {target_base_ppl:.2f}")
             print(f"  byte_ppl              = {byte_ppl:.4f}")
             print(f"  bpb                   = {bpb:.4f}")
             print(f"  loss (per valid token) = {avg_loss:.4f}")
-            print(f"  relaxed_loss (per base token) = {relaxed_loss:.4f}")
-            print(f"  relaxed_ppl           = {relaxed_ppl:.2f}")
+            print(f"  relaxed_loss (legacy denominator) = {relaxed_loss:.4f}")
+            print(f"  relaxed_ppl (legacy denominator)  = {relaxed_ppl:.2f}")
+            print(f"  relaxed_loss (target base token)  = {target_relaxed_loss:.4f}")
+            print(f"  relaxed_ppl (target base token)   = {target_relaxed_ppl:.2f}")
             print(f"  relaxed_byte_ppl      = {relaxed_byte_ppl:.4f}")
             print(f"  relaxed_bpb           = {relaxed_bpb:.4f}")
             print(f"  relaxed_loss (per valid token) = {relaxed_loss_valid:.4f}")
@@ -1516,7 +1696,8 @@ def main():
             print(f"  hyper_token_acc       = {hyper_token_acc:.4f}")
             print(f"  relaxed_hyper_acc     = {relaxed_hyper_acc:.4f}")
             print(f"  relaxed_acc           = {relaxed_acc:.4f}")
-            print(f"  compression           = {compression:.2f}")
+            print(f"  compression (legacy)  = {compression:.2f}")
+            print(f"  compression (target)  = {target_compression:.2f}")
             print(f"  total tokens evaluated = {int(valid_tok):,}")
             if args.online_codebook_mask:
                 online_skip_rate = online_skipped / (valid_tok + online_skipped)
@@ -1535,11 +1716,15 @@ def main():
                 eval_dict = {
                     "eval/loss": base_loss,
                     "eval/ppl": ppl,
+                    "eval/loss_target_base_token": target_base_loss,
+                    "eval/ppl_target_base_token": target_base_ppl,
                     "eval/byte_ppl": byte_ppl,
                     "eval/bpb": bpb,
                     "eval/loss_per_valid_token": avg_loss,
                     "eval/relaxed_loss": relaxed_loss,
                     "eval/relaxed_ppl": relaxed_ppl,
+                    "eval/relaxed_loss_target_base_token": target_relaxed_loss,
+                    "eval/relaxed_ppl_target_base_token": target_relaxed_ppl,
                     "eval/relaxed_byte_ppl": relaxed_byte_ppl,
                     "eval/relaxed_bpb": relaxed_bpb,
                     "eval/relaxed_loss_per_valid_token": relaxed_loss_valid,
@@ -1549,6 +1734,7 @@ def main():
                     "eval/relaxed_hyper_acc": relaxed_hyper_acc,
                     "eval/relaxed_acc": relaxed_acc,
                     "eval/compression": compression,
+                    "eval/compression_target": target_compression,
                 }
                 if args.online_codebook_mask:
                     eval_dict["eval/online_skipped_targets"] = online_skipped
@@ -1593,7 +1779,9 @@ def main():
             print(
                 "[gated_compressed_rope] enabled: zero-initialized learned "
                 f"compressed-position delta in layers "
-                f"{args.gated_rope_start_layer}-{config.n_layers - 1}"
+                f"{args.gated_rope_start_layer}-{config.n_layers - 1}, "
+                f"complex pairs {args.gated_rope_start_pair}-"
+                f"{config.rope.dim // 2 - 1}"
             )
         if args.base_view_replay_prob:
             print(
@@ -1612,22 +1800,12 @@ def main():
     model.train()
     data_iter = iter(dataloader)
     step = start_step
-    log_loss = 0.0
-    log_base_loss = 0.0
-    log_compression = 0.0
-    log_acc = 0.0
-    log_base_token_acc = 0.0
-    log_hyper_token_acc = 0.0
-    log_relaxed_acc = 0.0
-    log_type_loss = 0.0
-    log_type_acc = 0.0
-    log_base_type_acc = 0.0
-    log_hyper_type_acc = 0.0
-    log_hyper_ratio = 0.0
+    log_view_sums = {
+        "compressed": new_view_metric_sums(),
+        "base_view": new_view_metric_sums(),
+    }
     log_online_skipped = 0
     log_online_targets = 0
-    log_base_replay_microbatches = 0
-    log_total_microbatches = 0
     log_tokens = 0
     start_time = time.time()
 
@@ -1665,18 +1843,6 @@ def main():
 
         optimizer.zero_grad()
         model.zero_grad()
-        accum_loss = 0.0
-        accum_base_loss = 0.0
-        accum_compression = 0.0
-        accum_acc = 0.0
-        accum_base_token_acc = 0.0
-        accum_hyper_token_acc = 0.0
-        accum_relaxed_acc = 0.0
-        accum_type_loss = 0.0
-        accum_type_acc = 0.0
-        accum_base_type_acc = 0.0
-        accum_hyper_type_acc = 0.0
-        accum_hyper_ratio = 0.0
         replay_microsteps = base_view_replay_microsteps(
             step,
             args.gradient_accumulation_steps,
@@ -1710,11 +1876,14 @@ def main():
             n_base_tokens = input_dict[
                 "base_n_base_tokens" if use_base_view else "n_base_tokens"
             ].to(device)
+            target_n_base_tokens = (
+                input_dict["base_n_base_tokens"]
+                if use_base_view
+                else input_dict["target_n_base_tokens"]
+            ).to(device)
             labels = (
                 input_dict["base_labels"] if use_base_view else labels
             ).to(device)
-            log_base_replay_microbatches += int(use_base_view)
-            log_total_microbatches += 1
             _debug_rank_log(
                 debug_enabled,
                 rank,
@@ -1764,8 +1933,12 @@ def main():
                     log_online_skipped += skipped
                     log_online_targets += int(valid_mask.sum().item()) + skipped
                 loss_sum = per_token_loss.sum()
-                backward_loss = loss_sum / valid_mask.sum()
-                base_token_loss = loss_sum / n_base_tokens.sum()
+                valid_count = valid_mask.sum()
+                backward_loss = loss_sum / valid_count
+                legacy_base_token_loss = loss_sum / n_base_tokens.sum()
+                target_base_token_loss = (
+                    loss_sum / target_n_base_tokens.sum()
+                )
                 # Token type loss: predict if next token is base (0) or hyper (1)
                 if use_token_type_head:
                     type_targets = (labels >= config.vocab_size).float().flatten(0, 1)
@@ -1782,19 +1955,69 @@ def main():
                 _debug_rank_log(debug_enabled, rank, step, micro_step, "before backward")
                 loss.backward()
                 _debug_rank_log(debug_enabled, rank, step, micro_step, "after backward")
-            accum_loss += backward_loss.item() / args.gradient_accumulation_steps
-            accum_base_loss += base_token_loss.item() / args.gradient_accumulation_steps
-            accum_compression += (n_base_tokens.float().sum() / (valid_mask.sum())).item() / args.gradient_accumulation_steps
+
+            # Keep compressed and replay metrics in disjoint raw-count buckets.
+            # The optimizer still sees the mean over every accumulation
+            # microstep; only reporting is stratified.
+            view_sums = log_view_sums[
+                "base_view" if use_base_view else "compressed"
+            ]
+            backward_value = backward_loss.item()
+            n_valid = int(valid_count.item())
+            legacy_base_n = int(n_base_tokens.sum().item())
+            target_base_n = int(target_n_base_tokens.sum().item())
+            view_sums["nll_sum"] += loss_sum.item()
+            view_sums["valid_count"] += n_valid
+            view_sums["legacy_base_count"] += legacy_base_n
+            view_sums["target_base_count"] += target_base_n
+            view_sums["micro_count"] += 1
+            view_sums["compat_backward_loss_sum"] += backward_value
+            view_sums["compat_loss_legacy_sum"] += (
+                legacy_base_token_loss.item()
+            )
+            view_sums["compat_loss_target_sum"] += (
+                target_base_token_loss.item()
+            )
+            view_sums["compat_compression_legacy_sum"] += (
+                legacy_base_n / n_valid
+            )
+            view_sums["compat_compression_target_sum"] += (
+                target_base_n / n_valid
+            )
             with torch.no_grad():
                 valid_preds = flat_logits[valid_mask].argmax(-1)
                 valid_labels = flat_labels[valid_mask]
-                accum_acc += (valid_preds == valid_labels).float().mean().item() / args.gradient_accumulation_steps
+                correct_n = int((valid_preds == valid_labels).sum().item())
+                view_sums["correct"] += correct_n
+                view_sums["compat_acc_sum"] += correct_n / n_valid
                 base_tok_mask = valid_labels < config.vocab_size
                 hyper_tok_mask = valid_labels >= config.vocab_size
+                base_n = int(base_tok_mask.sum().item())
+                hyper_n = int(hyper_tok_mask.sum().item())
                 if base_tok_mask.any():
-                    accum_base_token_acc += (valid_preds[base_tok_mask] == valid_labels[base_tok_mask]).float().mean().item() / args.gradient_accumulation_steps
+                    base_correct_n = int(
+                        (
+                            valid_preds[base_tok_mask]
+                            == valid_labels[base_tok_mask]
+                        ).sum().item()
+                    )
+                    view_sums["base_correct"] += base_correct_n
+                    view_sums["base_count"] += base_n
+                    view_sums["compat_base_acc_sum"] += (
+                        base_correct_n / base_n
+                    )
                 if hyper_tok_mask.any():
-                    accum_hyper_token_acc += (valid_preds[hyper_tok_mask] == valid_labels[hyper_tok_mask]).float().mean().item() / args.gradient_accumulation_steps
+                    hyper_correct_n = int(
+                        (
+                            valid_preds[hyper_tok_mask]
+                            == valid_labels[hyper_tok_mask]
+                        ).sum().item()
+                    )
+                    view_sums["hyper_correct"] += hyper_correct_n
+                    view_sums["hyper_count"] += hyper_n
+                    view_sums["compat_hyper_acc_sum"] += (
+                        hyper_correct_n / hyper_n
+                    )
                     # Relaxed prefix accuracy
                     B_t, T_t = labels.shape
                     flat_valid_idx = torch.arange(B_t * T_t, device=device)[valid_mask]
@@ -1803,20 +2026,53 @@ def main():
                         valid_preds[hyper_tok_mask], valid_labels[hyper_tok_mask],
                         hyper_batch_idx, cb, config.vocab_size, config.pad_token_id,
                     )
-                    accum_relaxed_acc += (relaxed_n / hyper_tok_mask.sum().item()) / args.gradient_accumulation_steps
+                    view_sums["relaxed_hyper_correct"] += relaxed_n
+                    view_sums["compat_relaxed_hyper_acc_sum"] += (
+                        relaxed_n / hyper_n
+                    )
             if use_token_type_head:
-                accum_type_loss += type_loss.item() / args.gradient_accumulation_steps
                 with torch.no_grad():
                     type_preds = (valid_type_logits > 0).float()
-                    accum_type_acc += (type_preds == valid_targets).float().mean().item() / args.gradient_accumulation_steps
+                    type_correct_n = int(
+                        (type_preds == valid_targets).sum().item()
+                    )
+                    view_sums["type_nll_sum"] += (
+                        type_loss.item() * n_valid
+                    )
+                    view_sums["type_count"] += n_valid
+                    view_sums["type_correct"] += type_correct_n
+                    view_sums["compat_type_loss_sum"] += type_loss.item()
+                    view_sums["compat_type_acc_sum"] += (
+                        type_correct_n / n_valid
+                    )
                     # Per-class accuracy
                     base_mask_cls = valid_targets == 0
                     hyper_mask_cls = valid_targets == 1
+                    base_type_n = int(base_mask_cls.sum().item())
+                    hyper_type_n = int(hyper_mask_cls.sum().item())
                     if base_mask_cls.any():
-                        accum_base_type_acc += (type_preds[base_mask_cls] == 0).float().mean().item() / args.gradient_accumulation_steps
+                        base_type_correct_n = int(
+                            (type_preds[base_mask_cls] == 0).sum().item()
+                        )
+                        view_sums["base_type_correct"] += base_type_correct_n
+                        view_sums["base_type_count"] += base_type_n
+                        view_sums["compat_base_type_acc_sum"] += (
+                            base_type_correct_n / base_type_n
+                        )
                     if hyper_mask_cls.any():
-                        accum_hyper_type_acc += (type_preds[hyper_mask_cls] == 1).float().mean().item() / args.gradient_accumulation_steps
-                    accum_hyper_ratio += hyper_mask_cls.float().mean().item() / args.gradient_accumulation_steps
+                        hyper_type_correct_n = int(
+                            (type_preds[hyper_mask_cls] == 1).sum().item()
+                        )
+                        view_sums["hyper_type_correct"] += (
+                            hyper_type_correct_n
+                        )
+                        view_sums["hyper_type_count"] += hyper_type_n
+                        view_sums["compat_hyper_type_acc_sum"] += (
+                            hyper_type_correct_n / hyper_type_n
+                        )
+                    view_sums["compat_hyper_ratio_sum"] += (
+                        hyper_type_n / n_valid
+                    )
 
         # Phased warm-start: for the first --warmstart_steps optimizer steps, null
         # the decoder-LoRA grads AFTER backward+grad-sync but BEFORE clip/step, so
@@ -1846,49 +2102,33 @@ def main():
         optimizer.step()
         _debug_rank_log(debug_enabled, rank, step, -1, "after optimizer.step")
 
-        log_loss += accum_loss
-        log_base_loss += accum_base_loss
-        log_compression += accum_compression
-        log_acc += accum_acc
-        log_base_token_acc += accum_base_token_acc
-        log_hyper_token_acc += accum_hyper_token_acc
-        log_relaxed_acc += accum_relaxed_acc
-        if use_token_type_head:
-            log_type_loss += accum_type_loss
-            log_type_acc += accum_type_acc
-            log_base_type_acc += accum_base_type_acc
-            log_hyper_type_acc += accum_hyper_type_acc
-            log_hyper_ratio += accum_hyper_ratio
         log_tokens += args.local_batch_size * args.seq_len * args.gradient_accumulation_steps
 
         # Logging
         if step % args.log_freq == 0:
             elapsed = time.time() - start_time
             avg_step_time = elapsed / args.log_freq
-            avg_loss = log_loss / args.log_freq
-            avg_base_loss = log_base_loss / args.log_freq
-            avg_compression = log_compression / args.log_freq
-            avg_acc = log_acc / args.log_freq
-            avg_base_token_acc = log_base_token_acc / args.log_freq
-            avg_hyper_token_acc = log_hyper_token_acc / args.log_freq
-            avg_relaxed_acc = log_relaxed_acc / args.log_freq
-
-            # All-reduce loss for global average
-            loss_tensor = torch.tensor(avg_loss, device=device)
-            base_loss_tensor = torch.tensor(avg_base_loss, device=device)
-            compression_tensor = torch.tensor(avg_compression, device=device)
-            acc_tensor = torch.tensor(avg_acc, device=device)
-            base_token_acc_tensor = torch.tensor(avg_base_token_acc, device=device)
-            hyper_token_acc_tensor = torch.tensor(avg_hyper_token_acc, device=device)
-            relaxed_acc_tensor = torch.tensor(avg_relaxed_acc, device=device)
             _debug_rank_log(debug_enabled, rank, step, -1, "before metric all_reduce")
-            dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
-            dist.all_reduce(base_loss_tensor, op=dist.ReduceOp.AVG)
-            dist.all_reduce(compression_tensor, op=dist.ReduceOp.AVG)
-            dist.all_reduce(acc_tensor, op=dist.ReduceOp.AVG)
-            dist.all_reduce(base_token_acc_tensor, op=dist.ReduceOp.AVG)
-            dist.all_reduce(hyper_token_acc_tensor, op=dist.ReduceOp.AVG)
-            dist.all_reduce(relaxed_acc_tensor, op=dist.ReduceOp.AVG)
+            compressed_sums = _all_reduce_view_metric_sums(
+                log_view_sums["compressed"], device
+            )
+            base_view_sums = _all_reduce_view_metric_sums(
+                log_view_sums["base_view"], device
+            )
+            compressed_metrics = finalize_view_metric_sums(compressed_sums)
+            base_view_metrics = finalize_view_metric_sums(base_view_sums)
+            mixed_backward_loss = finalize_mixed_objective(
+                compressed_sums, base_view_sums
+            )
+            replay_count = base_view_sums["micro_count"]
+            total_micro_count = (
+                compressed_sums["micro_count"] + replay_count
+            )
+            replay_rate = (
+                replay_count / total_micro_count
+                if total_micro_count
+                else 0.0
+            )
             _debug_rank_log(debug_enabled, rank, step, -1, "after metric all_reduce")
 
             gate_stats = None
@@ -1902,29 +2142,11 @@ def main():
                     "max": gate_values.max().item(),
                     "mean": gate_values.mean().item(),
                     "rms": gate_values.square().mean().sqrt().item(),
+                    "layer_mean": gate_values.mean(dim=1).tolist(),
+                    "layer_rms": gate_values.square().mean(dim=1).sqrt().tolist(),
+                    "pair_mean": gate_values.mean(dim=0).tolist(),
+                    "pair_rms": gate_values.square().mean(dim=0).sqrt().tolist(),
                 }
-            replay_rate = (
-                log_base_replay_microbatches / log_total_microbatches
-                if log_total_microbatches
-                else 0.0
-            )
-
-            if use_token_type_head:
-                avg_type_loss = log_type_loss / args.log_freq
-                avg_type_acc = log_type_acc / args.log_freq
-                avg_base_type_acc = log_base_type_acc / args.log_freq
-                avg_hyper_type_acc = log_hyper_type_acc / args.log_freq
-                avg_hyper_ratio = log_hyper_ratio / args.log_freq
-                type_loss_tensor = torch.tensor(avg_type_loss, device=device)
-                type_acc_tensor = torch.tensor(avg_type_acc, device=device)
-                base_type_acc_tensor = torch.tensor(avg_base_type_acc, device=device)
-                hyper_type_acc_tensor = torch.tensor(avg_hyper_type_acc, device=device)
-                hyper_ratio_tensor = torch.tensor(avg_hyper_ratio, device=device)
-                dist.all_reduce(type_loss_tensor, op=dist.ReduceOp.AVG)
-                dist.all_reduce(type_acc_tensor, op=dist.ReduceOp.AVG)
-                dist.all_reduce(base_type_acc_tensor, op=dist.ReduceOp.AVG)
-                dist.all_reduce(hyper_type_acc_tensor, op=dist.ReduceOp.AVG)
-                dist.all_reduce(hyper_ratio_tensor, op=dist.ReduceOp.AVG)
 
             if args.online_codebook_mask:
                 online_counts_tensor = torch.tensor(
@@ -1946,31 +2168,43 @@ def main():
 
             if rank == 0:
                 total_tokens_seen = step * global_batch_tokens
-                _base_loss_val = base_loss_tensor.item()
+                # Historical top-level keys are now explicitly compressed-only.
+                # They retain the old per-micro averaging formula, while the
+                # slash-prefixed view metrics below use exact raw counts.
+                _base_loss_val = compressed_metrics["compat_loss_legacy"]
+                _target_loss_val = compressed_metrics["compat_loss_target"]
+
+                def _safe_ppl(value):
+                    if not math.isfinite(value) or value > 60:
+                        return float("inf")
+                    return math.exp(value)
+
                 # Guard ppl: a diverged/inf loss must not crash the logging (and
                 # the whole job). Print inf instead and flag it.
-                if not math.isfinite(_base_loss_val) or _base_loss_val > 60:
-                    _ppl_val = float("inf")
-                else:
-                    _ppl_val = math.exp(_base_loss_val)
+                _ppl_val = _safe_ppl(_base_loss_val)
+                _target_ppl_val = _safe_ppl(_target_loss_val)
                 if not math.isfinite(_base_loss_val):
                     print(f"[WARN] step {step}: non-finite base_loss={_base_loss_val} "
                           f"(training diverged or numerical issue)")
                 log_msg = (
                     f"step={step:6d} | loss={_base_loss_val:.4f} | "
                     f"ppl={_ppl_val:.2f} | "
-                    f"acc={acc_tensor.item():.4f} | "
-                    f"base_token_acc={base_token_acc_tensor.item():.4f} | "
-                    f"hyper_token_acc={hyper_token_acc_tensor.item():.4f} | "
-                    f"relaxed_acc={relaxed_acc_tensor.item():.4f} | "
-                    f"backward_loss={loss_tensor.item():.4f} | "
-                    f"compression={compression_tensor.item():.2f} | "
+                    f"target_loss={_target_loss_val:.4f} | "
+                    f"acc={compressed_metrics['compat_acc']:.4f} | "
+                    f"base_token_acc={compressed_metrics['compat_base_acc']:.4f} | "
+                    f"hyper_token_acc={compressed_metrics['compat_hyper_acc']:.4f} | "
+                    f"relaxed_acc={compressed_metrics['compat_relaxed_hyper_acc']:.4f} | "
+                    f"backward_loss={compressed_metrics['compat_backward_loss']:.4f} | "
+                    f"compression={compressed_metrics['compat_compression_legacy']:.2f} | "
+                    f"target_compression={compressed_metrics['compat_compression_target']:.2f} | "
                 )
                 if use_token_type_head:
                     log_msg += (
-                        f"type_loss={type_loss_tensor.item():.4f} | type_acc={type_acc_tensor.item():.4f} | "
-                        f"base_acc={base_type_acc_tensor.item():.4f} | hyper_acc={hyper_type_acc_tensor.item():.4f} | "
-                        f"hyper_ratio={hyper_ratio_tensor.item():.4f} | "
+                        f"type_loss={compressed_metrics['compat_type_loss']:.4f} | "
+                        f"type_acc={compressed_metrics['compat_type_acc']:.4f} | "
+                        f"base_acc={compressed_metrics['compat_base_type_acc']:.4f} | "
+                        f"hyper_acc={compressed_metrics['compat_hyper_type_acc']:.4f} | "
+                        f"hyper_ratio={compressed_metrics['compat_hyper_ratio']:.4f} | "
                     )
                 if args.online_codebook_mask:
                     log_msg += (
@@ -1978,7 +2212,12 @@ def main():
                         f"(n={int(online_skipped_value)}) | "
                     )
                 if args.base_view_replay_prob:
-                    log_msg += f"base_replay={replay_rate:.4f} | "
+                    log_msg += (
+                        f"mixed_backward_loss={mixed_backward_loss:.4f} | "
+                        f"base_view_loss="
+                        f"{base_view_metrics['loss_target_base_token']:.4f} | "
+                        f"base_replay={replay_rate:.4f} | "
+                    )
                 if gate_stats is not None:
                     log_msg += (
                         f"rope_gate_mean={gate_stats['mean']:.3e} | "
@@ -1995,14 +2234,69 @@ def main():
 
                 if args.wandb:
                     log_dict = {
-                        "loss": base_loss_tensor.item(),
+                        "loss": _base_loss_val,
                         "ppl": _ppl_val,
-                        "acc": acc_tensor.item(),
-                        "base_token_acc": base_token_acc_tensor.item(),
-                        "hyper_token_acc": hyper_token_acc_tensor.item(),
-                        "relaxed_acc": relaxed_acc_tensor.item(),
-                        "backward_loss": loss_tensor.item(),
-                        "compression": compression_tensor.item(),
+                        "loss_target_base_token": _target_loss_val,
+                        "ppl_target_base_token": _target_ppl_val,
+                        "acc": compressed_metrics["compat_acc"],
+                        "base_token_acc": compressed_metrics["compat_base_acc"],
+                        "hyper_token_acc": compressed_metrics["compat_hyper_acc"],
+                        "relaxed_acc": compressed_metrics[
+                            "compat_relaxed_hyper_acc"
+                        ],
+                        "backward_loss": compressed_metrics[
+                            "compat_backward_loss"
+                        ],
+                        "compression": compressed_metrics[
+                            "compat_compression_legacy"
+                        ],
+                        "compression_target": compressed_metrics[
+                            "compat_compression_target"
+                        ],
+                        "objective/backward_loss": mixed_backward_loss,
+                        "compressed/loss_legacy_base_token": compressed_metrics[
+                            "loss_legacy_base_token"
+                        ],
+                        "compressed/ppl_legacy_base_token": _safe_ppl(
+                            compressed_metrics["loss_legacy_base_token"]
+                        ),
+                        "compressed/loss_target_base_token": compressed_metrics[
+                            "loss_target_base_token"
+                        ],
+                        "compressed/ppl_target_base_token": _safe_ppl(
+                            compressed_metrics["loss_target_base_token"]
+                        ),
+                        "compressed/loss_per_valid_token": compressed_metrics[
+                            "loss_per_valid_token"
+                        ],
+                        "compressed/compression_legacy": compressed_metrics[
+                            "compression_legacy"
+                        ],
+                        "compressed/compression_target": compressed_metrics[
+                            "compression_target"
+                        ],
+                        "compressed/acc": compressed_metrics["acc"],
+                        "compressed/base_token_acc": compressed_metrics[
+                            "base_token_acc"
+                        ],
+                        "compressed/hyper_token_acc": compressed_metrics[
+                            "hyper_token_acc"
+                        ],
+                        "compressed/relaxed_hyper_acc": compressed_metrics[
+                            "relaxed_hyper_acc"
+                        ],
+                        "compressed/relaxed_acc": compressed_metrics[
+                            "relaxed_acc"
+                        ],
+                        "compressed/backward_loss": compressed_metrics[
+                            "compat_backward_loss"
+                        ],
+                        # Counts are summed over distributed ranks, so name
+                        # their unit explicitly rather than implying logical
+                        # accumulation microbatches.
+                        "compressed/rank_microbatches": compressed_metrics[
+                            "micro_count"
+                        ],
                         "lr": lr,
                         "hyper_lr": hyper_lr,
                         "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
@@ -2011,16 +2305,67 @@ def main():
                         "total_tokens": total_tokens_seen,
                     }
                     if use_token_type_head:
-                        log_dict["type_loss"] = type_loss_tensor.item()
-                        log_dict["type_acc"] = type_acc_tensor.item()
-                        log_dict["base_type_acc"] = base_type_acc_tensor.item()
-                        log_dict["hyper_type_acc"] = hyper_type_acc_tensor.item()
-                        log_dict["hyper_ratio"] = hyper_ratio_tensor.item()
+                        log_dict["type_loss"] = compressed_metrics[
+                            "compat_type_loss"
+                        ]
+                        log_dict["type_acc"] = compressed_metrics[
+                            "compat_type_acc"
+                        ]
+                        log_dict["base_type_acc"] = compressed_metrics[
+                            "compat_base_type_acc"
+                        ]
+                        log_dict["hyper_type_acc"] = compressed_metrics[
+                            "compat_hyper_type_acc"
+                        ]
+                        log_dict["hyper_ratio"] = compressed_metrics[
+                            "compat_hyper_ratio"
+                        ]
+                        for key in (
+                            "type_loss",
+                            "type_acc",
+                            "base_type_acc",
+                            "hyper_type_acc",
+                            "hyper_ratio",
+                        ):
+                            log_dict[f"compressed/{key}"] = compressed_metrics[
+                                key
+                            ]
                     if args.online_codebook_mask:
                         log_dict["online_skipped_targets"] = online_skipped_value
                         log_dict["online_skipped_target_rate"] = online_skip_rate
                     if args.base_view_replay_prob:
                         log_dict["base_view_replay_rate"] = replay_rate
+                        log_dict.update(
+                            {
+                                "base_view/loss_target_base_token":
+                                    base_view_metrics[
+                                        "loss_target_base_token"
+                                    ],
+                                "base_view/ppl_target_base_token": _safe_ppl(
+                                    base_view_metrics[
+                                        "loss_target_base_token"
+                                    ]
+                                ),
+                                "base_view/loss_per_valid_token":
+                                    base_view_metrics[
+                                        "loss_per_valid_token"
+                                    ],
+                                "base_view/acc": base_view_metrics["acc"],
+                                "base_view/base_token_acc":
+                                    base_view_metrics["base_token_acc"],
+                                "base_view/rank_microbatches":
+                                    base_view_metrics["micro_count"],
+                            }
+                        )
+                        if use_token_type_head:
+                            for key in (
+                                "type_loss",
+                                "type_acc",
+                                "base_type_acc",
+                            ):
+                                log_dict[f"base_view/{key}"] = (
+                                    base_view_metrics[key]
+                                )
                     if gate_stats is not None:
                         log_dict.update(
                             {
@@ -2030,24 +2375,44 @@ def main():
                                 "rope_gate_rms": gate_stats["rms"],
                             }
                         )
+                        for layer_offset, (mean, rms) in enumerate(
+                            zip(
+                                gate_stats["layer_mean"],
+                                gate_stats["layer_rms"],
+                            )
+                        ):
+                            layer_id = (
+                                args.gated_rope_start_layer + layer_offset
+                            )
+                            log_dict[
+                                f"rope_gate/layer_{layer_id:02d}_mean"
+                            ] = mean
+                            log_dict[
+                                f"rope_gate/layer_{layer_id:02d}_rms"
+                            ] = rms
+                        for pair_offset, (mean, rms) in enumerate(
+                            zip(
+                                gate_stats["pair_mean"],
+                                gate_stats["pair_rms"],
+                            )
+                        ):
+                            pair_id = (
+                                args.gated_rope_start_pair + pair_offset
+                            )
+                            log_dict[
+                                f"rope_gate/pair_{pair_id:02d}_mean"
+                            ] = mean
+                            log_dict[
+                                f"rope_gate/pair_{pair_id:02d}_rms"
+                            ] = rms
                     wandb.log(log_dict, step=step)
 
-            log_loss = 0.0
-            log_base_loss = 0.0
-            log_compression = 0.0
-            log_acc = 0.0
-            log_base_token_acc = 0.0
-            log_hyper_token_acc = 0.0
-            log_relaxed_acc = 0.0
-            log_type_loss = 0.0
-            log_type_acc = 0.0
-            log_base_type_acc = 0.0
-            log_hyper_type_acc = 0.0
-            log_hyper_ratio = 0.0
+            log_view_sums = {
+                "compressed": new_view_metric_sums(),
+                "base_view": new_view_metric_sums(),
+            }
             log_online_skipped = 0
             log_online_targets = 0
-            log_base_replay_microbatches = 0
-            log_total_microbatches = 0
             log_tokens = 0
             start_time = time.time()
 

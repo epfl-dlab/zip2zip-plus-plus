@@ -20,7 +20,10 @@ import torch
 from transformers import AutoTokenizer, GenerationConfig
 from zip2zip_compression import LZWCompressor
 
-from zip2zip_core.checkpoint import prepare_inference_state_dict
+from zip2zip_core.checkpoint import (
+    prepare_inference_state_dict,
+    resolve_gated_rope_start_pair,
+)
 from zip2zip_core.codebook import CodebookManager
 from zip2zip_core.configs import zip2zip_llama_configs
 from zip2zip_core.disabled_ids import compute_disabled_ids
@@ -39,6 +42,10 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
     meta = torch.load(f"{ckpt_dir}/meta.pt", map_location="cpu", weights_only=False)
     args = meta["args"]
     cfg = zip2zip_llama_configs[args["model_config"]]
+    sd = torch.load(
+        f"{ckpt_dir}/model.pt", map_location=device, weights_only=True
+    )
+    sd = prepare_inference_state_dict(sd, args)
     # Encoder architecture overrides recorded in meta.pt (None in legacy metas
     # means the config default; deeper/wider checkpoints crash the strict load
     # without these, e.g. the v0.6.1 4-layer encoder).
@@ -51,6 +58,19 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
     gated_start_layer = args.get("gated_rope_start_layer")
     if gated_start_layer is None:
         gated_start_layer = cfg.gated_rope_start_layer
+    head_dim = (
+        getattr(cfg.layer.attention, "head_dim", None)
+        or cfg.dim // cfg.layer.attention.n_heads
+    )
+    if args.get("gated_compressed_rope"):
+        gated_start_pair = resolve_gated_rope_start_pair(
+            args,
+            sd,
+            n_complex_pairs=head_dim // 2,
+            default=cfg.gated_rope_start_pair,
+        )
+    else:
+        gated_start_pair = cfg.gated_rope_start_pair
     overrides = dict(
         max_subtokens=args["max_subtokens"],
         max_codebook_size=args["max_codebook_size"],
@@ -65,9 +85,10 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
         # behavior-only two-axis geometry must also be restored from meta.pt.
         two_axis_rope=bool(args.get("two_axis_rope", False)),
         # v0.7.1 keeps ordinary RoPE and learns a gated compressed-coordinate
-        # delta in a configurable suffix of decoder layers.
+        # delta in configurable layer and low-frequency pair suffixes.
         gated_compressed_rope=bool(args.get("gated_compressed_rope", False)),
         gated_rope_start_layer=int(gated_start_layer),
+        gated_rope_start_pair=int(gated_start_pair),
         # builds the (eval-unused) token_type_head so its checkpoint weights
         # have a home and the strict load below does not fail on them.
         token_type_loss_weight=float(args.get("token_type_loss_weight") or 0.0),
@@ -80,13 +101,12 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
         f"base_positions={cfg.base_token_positions} "
         f"two_axis={cfg.two_axis_rope} "
         f"gated_compressed={cfg.gated_compressed_rope} "
-        f"gated_start_layer={cfg.gated_rope_start_layer}"
+        f"gated_start_layer={cfg.gated_rope_start_layer} "
+        f"gated_start_pair={cfg.gated_rope_start_pair}"
     )
     if not restore_encoder_residual(model, args):
         print("[inference] hyper-encoder residual: disabled from meta.pt")
     model = model.to(device)
-    sd = torch.load(f"{ckpt_dir}/model.pt", map_location=device, weights_only=True)
-    sd = prepare_inference_state_dict(sd, args)
     model.load_state_dict(sd, strict=True)
     model.eval()
     return model, args

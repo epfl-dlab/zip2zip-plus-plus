@@ -37,6 +37,7 @@ from zip2zip_compression import (
 from zip2zip_core.configs import zip2zip_llama_configs
 from zip2zip_core.checkpoint import (
     prepare_inference_state_dict,
+    resolve_gated_rope_start_pair,
     strip_wrapper_prefixes,
 )
 from zip2zip_core.data import online_codebook_counts, online_unavailable_targets
@@ -115,6 +116,13 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
 
     cfg_key = train_args.get("model_config", "1B")
     cfg = zip2zip_llama_configs[cfg_key]
+    sd = torch.load(
+        os.path.join(ckpt_dir, "model.pt"),
+        map_location=str(device),
+        weights_only=True,
+    )
+    sd = _strip_wrapper_prefixes(sd)
+    sd = _fold_lora_weights(sd, train_args)
 
     overrides: dict = {}
     for key in (
@@ -155,9 +163,20 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
             overrides["gated_rope_start_layer"] = int(
                 train_args["gated_rope_start_layer"]
             )
+        head_dim = (
+            getattr(cfg.layer.attention, "head_dim", None)
+            or cfg.dim // cfg.layer.attention.n_heads
+        )
+        overrides["gated_rope_start_pair"] = resolve_gated_rope_start_pair(
+            train_args,
+            sd,
+            n_complex_pairs=head_dim // 2,
+            default=cfg.gated_rope_start_pair,
+        )
         print(
             "[zip2zip-lm-eval] gated compressed-coordinate RoPE: enabled "
-            f"from layer {overrides.get('gated_rope_start_layer', cfg.gated_rope_start_layer)} "
+            f"from layer {overrides.get('gated_rope_start_layer', cfg.gated_rope_start_layer)}, "
+            f"pair {overrides.get('gated_rope_start_pair', cfg.gated_rope_start_pair)} "
             "from meta.pt"
         )
     if overrides:
@@ -179,13 +198,6 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
         # discards the imaginary part" UserWarning in earlier eval logs).
         model._apply(lambda t: t.to(dtype) if t.is_floating_point() else t)
 
-    sd = torch.load(
-        os.path.join(ckpt_dir, "model.pt"),
-        map_location=str(device),
-        weights_only=True,
-    )
-    sd = _strip_wrapper_prefixes(sd)
-    sd = _fold_lora_weights(sd, train_args)
     # Canonical training checkpoints are complete after wrapper normalization and
     # LoRA folding.  A permissive load can otherwise evaluate random decoder or
     # hyper-encoder weights while merely printing a warning.

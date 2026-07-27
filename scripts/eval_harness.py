@@ -184,7 +184,10 @@ def main():
         getattr(lm.cfg, "gated_compressed_rope", False)
     )
     args.gated_rope_start_layer = int(
-        getattr(lm.cfg, "gated_rope_start_layer", 16)
+        getattr(lm.cfg, "gated_rope_start_layer", 0)
+    )
+    args.gated_rope_start_pair = int(
+        getattr(lm.cfg, "gated_rope_start_pair", 0)
     )
     args.online_codebook_mask = lm.online_codebook_mask
     args.online_codebook_mask_active = lm.online_codebook_mask_active
@@ -202,7 +205,8 @@ def main():
         f"[eval_harness] decoder RoPE: base_positions="
         f"{args.base_token_positions} two_axis={args.two_axis_rope} "
         f"gated_compressed={args.gated_compressed_rope} "
-        f"gated_start_layer={args.gated_rope_start_layer}"
+        f"gated_start_layer={args.gated_rope_start_layer} "
+        f"gated_start_pair={args.gated_rope_start_pair}"
     )
     print(
         f"[eval_harness] online mask:  checkpoint={args.online_codebook_mask} "

@@ -37,9 +37,8 @@ CLI:
 
 ADDING A RECIPE. Add one entry whose `extends` names its parent and whose `env`
 holds ONLY the keys that change. That is this project's versioning convention
-(vX.Y = parent + one coherent design change; coordinated settings may require
-more than one key) expressed in code, so this file doubles as the experiment
-ledger: you can read what v0.6.4 is by reading four short blocks.
+(vX.Y = parent + exactly one change) expressed in code, so this file doubles as
+the experiment ledger: you can read what v0.6.4 is by reading four short blocks.
 
 Stdlib only — the launchers must be able to run this with whatever `python` is
 on PATH, before any venv exists. (`--identify` imports torch lazily; no launcher
@@ -68,7 +67,8 @@ ENV_KEYS = {
     "BASE_TOKEN_POSITIONS":     ("base_token_positions",     "flag",  False),
     "TWO_AXIS_ROPE":            ("two_axis_rope",            "flag",  False),
     "GATED_COMPRESSED_ROPE":    ("gated_compressed_rope",     "flag",  False),
-    "GATED_ROPE_START_LAYER":   ("gated_rope_start_layer",    "int",   16),
+    "GATED_ROPE_START_LAYER":   ("gated_rope_start_layer",    "int",   0),
+    "GATED_ROPE_START_PAIR":    ("gated_rope_start_pair",     "int",   0),
     "BASE_VIEW_REPLAY_PROB":    ("base_view_replay_prob",     "float", 0.0),
     "ZERO_INIT_ENCODER_OUTPUT": ("zero_init_encoder_output", "flag",  False),
     "NO_ENCODER_RESIDUAL":      ("no_encoder_residual",      "flag",  False),
@@ -77,6 +77,37 @@ ENV_KEYS = {
     "WARMSTART_STEPS":          ("warmstart_steps",          "int",   0),
     # off = the Phi3.5-mini config default, the only model config this line uses
     "ENCODER_N_LAYERS":         ("encoder_n_layers",         "int",   2),
+}
+
+# A mainline child may contain exactly one concrete delta, on exactly one
+# experimental axis. GATED_COMPRESSED_ROPE accepts a named profile as its one
+# value, so v0.7.1 can pin the complete mechanism without turning its geometry
+# into two additional recipe changes.
+ENV_AXES = {
+    "DISABLE_DIGIT_IDS": "data",
+    "UNTIED_HYPER_ENCODER": "architecture",
+    "SHARE_HYPER_ENCODER_WEIGHTS": "architecture",
+    "HYPER_ENCODER_TYPE": "architecture",
+    "BASE_TOKEN_POSITIONS": "positions",
+    "TWO_AXIS_ROPE": "positions",
+    "GATED_COMPRESSED_ROPE": "positions",
+    "GATED_ROPE_START_LAYER": "positions",
+    "GATED_ROPE_START_PAIR": "positions",
+    "BASE_VIEW_REPLAY_PROB": "data",
+    "ZERO_INIT_ENCODER_OUTPUT": "initialization",
+    "NO_ENCODER_RESIDUAL": "architecture",
+    "ONLINE_CODEBOOK_MASK": "objective",
+    "TOKEN_TYPE_LOSS_WEIGHT": "objective",
+    "WARMSTART_STEPS": "optimization",
+    "ENCODER_N_LAYERS": "architecture",
+}
+
+GATED_ROPE_PROFILES = {
+    "lowfreq_all_layers": {
+        "gated_compressed_rope": True,
+        "gated_rope_start_layer": 0,
+        "gated_rope_start_pair": 32,
+    },
 }
 
 # status: current | candidate | exploratory | superseded | negative (a measured negative result)
@@ -92,6 +123,7 @@ RECIPES = {
         "extends": "v0.2",
         "status": "superseded",
         "description": "math docs re-rendered as multi-turn chat (data-only change)",
+        "axis": "data",
         "data": "$SCRATCH/datasets/phi-1B-sft-8shards-mathchat",
         "env": {},
         "notes": "differs from v0.2 ONLY by DATA_DIR; it did not pay off",
@@ -100,6 +132,7 @@ RECIPES = {
         "extends": "v0.2",
         "status": "superseded",
         "description": "digit-protected compression: digits never LZW-merge",
+        "axis": "data",
         "env": {"DISABLE_DIGIT_IDS": "1"},
         "notes": "biggest single GSM8K jump of the line (+23pt)",
     },
@@ -107,6 +140,7 @@ RECIPES = {
         "extends": "v0.4",
         "status": "superseded",
         "description": "untied hyper-encoder (separate output-role encoder on lm_head)",
+        "axis": "architecture",
         "env": {"UNTIED_HYPER_ENCODER": "1"},
         "notes": "matches the released model's architecture",
     },
@@ -114,6 +148,7 @@ RECIPES = {
         "extends": "v0.5",
         "status": "negative",
         "description": "phased warm-start: decoder-LoRA frozen for the first N steps",
+        "axis": "optimization",
         "env": {"WARMSTART_STEPS": "200"},
         "notes": "GSM8K -6.6pt. Its premise (early transient damages the LoRA) was "
                  "wrong; the transient was the v0.6.4 init bug. Do not revisit.",
@@ -122,6 +157,7 @@ RECIPES = {
         "extends": "v0.5",
         "status": "negative",
         "description": "deeper hyper-encoder (2 -> 4 layers)",
+        "axis": "architecture",
         "env": {"ENCODER_N_LAYERS": "4"},
         "notes": "GSM8K -2.6pt; hurt both gap terms. Measured before the v0.6.4 "
                  "init fix, but not being revisited.",
@@ -130,6 +166,7 @@ RECIPES = {
         "extends": "v0.5",
         "status": "superseded",
         "description": "RoPE positions follow the uncompressed stream",
+        "axis": "positions",
         "env": {"BASE_TOKEN_POSITIONS": "1"},
         "notes": "GSM8K +2.7pt; shrank the input term of the gap 6.5 -> 4.3pt",
     },
@@ -137,6 +174,7 @@ RECIPES = {
         "extends": "v0.6.2",
         "status": "superseded",
         "description": "auxiliary base-vs-hyper token-type loss",
+        "axis": "objective",
         "env": {"TOKEN_TYPE_LOSS_WEIGHT": "0.05"},
         "notes": "shrank the weights term 5.2 -> 3.1pt; recovered v0.6.2's MC tax",
     },
@@ -144,6 +182,7 @@ RECIPES = {
         "extends": "v0.6.3",
         "status": "current",
         "description": "hyper-encoder starts at exactly zero (fixes a silent init no-op)",
+        "axis": "initialization",
         "env": {"ZERO_INIT_ENCODER_OUTPUT": "1"},
         "notes": "broadest balanced improvement of the line: GSM8K .652 -> .677, "
                  "MC average recovered, best ppl; OBQA/Wino changes within noise.",
@@ -191,6 +230,7 @@ RECIPES = {
         "extends": "v0.6.4",
         "status": "negative",
         "description": "decoder-time codebook availability during teacher forcing",
+        "axis": "objective",
         "env": {"ONLINE_CODEBOOK_MASK": "1"},
         "notes": "MEASURED NEGATIVE (2026-07-26): removing the train/generation "
                  "vocabulary leak made the model WORSE on 6 of 7 metrics — GSM8K "
@@ -204,6 +244,7 @@ RECIPES = {
         "extends": "v0.6.4",
         "status": "negative",
         "description": "two-axis RoPE over base and compressed positions",
+        "axis": "positions",
         "env": {"TWO_AXIS_ROPE": "1"},
         "notes": "MEASURED NEGATIVE (2026-07-27): even complex RoPE pairs take "
                  "base-stream positions, odd pairs compressed-token positions. "
@@ -215,19 +256,27 @@ RECIPES = {
                  "already gives it on every pair. Strong verdict against the "
                  "dual-position hypothesis.",
     },
+    "v0.6.6": {
+        "extends": "v0.6.4",
+        "status": "candidate",
+        "description": "25% of microbatches use the matched uncompressed data view",
+        "axis": "data",
+        "env": {"BASE_VIEW_REPLAY_PROB": "0.25"},
+        "notes": "UNMEASURED DATA-AXIS CANDIDATE: with the canonical four "
+                 "accumulation microsteps, three are compressed and one is the "
+                 "uncompressed view of the same source chunk. The hyper-encoders "
+                 "therefore receive gradients from 25% fewer microbatches.",
+    },
     "v0.7.1": {
         "extends": "v0.6.4",
         "status": "candidate",
-        "description": "zero-gated compressed-position RoPE in upper layers with base replay",
-        "env": {
-            "GATED_COMPRESSED_ROPE": "1",
-            "GATED_ROPE_START_LAYER": "16",
-            "BASE_VIEW_REPLAY_PROB": "0.25",
-        },
-        "notes": "UNMEASURED: preserves base-stream RoPE exactly at initialization, "
-                 "learns a compressed-coordinate delta only in decoder layers 16-31, "
-                 "and replays ordinary base-token views for 25% of microbatches. "
-                 "Branches from v0.6.4; it does not inherit v0.7's hard 50/50 split.",
+        "description": "zero-gated compressed-position RoPE on low frequencies",
+        "axis": "positions",
+        "env": {"GATED_COMPRESSED_ROPE": "lowfreq_all_layers"},
+        "notes": "UNMEASURED POSITION-AXIS CANDIDATE: preserves v0.6.4 exactly "
+                 "at initialization and gates only Phi complex pairs 32-47 in "
+                 "all 32 decoder layers (512 parameters). It has no base replay "
+                 "and does not inherit v0.7's hard 50/50 split.",
     },
 }
 
@@ -247,9 +296,76 @@ def _validate_registry():
                 f"recipe {name!r} sets unknown env var(s) {sorted(unknown)}; "
                 f"add them to ENV_KEYS or fix the spelling"
             )
+        gated_value = spec.get("env", {}).get("GATED_COMPRESSED_ROPE")
+        if (
+            gated_value is not None
+            and str(gated_value) not in {"0", "1", *GATED_ROPE_PROFILES}
+        ):
+            raise RecipeError(
+                f"recipe {name!r} uses unknown gated RoPE profile "
+                f"{gated_value!r}"
+            )
         parent = spec.get("extends")
         if parent is not None and parent not in RECIPES:
             raise RecipeError(f"recipe {name!r} extends unknown recipe {parent!r}")
+
+    def resolved_env(name):
+        chain, seen, cur = [], set(), name
+        while cur is not None:
+            if cur in seen:
+                raise RecipeError(f"recipe inheritance cycle at {cur!r}")
+            seen.add(cur)
+            chain.append(cur)
+            cur = RECIPES[cur].get("extends")
+        env = {}
+        for step in reversed(chain):
+            env.update(RECIPES[step].get("env", {}))
+        return env
+
+    def resolved_data(name):
+        chain, seen, cur = [], set(), name
+        while cur is not None:
+            if cur in seen:
+                raise RecipeError(f"recipe inheritance cycle at {cur!r}")
+            seen.add(cur)
+            chain.append(cur)
+            cur = RECIPES[cur].get("extends")
+        data = None
+        for step in reversed(chain):
+            if RECIPES[step].get("data"):
+                data = RECIPES[step]["data"]
+        return data
+
+    for name, spec in RECIPES.items():
+        parent = spec.get("extends")
+        if parent is not None and name.startswith("v") and not name.startswith("vx"):
+            parent_env = resolved_env(parent)
+            child_env = resolved_env(name)
+            env_delta = {
+                key
+                for key in parent_env.keys() | child_env.keys()
+                if parent_env.get(key) != child_env.get(key)
+            }
+            declared_env = set(spec.get("env", {}))
+            data_changed = resolved_data(name) != resolved_data(parent)
+            concrete_changes = len(env_delta) + int(data_changed)
+            if declared_env != env_delta or concrete_changes != 1:
+                raise RecipeError(
+                    f"mainline recipe {name!r} must be parent + exactly one "
+                    f"concrete change; declared_env={sorted(declared_env)}, "
+                    f"effective_env_delta={sorted(env_delta)}, "
+                    f"data_changed={data_changed}"
+                )
+            changed_axes = {ENV_AXES[key] for key in env_delta}
+            if data_changed:
+                changed_axes.add("data")
+            declared_axis = spec.get("axis")
+            if changed_axes != {declared_axis}:
+                raise RecipeError(
+                    f"mainline recipe {name!r} must make exactly one declared "
+                    f"change axis; declared={declared_axis!r}, changed="
+                    f"{sorted(changed_axes)}"
+                )
     if CURRENT not in RECIPES:
         raise RecipeError(f"CURRENT={CURRENT!r} is not a recipe")
     if RECIPES[CURRENT].get("status") != "current":
@@ -316,9 +432,19 @@ def _as_arg_value(kind, raw):
 def expected_args(name):
     """The train.py args a recipe implies, over EVERY known key (unset = off)."""
     env = resolve(name)
-    out = {}
+    out = {
+        arg: off
+        for arg, _kind, off in ENV_KEYS.values()
+    }
+    # A profile supplies defaults for its whole mechanism. Any separately
+    # declared numeric child delta is applied afterwards, matching the shell
+    # launcher's explicit-override behavior.
+    gated_profile = env.get("GATED_COMPRESSED_ROPE")
+    if gated_profile in GATED_ROPE_PROFILES:
+        out.update(GATED_ROPE_PROFILES[gated_profile])
     for key, (arg, kind, off) in ENV_KEYS.items():
-        out[arg] = _as_arg_value(kind, env[key]) if key in env else off
+        if key in env:
+            out[arg] = _as_arg_value(kind, env[key])
     return out
 
 

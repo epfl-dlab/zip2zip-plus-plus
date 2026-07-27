@@ -96,11 +96,17 @@ def main():
                 root, include_base_view=True
             )))
 
-            # BV1: opt-in only. Apart from the intentional n_base_tokens reporting
-            # fix, disabling replay preserves the historical sample contract.
+            # BV1: opt-in only. Dual reporting denominators are present with or
+            # without replay; only replay adds the base-view tensors.
             check(
                 "BV1_legacy_keys_unchanged",
-                set(legacy_sample) == {"input", "codebook", "n_base_tokens"},
+                set(legacy_sample)
+                == {
+                    "input",
+                    "codebook",
+                    "n_base_tokens",
+                    "target_n_base_tokens",
+                },
                 f"keys={sorted(legacy_sample)}",
             )
             check(
@@ -112,14 +118,17 @@ def main():
             )
 
             # Compressed targets are [span2, masked span1, masked span3, span1].
-            # Only 2+1 base tokens enter the loss; the former implementation
-            # incorrectly counted all 8 input+target base tokens.
+            # Only 2+1 base tokens enter the loss. n_base_tokens deliberately
+            # preserves the historical all-window value (8); the corrected
+            # target-only denominator is explicit and separately named.
             check(
-                "BV2_compressed_n_base_counts_only_unmasked_targets",
+                "BV2_legacy_and_target_denominators_are_both_preserved",
                 replay_labels.tolist() == [VOCAB_SIZE, -100, -100, 17]
-                and replay_sample["n_base_tokens"] == 3,
+                and replay_sample["n_base_tokens"] == 8
+                and replay_sample["target_n_base_tokens"] == 3,
                 f"labels={replay_labels.tolist()} "
-                f"n_base={replay_sample['n_base_tokens']}",
+                f"legacy={replay_sample['n_base_tokens']} "
+                f"target={replay_sample['target_n_base_tokens']}",
             )
 
             # The deterministic earliest best window is raw[0:5]. Its raw target
@@ -145,6 +154,8 @@ def main():
                 inputs["base_input"].shape == (2, SEQ_LEN)
                 and inputs["base_labels"].shape == (2, SEQ_LEN)
                 and inputs["base_n_base_tokens"].tolist() == [3, 3]
+                and inputs["n_base_tokens"].tolist() == [8, 8]
+                and inputs["target_n_base_tokens"].tolist() == [3, 3]
                 and torch.equal(labels[0], replay_labels),
                 f"keys={sorted(inputs)}",
             )
@@ -193,12 +204,14 @@ def main():
             _write_fixture(root, with_mask=False)
             sample, labels = next(iter(_dataset(root, include_base_view=True)))
             check(
-                "BV7_unmasked_counts_exclude_first_input_span",
-                sample["n_base_tokens"] == 7
+                "BV7_unmasked_legacy_includes_first_input_span",
+                sample["n_base_tokens"] == 8
+                and sample["target_n_base_tokens"] == 7
                 and sample["base_n_base_tokens"] == SEQ_LEN
                 and bool((labels != -100).all())
                 and bool((sample["base_labels"] != -100).all()),
-                f"compressed_n={sample['n_base_tokens']} "
+                f"legacy_n={sample['n_base_tokens']} "
+                f"target_n={sample['target_n_base_tokens']} "
                 f"base_n={sample['base_n_base_tokens']}",
             )
 

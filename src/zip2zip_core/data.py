@@ -324,22 +324,25 @@ class Zip2ZipDataset(IterableDataset, Stateful):
             offset += span_len
         return torch.BoolTensor(compressed_mask)
 
+    def _count_expanded_base_tokens(self, tokens, codebook) -> int:
+        """Number of base tokens represented by a compressed token sequence."""
+        cb_dict = codebook.to_dict()
+        return sum(
+            len(cb_dict[int(tok)])
+            if int(tok) >= self.initial_vocab_size
+            else 1
+            for tok in tokens
+            if int(tok) != -100
+        )
+
     def _count_unmasked_target_base_tokens(self, labels, codebook) -> int:
         """Base tokens represented by labels that actually enter the loss.
 
-        ``n_base_tokens`` is a reporting denominator, not a description of the
-        whole input window. Counting prompt/input spans or targets subsequently
-        replaced by ``-100`` understates nats/base-token and overstates the
-        effective compression ratio on assistant-masked corpora.
+        This is the corrected ``target_n_base_tokens`` denominator. The legacy
+        ``n_base_tokens`` field intentionally retains the historical count over
+        the complete compressed ``T+1`` window for curve comparability.
         """
-        cb_dict = codebook.to_dict()
-        total = 0
-        for tok in labels.tolist():
-            tok = int(tok)
-            if tok == -100:
-                continue
-            total += len(cb_dict[tok]) if tok >= self.initial_vocab_size else 1
-        return total
+        return self._count_expanded_base_tokens(labels.tolist(), codebook)
 
     def _make_base_view(self, chunk, chunk_mask):
         """An uncompressed CLM window from the same raw ``2 * seq_len`` chunk.
@@ -470,6 +473,15 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                         )
                         continue
 
+                    # Historical reporting denominator: expand the complete
+                    # compressed T+1 window, including the first input-only
+                    # token and targets that may subsequently be masked. Keep
+                    # this exact definition under its old field name so every
+                    # v0.6.x curve remains comparable.
+                    n_base_tokens = self._count_expanded_base_tokens(
+                        compressed, codebook
+                    )
+
                     x = torch.LongTensor(compressed[:-1])
                     y = torch.LongTensor(compressed[1:])
                     if chunk_mask is not None:
@@ -505,10 +517,10 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                         if not (y != -100).any():
                             continue
 
-                    # Reporting denominator: only target labels that survived
-                    # every mask above contribute, expanded back to base space.
-                    # This deliberately does not affect ``backward_loss``.
-                    n_base_tokens = self._count_unmasked_target_base_tokens(
+                    # Corrected reporting denominator: expand only target
+                    # labels that survived every mask above. This deliberately
+                    # does not affect ``backward_loss``.
+                    target_n_base_tokens = self._count_unmasked_target_base_tokens(
                         y, codebook
                     )
 
@@ -522,13 +534,15 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                         self._debug_log(
                             f"lm yield sample_idx={self._debug_samples_emitted} shard_idx={shard_idx} "
                             f"offset={offset - self.base_chunk_len} input={tuple(x.shape)} "
-                            f"codebook={tuple(cb.shape)} n_base_tokens={n_base_tokens}"
+                            f"codebook={tuple(cb.shape)} n_base_tokens={n_base_tokens} "
+                            f"target_n_base_tokens={target_n_base_tokens}"
                         )
                     self._debug_samples_emitted += 1
                     sample = {
                         "input": x,
                         "codebook": cb,
                         "n_base_tokens": n_base_tokens,
+                        "target_n_base_tokens": target_n_base_tokens,
                     }
                     if self.include_base_view:
                         (
@@ -656,7 +670,16 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                         )
                     self._debug_samples_emitted += 1
                     self._offset = offset
-                    yield {"input": x, "codebook": cb, "n_base_tokens": base_count}, y
+                    # In either task direction, the supervised second half
+                    # represents exactly ``base_count`` base tokens. Publish
+                    # the explicit corrected denominator here too so collation
+                    # never has to silently substitute the legacy field.
+                    yield {
+                        "input": x,
+                        "codebook": cb,
+                        "n_base_tokens": base_count,
+                        "target_n_base_tokens": base_count,
+                    }, y
 
                 # Shard exhausted: the next one starts at its own beginning.
                 self._offset = 0
@@ -847,11 +870,27 @@ def remap_collate_fn(batch, pad_token_id, max_subtokens, max_active_codebook_siz
     codebooks = torch.stack(padded_cbs)
 
     n_base_tokens = torch.tensor([inp["n_base_tokens"] for inp in inputs_list], dtype=torch.long)
+    missing_target_denominator = [
+        index
+        for index, inp in enumerate(inputs_list)
+        if "target_n_base_tokens" not in inp
+    ]
+    if missing_target_denominator:
+        raise ValueError(
+            "target_n_base_tokens is required for every sample; missing at "
+            f"batch indices {missing_target_denominator}. The LM path must "
+            "report its masked-target expansion explicitly."
+        )
+    target_n_base_tokens = torch.tensor(
+        [inp["target_n_base_tokens"] for inp in inputs_list],
+        dtype=torch.long,
+    )
 
     inputs = {
         "input": input_ids,
         "codebook": codebooks,
         "n_base_tokens": n_base_tokens,
+        "target_n_base_tokens": target_n_base_tokens,
     }
     base_fields = {"base_input", "base_labels", "base_n_base_tokens"}
     has_base_fields = [base_fields <= set(inp) for inp in inputs_list]

@@ -22,10 +22,15 @@ def test_finetune_forwards_complete_v071_contract():
     source = FINETUNE.read_text()
     for fragment in (
         "GATED_COMPRESSED_ROPE=${GATED_COMPRESSED_ROPE:-}",
-        "GATED_ROPE_START_LAYER=${GATED_ROPE_START_LAYER:-16}",
+        "GATED_COMPRESSED_ROPE=lowfreq_all_layers",
+        "GATED_ROPE_START_LAYER=${GATED_ROPE_START_LAYER:-0}",
+        "GATED_ROPE_START_PAIR=${GATED_ROPE_START_PAIR:-0}",
+        "GATED_ROPE_START_PAIR=${GATED_ROPE_START_PAIR:-32}",
+        "unknown GATED_COMPRESSED_ROPE profile",
         "BASE_VIEW_REPLAY_PROB=${BASE_VIEW_REPLAY_PROB:-0}",
         'GATEDROPE_FLAG="--gated_compressed_rope"',
         '--gated_rope_start_layer "$GATED_ROPE_START_LAYER"',
+        '--gated_rope_start_pair "$GATED_ROPE_START_PAIR"',
         '--base_view_replay_prob "$BASE_VIEW_REPLAY_PROB"',
         'SEED=${SEED:-42}',
         '--seed "$SEED"',
@@ -40,6 +45,7 @@ def test_pipeline_audits_every_gated_eval_and_docs_both_commands():
     assert source.count('audit_eval_mode "$PPL_JSON"') == 1
     assert 'args.get("gated_compressed_rope")' in source
     assert 'args.get("gated_rope_start_layer")' in source
+    assert 'args.get("gated_rope_start_pair")' in source
 
     docs = DOCS.read_text()
     assert "smoke-z2z-v071" in docs
@@ -56,7 +62,8 @@ def test_pipeline_gated_audit_accepts_match_and_rejects_mismatch(tmp_path):
     result.write_text(json.dumps({
         "args": {
             "gated_compressed_rope": True,
-            "gated_rope_start_layer": 16,
+            "gated_rope_start_layer": 0,
+            "gated_rope_start_pair": 32,
         }
     }))
 
@@ -70,15 +77,23 @@ def test_pipeline_gated_audit_accepts_match_and_rejects_mismatch(tmp_path):
         "",  # legacy two-axis
         "1",  # gated mode
     ]
-    subprocess.run([*common, "16"], input=audit_program, text=True, check=True)
+    subprocess.run([*common, "0", "32"], input=audit_program, text=True, check=True)
     bad = subprocess.run(
-        [*common, "17"],
+        [*common, "1", "32"],
         input=audit_program,
         text=True,
         capture_output=True,
     )
     assert bad.returncode != 0
-    assert "gated_rope_start_layer=16" in bad.stderr
+    assert "gated_rope_start_layer=0" in bad.stderr
+    bad_pair = subprocess.run(
+        [*common, "0", "31"],
+        input=audit_program,
+        text=True,
+        capture_output=True,
+    )
+    assert bad_pair.returncode != 0
+    assert "gated_rope_start_pair=32" in bad_pair.stderr
 
 
 def test_pipeline_offline_preflight_needs_no_api_key(tmp_path):
@@ -129,6 +144,57 @@ def test_pipeline_offline_preflight_needs_no_api_key(tmp_path):
     assert online.returncode == 1
     assert "WANDB=1 requires WANDB_API_KEY" in online.stdout
     assert "TRAIN_STUB_REACHED" not in online.stdout
+
+
+def test_pipeline_parent_resolves_named_and_manual_gate_geometry(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "shard_000.npy").touch()
+    (data / "mask_000.npy").touch()
+
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    inner_bash = stub_bin / "bash"
+    inner_bash.write_text(
+        "#!/bin/sh\n"
+        'echo "GATE=${GATED_COMPRESSED_ROPE:-} '
+        'LAYER=${GATED_ROPE_START_LAYER:-} '
+        'PAIR=${GATED_ROPE_START_PAIR:-}"\n'
+        "exit 42\n"
+    )
+    inner_bash.chmod(0o755)
+
+    common = {
+        **os.environ,
+        "PATH": f"{stub_bin}:{os.environ['PATH']}",
+        "PROJECT_DIR": str(REPO),
+        "Z2Z_SCRATCH": str(tmp_path / "scratch"),
+        "OUTPUT_BASE": str(tmp_path / "outputs"),
+        "DATA_DIR": str(data),
+        "WANDB": "0",
+    }
+    named = subprocess.run(
+        ["/bin/bash", str(PIPELINE)],
+        env={**common, "RECIPE": "v0.7.1", "RUN_NAME": "named-profile"},
+        text=True,
+        capture_output=True,
+    )
+    assert named.returncode == 42
+    assert "GATE=lowfreq_all_layers LAYER=0 PAIR=32" in named.stdout
+
+    manual = subprocess.run(
+        ["/bin/bash", str(PIPELINE)],
+        env={
+            **common,
+            "RECIPE": "",
+            "RUN_NAME": "manual-profile",
+            "GATED_COMPRESSED_ROPE": "1",
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert manual.returncode == 42
+    assert "GATE=1 LAYER=0 PAIR=0" in manual.stdout
 
 
 def test_pipeline_offline_routes_all_eval_and_upload_paths():

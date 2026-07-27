@@ -347,11 +347,12 @@ def main():
     check("O6_bad_count_shape_fails", shape_raises,
           "misaligned per-position metadata cannot broadcast silently")
 
-    # O7: collation is opt-in. The old dictionary is structurally unchanged.
+    # O7: collation is opt-in, but both reporting denominators are explicit.
     base_sample = {
         "input": torch.tensor([1, 2, 3]),
         "codebook": torch.tensor([[1, 2, PAD, PAD]]),
         "n_base_tokens": 3,
+        "target_n_base_tokens": 3,
     }
     old_inputs, _ = remap_collate_fn(
         [(base_sample, torch.tensor([2, 3, 4]))],
@@ -366,9 +367,27 @@ def main():
         [(online_sample, torch.tensor([2, 3, -100]))],
         PAD, 4, 4,
     )
-    check("O7_flag_off_collate_unchanged",
-          set(old_inputs) == {"input", "codebook", "n_base_tokens"},
+    check("O7_flag_off_collate_carries_explicit_target_denominator",
+          set(old_inputs)
+          == {"input", "codebook", "n_base_tokens", "target_n_base_tokens"}
+          and old_inputs["target_n_base_tokens"].tolist() == [3],
           f"keys={sorted(old_inputs)}")
+    missing_target_raises = False
+    try:
+        missing_target = {
+            key: value
+            for key, value in base_sample.items()
+            if key != "target_n_base_tokens"
+        }
+        remap_collate_fn(
+            [(missing_target, torch.tensor([2, 3, 4]))],
+            PAD, 4, 4,
+        )
+    except ValueError as exc:
+        missing_target_raises = "target_n_base_tokens is required" in str(exc)
+    check("O7_missing_target_denominator_fails_loudly",
+          missing_target_raises,
+          "LM collation cannot silently substitute the legacy denominator")
     check("O7_online_metadata_collates",
           online_inputs["codebook_counts"].shape == (1, 3)
           and online_inputs["codebook_counts"].tolist() == [[0, 1, 1]]

@@ -224,9 +224,12 @@ zip2zip_llama_configs = {
             scaling="llama",
         ),
     ),
-    # ~3.8B params — matches official Phi-3.5-mini-instruct architecture
+    # ~3.8B params — matches the official Phi-3.5-mini-instruct tensor shapes
     # (dim=3072, 32 layers, 32 heads MHA, head_dim=96, ffn=8192, vocab=32064,
-    #  rope theta=10000 no scaling, untied input/output embeddings).
+    #  rope theta=10000, untied input/output embeddings). Important: the
+    #  official checkpoint uses LongRoPE short/long factor vectors; this
+    #  inherited core config uses unscaled RoPE. That pre-existing baseline
+    #  discrepancy must not be silently bundled into a candidate recipe.
     # zip2zip components follow the from-scratch core defaults (flat encoder,
     # encoder_dim=512, intermediate=2048, max_codebook_size=4096), max_subtokens=3.
     "Phi3.5-mini": Zip2ZipLlama3Model.Config(

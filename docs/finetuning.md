@@ -52,9 +52,9 @@ Three things worth knowing about how it behaves:
   (warm-start), `v0.6.1` (deeper encoder), `v0.6.5` (exact decoder-time mask) and
   `v0.7` (two-axis RoPE). They stay selectable purely so the experiment is
   reproducible.
-- **Unmeasured mainline candidates are marked `+`.** `v0.7.1` is the current
-  candidate; `v0.6.4` remains the standard until the candidate passes its
-  paired acceptance criteria.
+- **Unmeasured mainline candidates are marked `+`.** `v0.6.6` and `v0.7.1`
+  independently test the data and position axes; `v0.6.4` remains the standard
+  until a candidate passes replicated, matched acceptance criteria.
 - **Exploratory `vx<base>.N` runs are marked `x`**. They are owned by
   Xinxian; the `v<base>` portion before the final `.N` names the mainline recipe
   they branch from (for example, `vx0.6.4.1` branches from `v0.6.4`). They are
@@ -752,47 +752,125 @@ four-GPU smoke checking finite forward/backward values, the resolved
 started by implementing or selecting the recipe; launch remains an explicit
 operator action.
 
-## Gated compressed-position RoPE with base replay (v0.7.1 — candidate)
+## Independent v0.6.6 and v0.7.1 candidates
 
-**Definition: `v0.7.1 = v0.6.4 + GATED_COMPRESSED_ROPE=1 +
-GATED_ROPE_START_LAYER=16 + BASE_VIEW_REPLAY_PROB=0.25`.** It branches from
-v0.6.4, not v0.7: the rejected hard 50/50 frequency split remains available
-only through `RECIPE=v0.7`.
+The mainline convention is literal: **`vX.Y = parent + exactly one change`.**
+The two hypotheses are therefore independent children of v0.6.4:
 
-For active decoder layer `l` and complex pair `i`, v0.7.1 uses
+- `v0.6.6 = v0.6.4 + BASE_VIEW_REPLAY_PROB=0.25` (data axis).
+- `v0.7.1 = v0.6.4 + GATED_COMPRESSED_ROPE=lowfreq_all_layers`
+  (position axis).
 
-`p_effective = p_base + gate[l,i] * (p_compressed - p_base)`.
+The named gate profile pins all layers and pairs 32-47 as one mechanism. The
+registry rejects a mainline child with zero or multiple concrete deltas, even
+when multiple deltas share an axis, then checks that the one delta matches its
+declared axis. Do not put replay into v0.7.1. If both hypotheses replicate
+positively, the combination gets a new version whose parent is the chosen
+winner and whose only new change is the other mechanism.
 
-The gates are direct learned coefficients initialized to zero, so the initial
-attention geometry is exactly v0.6.4. Only zero-based layers 16-31 of the
-32-layer Phi decoder receive gates. The lower half retains the pretrained
-base-stream geometry implicated by the v0.7 checkpoint comparison.
+### v0.7.1: low-frequency gated RoPE
 
-One quarter of training microbatches use the ordinary uncompressed token view
-with no codebook. Replay selection is stateless, identical on every distributed
-rank, and recoverable from `(step, gradient_accumulation_steps)`. With the
-canonical four accumulation microsteps, microstep 0 is base replay and
-microsteps 1-3 are compressed. The final microstep is always compressed so all
-hyper-encoder gradients participate in distributed reduction.
+For decoder layer `l` and active complex pair `i`, the phase is equivalent to
 
-All three levers are default-off/default-neutral outside the named recipe.
-`meta.pt` records the gated flag, start layer, replay probability, and
-accumulation schedule; resume rejects a mismatch. Evaluation and direct
-inference restore the gated geometry automatically. Evaluation JSON records
-`gated_compressed_rope` and `gated_rope_start_layer`, and the pipeline audits
-both after every smoke and final evaluation. The external HF runtime does not
-implement this geometry, so export remains refused.
+`theta[i] * (p_base + gate[l,i] * (p_compressed - p_base))`.
 
-Before launching, update
-`/dlabscratch1/gentilin/code/zip2zip-core` to the pushed
-`finetuning-andrea` commit, verify that the eosfix dataset and masks exist at
-the path below, and choose a `RUN_NAME` that has never been used (the pipeline
-intentionally rejects an existing output directory). The commands below use
-`WANDB=0` and require no API key; checkpoints, evaluation JSON, and logs remain
-under `/dlabscratch1/gentilin`. `NUM_WORKERS=0` is required for the matched
-investigation run and exact resumable loader state.
+The direct gates start at exactly zero. v0.7.1 instantiates them in all 32
+decoder layers, but only for Phi-3.5 complex pairs 32-47: `32 × 16 = 512`
+parameters. Pairs 0-31 always use v0.6.4 base-stream RoPE. This low-frequency
+third is a conditioning choice, not a claim that autodiff aliases: the
+high-frequency derivatives are exact but have large curvature, repeated phase
+wraps, and cancellation across examples. On 64 production windows the removed
+position delta had median 455.5, p90 750.9, and maximum 1188; at pair 32 those
+are approximately 0.98, 1.62, and 2.56 radians per unit gate.
 
-First run the four-H100, 20-step end-to-end smoke:
+Training logs aggregate gate mean/RMS and also write per-layer and per-pair
+mean/RMS profiles. `meta.pt`, native evaluation, direct inference, and the
+pipeline audit all preserve the start layer and start pair. The native
+checkpoint loader is strict. Both HF export paths fail explicitly because the
+external runtime cannot represent the learned geometry; they never silently
+evaluate v0.6.4 geometry.
+
+Official `microsoft/Phi-3.5-mini-instruct` uses LongRoPE short/long factor
+vectors, but this repository's inherited Phi config (including v0.6.4) uses
+vanilla `theta=10000` RoPE and exports `rope_scaling=None`. Adding LongRoPE only
+to v0.7.1 would introduce a second change. Treat baseline LongRoPE parity as a
+separate recipe: select short/long factors from the maximum semantic base
+position, apply scaled inverse frequencies before the fractional effective
+position, and preserve the official attention scaling factor.
+
+### v0.6.6: base-view replay and comparable metrics
+
+With four accumulation microsteps, v0.6.6 deterministically uses one base view
+and three compressed views. The final microstep remains compressed for
+rank-uniform FSDP synchronization. A base view passes `codebook=None`, so the
+decoder LoRA and token-type head receive gradients, but `hyper_encoder`,
+untied `hyper_output`, and the RoPE gate do not. The two hyper-encoders
+therefore see 25% fewer compressed examples; Adam normalization means the
+parameter update is not simply 25% smaller. Compensating its learning rate or
+adding a fifth microstep would be another experiment, not part of v0.6.6.
+
+Historical top-level training keys (`loss`, `ppl`, `acc`, `hyper_token_acc`,
+`type_*`, `compression`, and related keys) are computed only on compressed
+microbatches and preserve the old mean-of-rank-microbatch weighting formula
+(distributed reduction rounding can differ). In those compatibility keys, a
+microbatch with no hyper class contributes zero, matching the old accumulator.
+Canonical raw-count metrics live under `compressed/`; replay metrics live under
+`base_view/`; their class-specific denominators exclude absent classes. The
+actual mixed optimization objective is `objective/backward_loss`. Counters are
+named `compressed/rank_microbatches` and `base_view/rank_microbatches` because
+they are summed across distributed ranks.
+
+`n_base_tokens` retains its historical definition: expansion of the complete
+compressed `T+1` window, including the first input-only token and masked
+targets. The corrected denominator is separately named
+`target_n_base_tokens` and expands only labels that enter the loss. Existing
+`loss`, `ppl`, and `compression` curves stay legacy-comparable; corrected
+metrics are `compressed/loss_target_base_token`,
+`compressed/ppl_target_base_token`, and
+`compressed/compression_target` (with matching `eval/*_target*` keys).
+
+### Run order and launch
+
+Run v0.6.6 and v0.7.1 independently from the same v0.6.4 parent, data,
+schedule, and seed; they may run in parallel. Do not stack the winner of a
+single noisy run. Repeat both promising candidates and a matched v0.6.4 with
+seed 43 before combining anything.
+
+Before a full run, update the cluster checkout to the pushed
+`finetuning-andrea` commit and use a fresh `RUN_NAME`.
+
+The four-H100 v0.6.6 smoke is:
+
+```bash
+runai-rcp-prod submit --name smoke-z2z-v066 \
+  --image ghcr.io/jkminder/dlab-runai-images/pytorch:master \
+  --gpu 4 --cpu 16 --memory 128Gi \
+  --pvc dlab-scratch:/mnt --large-shm --node-pools h100 \
+  --environment WANDB=0 --environment NUM_WORKERS=0 \
+  --environment DATA_DIR=/dlabscratch1/gentilin/datasets/phi-1B-sft-8shards-eosfix \
+  --environment RUN_NAME=andrea-z2z-phi35-4B-baseview25-smoke-v0.6.6 \
+  --environment RECIPE=v0.6.6 --environment SEED=42 \
+  --environment STEPS=20 --environment SAVE_FREQ=20 --environment LOG_FREQ=1 \
+  --environment SMOKE_EVERY=20 --environment SMOKE_LIMIT=8 \
+  --environment FINAL_LIMIT=8 --environment SKIP_FULL_PPL=1 \
+  -- "bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
+```
+
+The full seed-42 v0.6.6 run is:
+
+```bash
+runai-rcp-prod submit --name ft-z2z-v066 \
+  --image ghcr.io/jkminder/dlab-runai-images/pytorch:master \
+  --gpu 4 --cpu 16 --memory 128Gi \
+  --pvc dlab-scratch:/mnt --large-shm --node-pools h100 \
+  --environment WANDB=0 --environment NUM_WORKERS=0 \
+  --environment DATA_DIR=/dlabscratch1/gentilin/datasets/phi-1B-sft-8shards-eosfix \
+  --environment RUN_NAME=andrea-z2z-phi35-4B-baseview25-1BData-v0.6.6-Zip2zipCore \
+  --environment RECIPE=v0.6.6 --environment SEED=42 \
+  -- "bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
+```
+
+The four-H100 v0.7.1 smoke is:
 
 ```bash
 runai-rcp-prod submit --name smoke-z2z-v071 \
@@ -801,21 +879,15 @@ runai-rcp-prod submit --name smoke-z2z-v071 \
   --pvc dlab-scratch:/mnt --large-shm --node-pools h100 \
   --environment WANDB=0 --environment NUM_WORKERS=0 \
   --environment DATA_DIR=/dlabscratch1/gentilin/datasets/phi-1B-sft-8shards-eosfix \
-  --environment RUN_NAME=andrea-z2z-phi35-4B-gatedrope-replay-smoke-v0.7.1 \
-  --environment RECIPE=v0.7.1 \
-  --environment SEED=42 \
+  --environment RUN_NAME=andrea-z2z-phi35-4B-gatedrope-lowfreq-smoke-v0.7.1 \
+  --environment RECIPE=v0.7.1 --environment SEED=42 \
   --environment STEPS=20 --environment SAVE_FREQ=20 --environment LOG_FREQ=1 \
   --environment SMOKE_EVERY=20 --environment SMOKE_LIMIT=8 \
   --environment FINAL_LIMIT=8 --environment SKIP_FULL_PPL=1 \
   -- "bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
 ```
 
-The smoke passes only if the job exits zero; loss, gradients, and gate values
-remain finite; the gate receives a nonzero update; the banner and `meta.pt`
-identify v0.7.1's exact `1/16/0.25` settings; one in four microbatches is base
-replay; and the smoke/final JSON geometry audits pass.
-
-After the smoke, launch the full seed-42 pipeline:
+The full seed-42 v0.7.1 run is:
 
 ```bash
 runai-rcp-prod submit --name ft-z2z-v071 \
@@ -824,18 +896,10 @@ runai-rcp-prod submit --name ft-z2z-v071 \
   --pvc dlab-scratch:/mnt --large-shm --node-pools h100 \
   --environment WANDB=0 --environment NUM_WORKERS=0 \
   --environment DATA_DIR=/dlabscratch1/gentilin/datasets/phi-1B-sft-8shards-eosfix \
-  --environment RUN_NAME=andrea-z2z-phi35-4B-gatedrope-replay-1BData-v0.7.1-Zip2zipCore \
-  --environment RECIPE=v0.7.1 \
-  --environment SEED=42 \
+  --environment RUN_NAME=andrea-z2z-phi35-4B-gatedrope-lowfreq-1BData-v0.7.1-Zip2zipCore \
+  --environment RECIPE=v0.7.1 --environment SEED=42 \
   -- "bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
 ```
-
-For a decision rather than a single-run observation, repeat matched v0.6.4 and
-v0.7.1 runs with `SEED=43` and fresh names. Promote v0.7.1 only if it beats the
-matched v0.6.4 compressed GSM8K score in both seeds, improves the two-seed mean
-by at least 1.0 point, stays within 0.5 point in base mode, keeps WikiText
-perplexity within 1%, and preserves the same prompt compression ratio.
-Otherwise stop this positional branch and keep v0.6.4.
 
 ## Canonical RCP locations and run conventions
 

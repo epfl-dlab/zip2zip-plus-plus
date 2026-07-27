@@ -27,6 +27,7 @@ Usage (see scripts/diagnose_ckpt_rcp.sh for the Run:AI launcher):
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -200,11 +201,16 @@ def train_style_replay(lm, chunk, mask, seq_len, disabled_ids, tokenizer):
     per_tok = F.cross_entropy(logits, labels, reduction="none", ignore_index=-100)
     valid = labels != -100
     ce_sum = per_tok.sum().item()
+    n_target_base = sum(
+        len(cb_dict[int(tok)]) if int(tok) >= cfg.vocab_size else 1
+        for tok in labels[valid].tolist()
+    )
 
     n_bytes = len(tokenizer.decode(chunk[:n_base], skip_special_tokens=False).encode("utf-8"))
     return dict(
         ce_sum=ce_sum,
         n_base=n_base,
+        n_target_base=n_target_base,
         n_valid=int(valid.sum()),
         n_comp=len(compressed),
         n_bytes=n_bytes,
@@ -247,6 +253,16 @@ def main():
                         "run consumed only part of each shard, so this is near-held-out).")
     p.add_argument("--device", default="cuda")
     p.add_argument("--dtype", default="bfloat16")
+    p.add_argument(
+        "--output_json",
+        default=None,
+        help="Optional dual-denominator aggregate artifact path.",
+    )
+    p.add_argument(
+        "--replay_only",
+        action="store_true",
+        help="Stop after train-style replay (useful for a quick denominator map).",
+    )
     args = p.parse_args()
 
     log("=== step 0: LoRA adapter weight inspection (mmap, no GPU) ===")
@@ -268,6 +284,7 @@ def main():
         "max_active_codebook_size", "lora_rank", "lora_alpha",
         "hyper_causal_mask", "base_token_positions", "two_axis_rope",
         "gated_compressed_rope", "gated_rope_start_layer",
+        "gated_rope_start_pair",
         "base_view_replay_prob",
         "online_codebook_mask", "no_remap_codebook", "data_dir", "tokenizer",
     )
@@ -296,20 +313,32 @@ def main():
     chunks = load_chunks(args.data_dir, args.n_chunks, args.seq_len * 2, args.start_frac)
 
     log("=== step 2: train-style replay (exact data.py/train.py recipe) ===")
-    agg = dict(ce=0.0, base=0, valid=0, comp=0, bytes=0, online_skipped=0)
+    agg = dict(
+        ce=0.0,
+        base=0,
+        target_base=0,
+        valid=0,
+        comp=0,
+        bytes=0,
+        online_skipped=0,
+    )
     accs = []
     for i, (chunk, mask) in enumerate(chunks):
         m = train_style_replay(lm, chunk, mask, args.seq_len, train_disabled, tokenizer)
         if m is None:
             log(f"  chunk {i}: skipped (compressed < seq_len+1 or fully masked — train.py would skip too)")
             continue
-        log(f"  chunk {i}: nats/base={m['ce_sum'] / m['n_base']:.4f} "
+        log(f"  chunk {i}: nats/legacy-base={m['ce_sum'] / m['n_base']:.4f} "
+            f"nats/target-base={m['ce_sum'] / m['n_target_base']:.4f} "
             f"nats/valid_comp={m['ce_sum'] / max(m['n_valid'], 1):.4f} "
             f"nats/byte={m['ce_sum'] / m['n_bytes']:.4f} "
-            f"acc={m['acc']:.3f} compression={m['n_base'] / m['n_comp']:.3f} "
+            f"acc={m['acc']:.3f} "
+            f"compression_legacy={m['n_base'] / m['n_valid']:.3f} "
+            f"compression_target={m['n_target_base'] / m['n_valid']:.3f} "
             f"assistant_valid_frac_before_online={m['valid_frac']:.3f} "
             f"online_skipped={m['online_skipped']}")
-        agg["ce"] += m["ce_sum"]; agg["base"] += m["n_base"]; agg["valid"] += m["n_valid"]
+        agg["ce"] += m["ce_sum"]; agg["base"] += m["n_base"]
+        agg["target_base"] += m["n_target_base"]; agg["valid"] += m["n_valid"]
         agg["comp"] += m["n_comp"]; agg["bytes"] += m["n_bytes"]
         agg["online_skipped"] += m["online_skipped"]; accs.append(m["acc"])
 
@@ -317,13 +346,42 @@ def main():
         raise SystemExit("No scorable chunks — check DATA_DIR / start_frac.")
 
     train_nats_base = agg["ce"] / agg["base"]
+    train_nats_target_base = agg["ce"] / agg["target_base"]
     train_nats_byte = agg["ce"] / agg["bytes"]
-    log(f"TRAIN-STYLE REPLAY AGGREGATE: nats/base-token={train_nats_base:.4f} "
+    log(f"TRAIN-STYLE REPLAY AGGREGATE: "
+        f"nats/legacy-base-token={train_nats_base:.4f} "
+        f"| nats/target-base-token={train_nats_target_base:.4f} "
         f"(W&B step-8000 'loss' was ~1.63) | nats/valid-comp-token={agg['ce'] / agg['valid']:.4f} "
         f"| bits/byte={train_nats_byte / math.log(2):.4f} | byte_ppl={math.exp(train_nats_byte):.4f} "
         f"| acc={sum(accs) / len(accs):.3f} (W&B acc ~0.5x) "
-        f"| compression={agg['base'] / agg['comp']:.3f} (W&B ~1.45-1.50) "
+        f"| compression_legacy={agg['base'] / agg['valid']:.3f} "
+        f"| compression_target={agg['target_base'] / agg['valid']:.3f} "
         f"| online_skipped={agg['online_skipped']}")
+    dual_denominator = {
+        "checkpoint": os.path.abspath(args.ckpt_dir),
+        "data_dir": os.path.abspath(args.data_dir),
+        "start_frac": args.start_frac,
+        "requested_chunks": args.n_chunks,
+        "scored_chunks": len(accs),
+        "ce_sum": agg["ce"],
+        "valid_compressed_targets": agg["valid"],
+        "legacy_base_tokens": agg["base"],
+        "target_base_tokens": agg["target_base"],
+        "legacy_nats_per_base_token": train_nats_base,
+        "target_nats_per_base_token": train_nats_target_base,
+        "legacy_compression": agg["base"] / agg["valid"],
+        "target_compression": agg["target_base"] / agg["valid"],
+    }
+    if args.output_json:
+        output_dir = os.path.dirname(os.path.abspath(args.output_json))
+        os.makedirs(output_dir, exist_ok=True)
+        with open(args.output_json, "w") as f:
+            json.dump(dual_denominator, f, indent=2, sort_keys=True)
+            f.write("\n")
+        log(f"wrote dual-denominator artifact: {args.output_json}")
+    if args.replay_only:
+        log("replay-only requested; skipping rolling-window and base-mode passes")
+        return
 
     log("=== step 3: eval-style rolling windows on the SAME data (real adapter scorer) ===")
     for max_len in (1024, 2048):

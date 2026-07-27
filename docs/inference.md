@@ -21,6 +21,8 @@ print(tokenizer.decode(output))
 ```
 
 This requires models exported to HF format (see [Export & Interop](export.md)).
+It does **not** apply to v0.7.1: the external HF runtime cannot represent its
+per-layer gated RoPE geometry, so both export paths fail explicitly.
 
 ## 2. Torchtitan-based inference (in development)
 
@@ -42,4 +44,7 @@ legacy v0.7 two-axis RoPE, and v0.7.1 gated compressed-position RoPE.
 
 There is also `scripts/generate.py` with a similar interface using `Zip2ZipTokenizer` for encoding/decoding.
 
-> **Note**: The torchtitan inference scripts are development tools, not production-ready. For benchmarking and deployment, use the HF-based path above.
+> **Note**: The torchtitan inference scripts are development tools, not
+> production-ready. Use the HF-based path for export-compatible checkpoints.
+> v0.7.1 must instead use this native path for both evaluation and inference
+> until the external runtime implements the gated geometry.

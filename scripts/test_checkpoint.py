@@ -16,7 +16,10 @@ import dataclasses
 
 import torch
 
-from zip2zip_core.checkpoint import prepare_inference_state_dict
+from zip2zip_core.checkpoint import (
+    prepare_inference_state_dict,
+    resolve_gated_rope_start_pair,
+)
 from zip2zip_core.configs import zip2zip_llama_configs
 from zip2zip_core.model import Zip2ZipLlama3Model, restore_encoder_residual
 
@@ -72,6 +75,10 @@ print(f"  max_codebook_size: {train_args.get('max_codebook_size')}")
 MODEL_KEY = train_args.get("model_config") or args.model_config
 print(f"\nBuilding {MODEL_KEY} model on {DEVICE}...")
 cfg = zip2zip_llama_configs[MODEL_KEY]
+model_path = os.path.join(ckpt_dir, "model.pt")
+print(f"\nLoading checkpoint from {model_path} ...")
+state_dict = torch.load(model_path, map_location=DEVICE, weights_only=True)
+state_dict = prepare_inference_state_dict(state_dict, train_args)
 overrides = {
     key: train_args[key]
     for key in (
@@ -84,6 +91,7 @@ overrides = {
         "encoder_intermediate_size",
         "token_type_loss_weight",
         "gated_rope_start_layer",
+        "gated_rope_start_pair",
     )
     if train_args.get(key) is not None
 }
@@ -96,6 +104,17 @@ overrides.update(
     two_axis_rope=bool(train_args.get("two_axis_rope")),
     gated_compressed_rope=bool(train_args.get("gated_compressed_rope")),
 )
+if train_args.get("gated_compressed_rope"):
+    head_dim = (
+        getattr(cfg.layer.attention, "head_dim", None)
+        or cfg.dim // cfg.layer.attention.n_heads
+    )
+    overrides["gated_rope_start_pair"] = resolve_gated_rope_start_pair(
+        train_args,
+        state_dict,
+        n_complex_pairs=head_dim // 2,
+        default=cfg.gated_rope_start_pair,
+    )
 if overrides:
     cfg = dataclasses.replace(cfg, **overrides)
 model = Zip2ZipLlama3Model(cfg)
@@ -105,10 +124,6 @@ n_params = sum(p.numel() for p in model.parameters())
 print(f"  params: {n_params/1e6:.1f}M  (max_subtokens={cfg.max_subtokens})")
 
 # ── load checkpoint ───────────────────────────────────────────────────────────
-model_path = os.path.join(ckpt_dir, "model.pt")
-print(f"\nLoading checkpoint from {model_path} ...")
-state_dict = torch.load(model_path, map_location=DEVICE, weights_only=True)
-state_dict = prepare_inference_state_dict(state_dict, train_args)
 model.load_state_dict(state_dict, strict=True)
 print("  All keys matched perfectly (strict load).")
 
@@ -124,4 +139,39 @@ with torch.no_grad():
 logits = out[0] if isinstance(out, tuple) else out
 print(f"  logits shape: {logits.shape}")   # expected (B, T, vocab_size)
 print(f"  logits range: [{logits.min():.3f}, {logits.max():.3f}]")
+
+if cfg.gated_compressed_rope:
+    print("\nRunning compressed forward through gated RoPE...")
+    compressed_tokens = tokens[:1].clone()
+    compressed_tokens[0, T // 2] = cfg.vocab_size
+    codebook = torch.full(
+        (1, cfg.max_codebook_size, cfg.max_subtokens),
+        cfg.pad_token_id,
+        device=DEVICE,
+        dtype=torch.long,
+    )
+    codebook[0, 0, :2] = torch.tensor([1, 2], device=DEVICE)
+    before = model.gated_rope_forwards
+    with torch.no_grad():
+        compressed_out = model(
+            compressed_tokens,
+            codebook=codebook,
+            hyper_causal_mask=bool(
+                train_args.get("hyper_causal_mask", True)
+            ),
+        )
+    compressed_logits = (
+        compressed_out[0]
+        if isinstance(compressed_out, tuple)
+        else compressed_out
+    )
+    if model.gated_rope_forwards != before + 1:
+        raise RuntimeError("gated compressed forward did not activate RoPE gates")
+    if not torch.isfinite(compressed_logits).all():
+        raise RuntimeError("gated compressed forward produced non-finite logits")
+    print(
+        "  gated path active: "
+        f"shape={tuple(model.compressed_rope_gate.shape)} "
+        f"forwards={model.gated_rope_forwards}"
+    )
 print("\nDone — checkpoint loads and runs correctly.")
