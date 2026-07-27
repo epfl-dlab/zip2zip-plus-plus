@@ -31,7 +31,25 @@ Interpretation goal: understand whether the input and output hyper-encoders are
 learning different functions, rather than only measuring the final benchmark
 delta.
 
-Status: to run. (original checkpoints use false initialization)
+Result: comparison between `v0.6.4` and `vx0.6.4.1`.
+
+| Version | ARC-c | ARC-e | HellaSwag | OBQA | PIQA | WinoGrande | GSM8K strict \| flexible | Wiki byte_ppl↓ | gen_compression_ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `v0.6.4` | 0.5700 | **0.8304** | 0.7233 | 0.4660 | **0.8003** | **0.7443** | 0.215 \| **0.6770** | **1.6574** | **1.2593** |
+| `vx0.6.4.1` | **0.5751** | 0.8300 | **0.7247** | **0.4680** | 0.7982 | 0.7435 | **0.224** \| 0.5861 | 1.6592 | 1.2406 |
+
+Takeaway: the shared hyper-encoder is roughly neutral on multiple-choice tasks
+and Wiki byte-ppl, but it hurts GSM8K flexible extraction sharply (-9.1pt). This
+suggests that the input and output hyper-encoders may need to learn different
+functions, and that the untied design in `v0.6.4` remains important for
+generation.
+
+Note: this drop is larger than the earlier shared-hyper-encoder experiment on
+top of `v0.5`, where GSM8K flexible extraction was around 0.636. The current run
+also includes the base-token-position fix, so the interaction may be different.
+Since that earlier result was compared against `v0.5` rather than `v0.6.4`, it
+does not change the conclusion here.
+
 
 ### `vx0.6.4.2`: no residual initialization
 
