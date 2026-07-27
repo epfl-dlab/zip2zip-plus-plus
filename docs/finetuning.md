@@ -49,11 +49,11 @@ Three things worth knowing about how it behaves:
   superseded recipe prints a note; selecting a measured *negative*
   results (`v0.6` warm-start, `v0.6.1` deeper encoder) prints a loud warning.
 - **Measured negative results are marked `!`** and print a loud warning: `v0.6`
-  (warm-start), `v0.6.1` (deeper encoder) and `v0.6.5` (exact decoder-time mask).
-  They stay selectable purely so the experiment is reproducible.
-- **Unmeasured mainline candidates are marked `+`**. `v0.7` is the candidate on
-  the main `v0.x` line; it does not replace the validated v0.6.4 standard until
-  it is measured.
+  (warm-start), `v0.6.1` (deeper encoder), `v0.6.5` (exact decoder-time mask) and
+  `v0.7` (two-axis RoPE). They stay selectable purely so the experiment is
+  reproducible.
+- **Unmeasured mainline candidates are marked `+`.** There is none right now:
+  `v0.6.4` remains the standard and `v0.7` was measured and rejected.
 - **Exploratory `vx<base>.N` runs are marked `x`**. They are owned by
   Xinxian; the `v<base>` portion before the final `.N` names the mainline recipe
   they branch from (for example, `vx0.6.4.1` branches from `v0.6.4`). They are
@@ -687,11 +687,30 @@ smoke checkpoint before the full 8k pipeline. Record wall-clock time and inspect
 `online_skipped_targets`; otherwise its MC score is rejected rather than
 reported.
 
-## Two-axis RoPE (v0.7 — candidate, unmeasured)
+## Two-axis RoPE (v0.7 — measured negative)
 
-**Definition: `v0.7 = v0.6.4 + TWO_AXIS_ROPE=1`.** It deliberately branches
-from v0.6.4, not from the measured-negative v0.6.5. The current standard remains
-v0.6.4.
+**Definition: `v0.7 = v0.6.4 + TWO_AXIS_ROPE=1`.** It branched from v0.6.4, not
+from the measured-negative v0.6.5. **It lost. v0.6.4 remains the standard.**
+
+| metric | v0.6.4 | v0.7 | delta | ±2σ |
+|---|---|---|---|---|
+| GSM8K flexible-extract | .6770 | .6528 | **−2.4pt** | 3.7 |
+| MC average (6 tasks) | — | — | −0.17pt | — |
+| wikitext word ppl | 14.9049 | 14.9056 | +0.0007 | — |
+
+Read it as: **nothing moved.** The six multiple-choice tasks are individually
+and collectively indistinguishable from the baseline, and raw-text perplexity
+agrees to five figures. GSM8K fell by less than 2σ on its own, but it fell in
+both an earlier data-scrambled run (−4.4pt) and this clean one, and no metric
+improved. Every previous lever that worked moved GSM8K clearly and immediately —
+v0.6.2 +2.7pt, v0.6.4 +2.5pt — so a flat GSM8K here is the answer, not noise
+hiding a win.
+
+The verdict is stronger than "this recipe did not help": giving half the rotary
+pairs the compressed coordinate buys nothing, which is evidence against the
+dual-position hypothesis itself. The decoder does not want both geometries
+available; it wants the base geometry, which v0.6.2 already gives it on every
+pair. Do not revisit without a new argument.
 
 Every decoder attention head keeps the original complex RoPE pairs, but assigns
 their coordinates alternately:
@@ -719,7 +738,8 @@ geometry mid-run. Evaluation and compressed inference restore it automatically
 from `meta.pt`; results JSON records `two_axis_rope`. HF export is refused
 because the external runtime does not implement this geometry.
 
-Select the candidate with:
+The recipe stays selectable so the experiment is reproducible; it prints a loud
+warning:
 
 ```bash
 RECIPE=v0.7 bash scripts/pipeline_ft_eval_rcp.sh

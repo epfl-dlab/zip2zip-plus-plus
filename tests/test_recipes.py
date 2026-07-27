@@ -110,7 +110,7 @@ def main():
     check("R2_v07_is_v064_plus_two_axis_rope",
           R.resolve("v0.7") == EXPECTED_V07
           and R.RECIPES["v0.7"]["extends"] == "v0.6.4"
-          and R.RECIPES["v0.7"]["status"] == "candidate",
+          and R.RECIPES["v0.7"]["status"] == "negative",
           f"{sorted(R.resolve('v0.7').items())}")
 
     # ---- R3: ledger property — each version = parent + its own env block ----
@@ -202,11 +202,11 @@ def main():
         capture_output=True,
         text=True,
     )
-    check("R6_v07_candidate_warns_but_works",
+    check("R6_v07_negative_warns_but_works",
           candidate.returncode == 0
-          and "UNMEASURED CANDIDATE" in candidate.stderr
+          and "MEASURED NEGATIVE" in candidate.stderr
           and "TWO_AXIS_ROPE" in candidate.stdout,
-          "v0.7 resolves, but remains explicitly unmeasured")
+          "v0.7 still resolves, but warns it lost to v0.6.4")
 
     # ---- R7: identify() round-trip, for EVERY recipe ----
     wrong = []

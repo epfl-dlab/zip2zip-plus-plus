@@ -198,12 +198,18 @@ RECIPES = {
     },
     "v0.7": {
         "extends": "v0.6.4",
-        "status": "candidate",
+        "status": "negative",
         "description": "two-axis RoPE over base and compressed positions",
         "env": {"TWO_AXIS_ROPE": "1"},
-        "notes": "UNMEASURED: even complex RoPE pairs use base-stream positions "
-                 "and odd pairs use compressed-token positions in every decoder "
-                 "layer. The all-base path is unchanged.",
+        "notes": "MEASURED NEGATIVE (2026-07-27): even complex RoPE pairs take "
+                 "base-stream positions, odd pairs compressed-token positions. "
+                 "GSM8K .677 -> .653 (-2.4pt, within 2sd but negative in both a "
+                 "clean and a data-scrambled run), MC average -0.17pt = zero, and "
+                 "wikitext perplexity identical to five figures (14.9049 vs "
+                 "14.9056). Giving half the pairs the compressed coordinate buys "
+                 "nothing: the decoder wants the base geometry that v0.6.2 "
+                 "already gives it on every pair. Strong verdict against the "
+                 "dual-position hypothesis.",
     },
 }
 
