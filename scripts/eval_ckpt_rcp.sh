@@ -94,6 +94,10 @@ LIMIT=${LIMIT:-}
 TASKS=${TASKS:-}
 # EVAL_MODE=base for MAX_CODEBOOK_SIZE=0 control checkpoints (base-mode-only).
 EVAL_MODE=${EVAL_MODE:-}
+# EVAL_MAX_SUBTOKENS: eval-only LZW merge-size override. Unset follows meta.pt.
+# "0" normalizes to off so it cannot half-trigger the :+ passthrough.
+EVAL_MAX_SUBTOKENS=${EVAL_MAX_SUBTOKENS:-}
+[ "$EVAL_MAX_SUBTOKENS" = "0" ] && EVAL_MAX_SUBTOKENS=""
 # DISABLE_DIGIT_IDS=1: diagnostic — digits never LZW-merge into hypertokens.
 # "0" is normalized to off ("" ) so it cannot half-trigger the :+ passthrough.
 DISABLE_DIGIT_IDS=${DISABLE_DIGIT_IDS:-}
@@ -228,6 +232,7 @@ echo "  PRESET:      $PRESET"
 echo "  TASKS:       ${TASKS:-<preset default>}"
 echo "  LIMIT:       ${LIMIT:-<full>}"
 echo "  VARIANT:     $VARIANT_TAG"
+echo "  EVAL_MS:     ${EVAL_MAX_SUBTOKENS:-<checkpoint>}"
 echo "  WANDB:       $WANDB${WANDB_NAME:+ (name: eval-$WANDB_NAME)}${WANDB_PROJECT:+ (project: $WANDB_PROJECT)}"
 echo "  RESUME_ID:   ${RESUME_WANDB_ID:-<none>}${RESUME_WANDB_ID:+ (prefix: $WANDB_PREFIX${WANDB_STEP:+, step: $WANDB_STEP})}"
 echo "  LOGFILE:     $LOGFILE"
@@ -242,6 +247,7 @@ if [ -n "$CKPT_DIR" ]; then
         --resume_wandb_id none \
         --output_path "$OUTPUT_JSON" \
         ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
+        ${EVAL_MAX_SUBTOKENS:+--eval_max_subtokens "$EVAL_MAX_SUBTOKENS"} \
         ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
         ${DISABLE_MATHSYM_IDS:+--disable_mathsym_ids} \
         ${NO_ONLINE_CODEBOOK_MASK:+--no_online_codebook_mask} \
@@ -256,6 +262,7 @@ else
         --resume_wandb_id none \
         --output_path "$OUTPUT_JSON" \
         ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
+        ${EVAL_MAX_SUBTOKENS:+--eval_max_subtokens "$EVAL_MAX_SUBTOKENS"} \
         ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
         ${DISABLE_MATHSYM_IDS:+--disable_mathsym_ids} \
         ${NO_ONLINE_CODEBOOK_MASK:+--no_online_codebook_mask} \
@@ -267,14 +274,17 @@ fi
 # Same audit as the pipeline: the results JSON must record the flags we asked
 # for — a silently dropped flag fails loudly instead of producing numbers from
 # the wrong distribution.
-if [ -n "${EVAL_MODE:-}" ] || [ -n "${DISABLE_DIGIT_IDS:-}" ] || [ -n "${DISABLE_MATHSYM_IDS:-}" ]; then
-    python - "$OUTPUT_JSON" "${EVAL_MODE:-}" "${DISABLE_DIGIT_IDS:-}" "${DISABLE_MATHSYM_IDS:-}" <<'PY'
+if [ -n "${EVAL_MODE:-}" ] || [ -n "${EVAL_MAX_SUBTOKENS:-}" ] || [ -n "${DISABLE_DIGIT_IDS:-}" ] || [ -n "${DISABLE_MATHSYM_IDS:-}" ]; then
+    python - "$OUTPUT_JSON" "${EVAL_MODE:-}" "${EVAL_MAX_SUBTOKENS:-}" "${DISABLE_DIGIT_IDS:-}" "${DISABLE_MATHSYM_IDS:-}" <<'PY'
 import json, sys
-path, want_mode, want_digits, want_syms = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+path, want_mode, want_ms, want_digits, want_syms = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 args = json.load(open(path))["args"]
 if want_mode:
     got = args["eval_mode"]
     assert got == want_mode, f"eval-mode audit FAILED: {path} recorded {got!r}, expected {want_mode!r}"
+if want_ms:
+    got = args.get("eval_max_subtokens")
+    assert got == int(want_ms), f"eval-max-subtokens audit FAILED: {path} recorded {got!r}, expected {want_ms}"
 if want_digits:
     got = args.get("disable_digit_ids")
     assert got is True, f"digit-flag audit FAILED: {path} recorded disable_digit_ids={got!r}, expected True"

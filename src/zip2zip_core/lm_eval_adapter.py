@@ -92,7 +92,12 @@ def _fold_lora_weights(sd: dict, train_args: dict) -> dict:
     return out
 
 
-def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.dtype):
+def _load_zip2zip_checkpoint(
+    ckpt_dir: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    eval_max_subtokens: int | None = None,
+):
     """Load a checkpoint produced by zip2zip_core.train.
 
     Requires meta.pt to recover the training arguments and rebuilds
@@ -181,6 +186,25 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
         )
     if overrides:
         cfg = dataclasses.replace(cfg, **overrides)
+    checkpoint_max_subtokens = cfg.max_subtokens
+    if eval_max_subtokens is not None:
+        if eval_max_subtokens <= 0:
+            raise ValueError(
+                f"eval_max_subtokens must be positive, got {eval_max_subtokens}"
+            )
+        if eval_max_subtokens != checkpoint_max_subtokens:
+            if cfg.hyper_encoder_type not in ("hierarchical", "fast_hierarchical"):
+                raise ValueError(
+                    "eval_max_subtokens can only change checkpoint max_subtokens "
+                    "for hierarchical encoders. Flat hyper-encoders have "
+                    "length-shaped positional embeddings, so this override would "
+                    "not load the checkpoint safely."
+                )
+            cfg = dataclasses.replace(cfg, max_subtokens=eval_max_subtokens)
+            print(
+                "[zip2zip-lm-eval] eval max_subtokens override: "
+                f"checkpoint={checkpoint_max_subtokens} eval={eval_max_subtokens}"
+            )
 
     model = Zip2ZipLlama3Model(cfg)
     if not restore_encoder_residual(model, train_args):
@@ -224,6 +248,7 @@ class Zip2ZipLM(LM):
         online_codebook_mask: bool | None = None,
         disable_digit_ids: bool = False,
         disable_mathsym_ids: bool = False,
+        eval_max_subtokens: int | None = None,
     ):
         super().__init__()
         if not torch.cuda.is_available() and device.startswith("cuda"):
@@ -242,8 +267,12 @@ class Zip2ZipLM(LM):
             raise ValueError(f"eval_mode must be 'compressed' or 'base', got {eval_mode!r}")
 
         self.model, self.cfg, self.train_args = _load_zip2zip_checkpoint(
-            pretrained, self._device, self._dtype
+            pretrained, self._device, self._dtype, eval_max_subtokens=eval_max_subtokens
         )
+        self.checkpoint_max_subtokens = int(
+            (self.train_args or {}).get("max_subtokens", self.cfg.max_subtokens)
+        )
+        self.eval_max_subtokens = int(self.cfg.max_subtokens)
         if self.cfg.max_codebook_size == 0 and eval_mode == "compressed":
             # With max_codebook_size=0 the compressor is an exact identity, so
             # compressed scoring equals base scoring numerically — but slower

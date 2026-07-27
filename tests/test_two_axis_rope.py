@@ -664,6 +664,73 @@ def main():
                 loaders_ok,
                 "meta.pt restores geometry and reproduces the source forward",
             )
+
+            # ---- TA11b: eval-only merge-size transfer for hierarchical composer ----
+            hier_key = "_eval_max_subtokens_hier_test"
+            hier_cfg = dataclasses.replace(
+                loader_cfg, max_subtokens=3, hyper_encoder_type="hierarchical"
+            )
+            hier_model = build_model(hier_cfg, seed=11)
+            with tempfile.TemporaryDirectory() as hier_tmp:
+                torch.save(hier_model.state_dict(), os.path.join(hier_tmp, "model.pt"))
+                torch.save(
+                    {
+                        "args": {
+                            "model_config": hier_key,
+                            "max_subtokens": 3,
+                            "max_codebook_size": hier_cfg.max_codebook_size,
+                            "encoder_dim": hier_cfg.encoder_dim,
+                            "encoder_n_layers": hier_cfg.encoder_n_layers,
+                            "encoder_n_heads": hier_cfg.encoder_n_heads,
+                            "encoder_intermediate_size": hier_cfg.encoder_intermediate_size,
+                            "hyper_encoder_type": "hierarchical",
+                        }
+                    },
+                    os.path.join(hier_tmp, "meta.pt"),
+                )
+                adapter.zip2zip_llama_configs[hier_key] = hier_cfg
+                loaded_hier, loaded_hier_cfg, _ = adapter._load_zip2zip_checkpoint(
+                    hier_tmp, device, torch.float32, eval_max_subtokens=4
+                )
+                check(
+                    "TA11b_hier_eval_max_subtokens_override",
+                    loaded_hier_cfg.max_subtokens == 4
+                    and loaded_hier.zip2zip_config.max_subtokens == 4,
+                    "hierarchical checkpoints can widen the eval merge-size loop",
+                )
+                adapter.zip2zip_llama_configs.pop(hier_key, None)
+
+            flat_key = "_eval_max_subtokens_flat_test"
+            flat_cfg = dataclasses.replace(
+                loader_cfg, max_subtokens=3, hyper_encoder_type="flat"
+            )
+            flat_model = build_model(flat_cfg, seed=12)
+            with tempfile.TemporaryDirectory() as flat_tmp:
+                torch.save(flat_model.state_dict(), os.path.join(flat_tmp, "model.pt"))
+                torch.save({"args": {
+                    "model_config": flat_key,
+                    "max_subtokens": 3,
+                    "max_codebook_size": flat_cfg.max_codebook_size,
+                    "encoder_dim": flat_cfg.encoder_dim,
+                    "encoder_n_layers": flat_cfg.encoder_n_layers,
+                    "encoder_n_heads": flat_cfg.encoder_n_heads,
+                    "encoder_intermediate_size": flat_cfg.encoder_intermediate_size,
+                    "hyper_encoder_type": "flat",
+                }}, os.path.join(flat_tmp, "meta.pt"))
+                adapter.zip2zip_llama_configs[flat_key] = flat_cfg
+                flat_refused = raises(
+                    lambda: adapter._load_zip2zip_checkpoint(
+                        flat_tmp, device, torch.float32, eval_max_subtokens=4
+                    ),
+                    "Flat hyper-encoders",
+                )
+                check(
+                    "TA11b_flat_eval_max_subtokens_refused",
+                    flat_refused,
+                    "flat checkpoints have length-shaped positional embeddings",
+                )
+                adapter.zip2zip_llama_configs.pop(flat_key, None)
+
             inference_mod.zip2zip_llama_configs.pop(loader_key, None)
     finally:
         adapter.zip2zip_llama_configs.pop(loader_key, None)
