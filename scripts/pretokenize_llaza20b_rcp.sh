@@ -12,11 +12,16 @@
 #
 # ── Usage (Run:AI) ──────────────────────────────────────────────────────
 #
-#   runai submit --name pretok-llaza20b-phi \
+#   runai-rcp-prod submit --name pretok-llaza20b-phi \
 #     --image ghcr.io/jkminder/dlab-runai-images/pytorch:master \
-#     --cpu 32 --memory 128Gi \
+#     --cpu 16 --memory 128Gi \
 #     --pvc dlab-scratch:/mnt \
-#     -- "bash /dlabscratch1/<your-username>/code/zip2zip-core/scripts/pretokenize_llaza20b_rcp.sh"
+#     -- bash /dlabscratch1/<your-username>/code/zip2zip-core/scripts/pretokenize_llaza20b_rcp.sh
+#
+# Pass the command as a bare argument list, NOT as a quoted string and NOT as
+# `bash -c '...'`: the DLAB image entrypoint wraps whatever it receives in its own
+# `/bin/bash -c "..."`, so any quoting of your own is lost and an inline shell
+# snippet is truncated at the first `;`.
 #
 # For a Llama-tokenized corpus instead:
 #   TOKENIZER=$PWD/assets/hf_tokenizer/Llama-3.1-8B \
