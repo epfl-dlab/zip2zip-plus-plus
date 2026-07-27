@@ -64,7 +64,17 @@ have unusually high similarity to the first base token in the merged span (next 
 run tests whether that behavior is helpful structure or an initialization
 artifact.
 
-Status: to run.
+Result: comparison between `v0.6.4` and `vx0.6.4.2`.
+
+| Version | ARC-c | ARC-e | HellaSwag | OBQA | PIQA | WinoGrande | GSM8K strict \| flexible | Wiki byte_ppl↓ | gen_compression_ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `v0.6.4` | **0.5700** | **0.8304** | **0.7233** | **0.4660** | **0.8003** | **0.7443** | **0.215** \| **0.6770** | **1.6574** | **1.2593** |
+| `vx0.6.4.2` | 0.5367 | 0.8089 | 0.7104 | 0.4620 | 0.7976 | 0.7427 | 0.152 \| 0.6384 | 1.7052 | 1.2537 |
+
+Takeaway: removing residual initialization hurts broadly. Multiple-choice scores
+fall across the board, Wiki byte-ppl worsens substantially, and GSM8K flexible
+extraction drops by 3.9pt. The residual path therefore looks like useful
+structure rather than only an early-training optimization aid.
 
 ## Embedding Interpretation
 
