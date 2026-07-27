@@ -45,8 +45,8 @@
 #   TASKS=gsm8k     Comma-separated task override (default: preset's tasks)
 #   Z2Z_SCRATCH=...     Your PVC scratch dir (default: /dlabscratch1/gentilin)
 #   WANDB=1         Log results/samples/compression to W&B (default: off, JSON+log
-#                   only). Requires WANDB_API_KEY in the job env. Entity is
-#                   hardcoded to epfl-dlab in src/zip2zip_core/project.py.
+#                   only). Requires WANDB_API_KEY in the job env.
+#   WANDB_ENTITY=. W&B entity (default: epfl-dlab)
 #   WANDB_NAME=...  W&B run name; eval_harness.py prepends "eval-" automatically
 #                   (default: auto from checkpoint/repo name)
 #   WANDB_PROJECT=. W&B project (default: project.py's WANDB_PROJECT, i.e. llaza)
@@ -63,6 +63,7 @@
 #   WANDB_STEP=...  With RESUME_WANDB_ID: checkpoint step, logged on the
 #                   '<prefix>/step' x-axis so it lines up with the pipeline's
 #                   final evals (e.g. final/wikitext/*)
+#   EVAL_PATHS_ONLY=1  Print collision-safe log/result paths and exit (no eval).
 #
 set -euo pipefail
 
@@ -74,7 +75,7 @@ export TOKENIZERS_PARALLELISM=false
 PROJECT_DIR=${PROJECT_DIR:-$Z2Z_SCRATCH/code/zip2zip-core}
 LOG_DIR=$Z2Z_SCRATCH/logs/eval
 mkdir -p "$LOG_DIR"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+TIMESTAMP=${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 
 # ---------- config ----------
 HF_REPO=${HF_REPO:-}
@@ -108,13 +109,15 @@ NO_ONLINE_CODEBOOK_MASK=${NO_ONLINE_CODEBOOK_MASK:-}
 [ "$NO_ONLINE_CODEBOOK_MASK" = "0" ] && NO_ONLINE_CODEBOOK_MASK=""
 WANDB=${WANDB:-0}
 WANDB_NAME=${WANDB_NAME:-}
-WANDB_PROJECT=${WANDB_PROJECT:-}
+export WANDB_PROJECT=${WANDB_PROJECT:-llaza}
+export WANDB_ENTITY=${WANDB_ENTITY:-epfl-dlab}
 RESUME_WANDB_ID=${RESUME_WANDB_ID:-}
 WANDB_PREFIX=${WANDB_PREFIX:-final}
 WANDB_STEP=${WANDB_STEP:-}
 
-if [ -n "$RESUME_WANDB_ID" ] && [ -z "${WANDB_API_KEY:-}" ]; then
-    echo "RESUME_WANDB_ID is set but WANDB_API_KEY is empty — cannot log into the run." >&2
+if { [ -n "$RESUME_WANDB_ID" ] || [ "$WANDB" != "0" ]; } \
+    && [ -z "${WANDB_API_KEY:-}" ]; then
+    echo "W&B logging is enabled but WANDB_API_KEY is empty." >&2
     exit 1
 fi
 
@@ -126,8 +129,31 @@ else
 fi
 TASKS_SUFFIX=${TASKS:+_${TASKS//,/-}}
 
-LOGFILE="$LOG_DIR/eval_${MODEL_SHORT}_${PRESET}${TASKS_SUFFIX}_${TIMESTAMP}.log"
-OUTPUT_JSON="$LOG_DIR/results_${MODEL_SHORT}_${PRESET}${TASKS_SUFFIX}_${TIMESTAMP}.json"
+# Include the requested evaluation regime in the human-readable tag. "auto"
+# means the adapter chooses compressed/base from the checkpoint. A unique
+# pod/process suffix prevents same-second jobs (including identical retries)
+# from overwriting one another.
+MODE_TAG=$(printf '%s' "${EVAL_MODE:-auto}" | tr -cs '[:alnum:]._-' '_')
+VARIANT_TAG="mode-${MODE_TAG}"
+[ -n "$DISABLE_DIGIT_IDS" ] && VARIANT_TAG="${VARIANT_TAG}-nodigits"
+[ -n "$DISABLE_MATHSYM_IDS" ] && VARIANT_TAG="${VARIANT_TAG}-nomathsym"
+[ -n "$NO_ONLINE_CODEBOOK_MASK" ] && VARIANT_TAG="${VARIANT_TAG}-legacycbmask"
+if [ -n "$LIMIT" ]; then
+    LIMIT_TAG=$(printf '%s' "$LIMIT" | tr -cs '[:alnum:]._-' '_')
+    VARIANT_TAG="${VARIANT_TAG}-limit${LIMIT_TAG}"
+fi
+INSTANCE_RAW="${RUNAI_JOB_NAME:-local}-${HOSTNAME:-host}-$$"
+INSTANCE_TAG=$(printf '%s' "$INSTANCE_RAW" | tr -cs '[:alnum:]._-' '_')
+ARTIFACT_STEM="${MODEL_SHORT}_${PRESET}${TASKS_SUFFIX}_${VARIANT_TAG}_${TIMESTAMP}_${INSTANCE_TAG}"
+
+LOGFILE="$LOG_DIR/eval_${ARTIFACT_STEM}.log"
+OUTPUT_JSON="$LOG_DIR/results_${ARTIFACT_STEM}.json"
+
+if [ "${EVAL_PATHS_ONLY:-0}" != "0" ]; then
+    echo "LOGFILE=$LOGFILE"
+    echo "OUTPUT_JSON=$OUTPUT_JSON"
+    exit 0
+fi
 
 # ---------- venv ----------
 VENV_DIR=$Z2Z_SCRATCH/.venvs/lm-eval
@@ -136,7 +162,11 @@ if [ ! -f "$VENV_DIR/bin/activate" ]; then
     python -m venv --system-site-packages "$VENV_DIR"
 fi
 source "$VENV_DIR/bin/activate"
-pip install --quiet "lm-eval==0.4.9" "huggingface_hub" wandb
+pip install --quiet \
+    "lm-eval==0.4.9" \
+    "huggingface_hub" \
+    "zip2zip-compression>=0.3.3" \
+    wandb
 
 # Verify the resume target EXISTS before spending an hour of GPU. The upload runs
 # LAST, so a wrong id used to surface only after the whole eval had finished — and
@@ -145,7 +175,7 @@ pip install --quiet "lm-eval==0.4.9" "huggingface_hub" wandb
 # contains training steps: a crashed pipeline that Run:AI retried leaves several
 # short logs, each with its OWN freshly-generated run_id that was never created.
 if [ -n "$RESUME_WANDB_ID" ]; then
-    python - "$RESUME_WANDB_ID" "${WANDB_PROJECT:-zip2zip-core}" "${WANDB_ENTITY:-epfl-dlab}" <<'PY' || exit 1
+    python - "$RESUME_WANDB_ID" "$WANDB_PROJECT" "$WANDB_ENTITY" <<'PY' || exit 1
 import sys
 import wandb
 run_id, project, entity = sys.argv[1:4]
@@ -197,6 +227,7 @@ echo "  TOKENIZER:   $TOKENIZER"
 echo "  PRESET:      $PRESET"
 echo "  TASKS:       ${TASKS:-<preset default>}"
 echo "  LIMIT:       ${LIMIT:-<full>}"
+echo "  VARIANT:     $VARIANT_TAG"
 echo "  WANDB:       $WANDB${WANDB_NAME:+ (name: eval-$WANDB_NAME)}${WANDB_PROJECT:+ (project: $WANDB_PROJECT)}"
 echo "  RESUME_ID:   ${RESUME_WANDB_ID:-<none>}${RESUME_WANDB_ID:+ (prefix: $WANDB_PREFIX${WANDB_STEP:+, step: $WANDB_STEP})}"
 echo "  LOGFILE:     $LOGFILE"
@@ -265,7 +296,8 @@ if [ -n "$RESUME_WANDB_ID" ]; then
     python scripts/log_results_to_wandb.py \
         --json "$OUTPUT_JSON" \
         --resume_id "$RESUME_WANDB_ID" \
-        ${WANDB_PROJECT:+--project "$WANDB_PROJECT"} \
+        --entity "$WANDB_ENTITY" \
+        --project "$WANDB_PROJECT" \
         --prefix "$WANDB_PREFIX" \
         ${WANDB_STEP:+--step "$WANDB_STEP"} \
         $RESOLVE_PENDING \

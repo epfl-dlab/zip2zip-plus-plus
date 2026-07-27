@@ -267,6 +267,8 @@ def main():
         "model_config", "seq_len", "max_subtokens", "max_codebook_size",
         "max_active_codebook_size", "lora_rank", "lora_alpha",
         "hyper_causal_mask", "base_token_positions", "two_axis_rope",
+        "gated_compressed_rope", "gated_rope_start_layer",
+        "base_view_replay_prob",
         "online_codebook_mask", "no_remap_codebook", "data_dir", "tokenizer",
     )
     replay_args = {key: lm.train_args.get(key) for key in replay_arg_keys}

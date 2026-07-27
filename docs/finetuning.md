@@ -52,8 +52,9 @@ Three things worth knowing about how it behaves:
   (warm-start), `v0.6.1` (deeper encoder), `v0.6.5` (exact decoder-time mask) and
   `v0.7` (two-axis RoPE). They stay selectable purely so the experiment is
   reproducible.
-- **Unmeasured mainline candidates are marked `+`.** There is none right now:
-  `v0.6.4` remains the standard and `v0.7` was measured and rejected.
+- **Unmeasured mainline candidates are marked `+`.** `v0.7.1` is the current
+  candidate; `v0.6.4` remains the standard until the candidate passes its
+  paired acceptance criteria.
 - **Exploratory `vx<base>.N` runs are marked `x`**. They are owned by
   Xinxian; the `v<base>` portion before the final `.N` names the mainline recipe
   they branch from (for example, `vx0.6.4.1` branches from `v0.6.4`). They are
@@ -751,6 +752,91 @@ four-GPU smoke checking finite forward/backward values, the resolved
 started by implementing or selecting the recipe; launch remains an explicit
 operator action.
 
+## Gated compressed-position RoPE with base replay (v0.7.1 — candidate)
+
+**Definition: `v0.7.1 = v0.6.4 + GATED_COMPRESSED_ROPE=1 +
+GATED_ROPE_START_LAYER=16 + BASE_VIEW_REPLAY_PROB=0.25`.** It branches from
+v0.6.4, not v0.7: the rejected hard 50/50 frequency split remains available
+only through `RECIPE=v0.7`.
+
+For active decoder layer `l` and complex pair `i`, v0.7.1 uses
+
+`p_effective = p_base + gate[l,i] * (p_compressed - p_base)`.
+
+The gates are direct learned coefficients initialized to zero, so the initial
+attention geometry is exactly v0.6.4. Only zero-based layers 16-31 of the
+32-layer Phi decoder receive gates. The lower half retains the pretrained
+base-stream geometry implicated by the v0.7 checkpoint comparison.
+
+One quarter of training microbatches use the ordinary uncompressed token view
+with no codebook. Replay selection is stateless, identical on every distributed
+rank, and recoverable from `(step, gradient_accumulation_steps)`. With the
+canonical four accumulation microsteps, microstep 0 is base replay and
+microsteps 1-3 are compressed. The final microstep is always compressed so all
+hyper-encoder gradients participate in distributed reduction.
+
+All three levers are default-off/default-neutral outside the named recipe.
+`meta.pt` records the gated flag, start layer, replay probability, and
+accumulation schedule; resume rejects a mismatch. Evaluation and direct
+inference restore the gated geometry automatically. Evaluation JSON records
+`gated_compressed_rope` and `gated_rope_start_layer`, and the pipeline audits
+both after every smoke and final evaluation. The external HF runtime does not
+implement this geometry, so export remains refused.
+
+Before launching, update
+`/dlabscratch1/gentilin/code/zip2zip-core` to the pushed
+`finetuning-andrea` commit, verify that the eosfix dataset and masks exist at
+the path below, and choose a `RUN_NAME` that has never been used (the pipeline
+intentionally rejects an existing output directory). The commands below use
+`WANDB=0` and require no API key; checkpoints, evaluation JSON, and logs remain
+under `/dlabscratch1/gentilin`. `NUM_WORKERS=0` is required for the matched
+investigation run and exact resumable loader state.
+
+First run the four-H100, 20-step end-to-end smoke:
+
+```bash
+runai-rcp-prod submit --name smoke-z2z-v071 \
+  --image ghcr.io/jkminder/dlab-runai-images/pytorch:master \
+  --gpu 4 --cpu 16 --memory 128Gi \
+  --pvc dlab-scratch:/mnt --large-shm --node-pools h100 \
+  --environment WANDB=0 --environment NUM_WORKERS=0 \
+  --environment DATA_DIR=/dlabscratch1/gentilin/datasets/phi-1B-sft-8shards-eosfix \
+  --environment RUN_NAME=andrea-z2z-phi35-4B-gatedrope-replay-smoke-v0.7.1 \
+  --environment RECIPE=v0.7.1 \
+  --environment SEED=42 \
+  --environment STEPS=20 --environment SAVE_FREQ=20 --environment LOG_FREQ=1 \
+  --environment SMOKE_EVERY=20 --environment SMOKE_LIMIT=8 \
+  --environment FINAL_LIMIT=8 --environment SKIP_FULL_PPL=1 \
+  -- "bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
+```
+
+The smoke passes only if the job exits zero; loss, gradients, and gate values
+remain finite; the gate receives a nonzero update; the banner and `meta.pt`
+identify v0.7.1's exact `1/16/0.25` settings; one in four microbatches is base
+replay; and the smoke/final JSON geometry audits pass.
+
+After the smoke, launch the full seed-42 pipeline:
+
+```bash
+runai-rcp-prod submit --name ft-z2z-v071 \
+  --image ghcr.io/jkminder/dlab-runai-images/pytorch:master \
+  --gpu 4 --cpu 16 --memory 128Gi \
+  --pvc dlab-scratch:/mnt --large-shm --node-pools h100 \
+  --environment WANDB=0 --environment NUM_WORKERS=0 \
+  --environment DATA_DIR=/dlabscratch1/gentilin/datasets/phi-1B-sft-8shards-eosfix \
+  --environment RUN_NAME=andrea-z2z-phi35-4B-gatedrope-replay-1BData-v0.7.1-Zip2zipCore \
+  --environment RECIPE=v0.7.1 \
+  --environment SEED=42 \
+  -- "bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
+```
+
+For a decision rather than a single-run observation, repeat matched v0.6.4 and
+v0.7.1 runs with `SEED=43` and fresh names. Promote v0.7.1 only if it beats the
+matched v0.6.4 compressed GSM8K score in both seeds, improves the two-seed mean
+by at least 1.0 point, stays within 0.5 point in base mode, keeps WikiText
+perplexity within 1%, and preserves the same prompt compression ratio.
+Otherwise stop this positional branch and keep v0.6.4.
+
 ## Canonical RCP locations and run conventions
 
 Single source of truth for where things live on the cluster (`$SCRATCH =
@@ -775,7 +861,9 @@ smoke-evals every 1000-step checkpoint (arc_easy/hellaswag/winogrande/gsm8k_boxe
 wikitext perplexity on the final checkpoint (all sample tables in W&B), and appends
 every RCP artifact path plus the ready-made 4-corpora-perplexity command to the run
 notes. All in ONE W&B run named `RUN_NAME`; hard-fails on an existing output dir
-(never suffixes `(1)`). Rehearse pipeline changes first with
+(never suffixes `(1)`). With `WANDB=0`, the same train, smoke, final evaluation,
+and audit phases run without an API key or uploads; JSON/log/checkpoint artifacts
+remain on the PVC. Rehearse pipeline changes first with
 `STEPS=20 SAVE_FREQ=10 SMOKE_EVERY=10 SMOKE_LIMIT=8 FINAL_LIMIT=8` (~30 min).
 For manual/partial runs the individual pieces remain: `finetune_phi35_rcp.sh`,
 `diagnose_ckpt_rcp.sh` (15-min sanity gate: train-style replay must land near the

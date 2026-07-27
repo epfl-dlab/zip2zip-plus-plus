@@ -84,6 +84,74 @@ def build_two_axis_rope_inputs(
     return mixed_freqs.reshape(batch_size * seq_len, n_complex_pairs), lookup_positions
 
 
+def build_gated_rope_inputs(
+    freqs_cis: torch.Tensor,
+    base_positions: torch.Tensor,
+    gate: torch.Tensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build one layer's gated base/compressed RoPE cache.
+
+    For complex pair ``i`` the phase is
+
+      base_phase + gate[i] * (compressed_phase - base_phase).
+
+    ``gate == 0`` therefore preserves base-position RoPE exactly, while
+    ``gate == 1`` reaches compressed-index RoPE.  The inverse frequencies are
+    recovered from cache row 1, whose phases are all in ``[0, 1]`` radians for
+    the supported RoPE configurations, so no phase unwrapping is needed.
+    """
+    if not torch.is_complex(freqs_cis) or freqs_cis.ndim != 2:
+        raise ValueError("gated_compressed_rope requires a 2D complex RoPE cache")
+    if freqs_cis.shape[0] < max(2, seq_len):
+        raise ValueError(
+            "gated_compressed_rope needs at least "
+            f"{max(2, seq_len)} RoPE cache rows, got {freqs_cis.shape[0]}"
+        )
+
+    n_complex_pairs = freqs_cis.shape[-1]
+    if gate.ndim != 1 or gate.shape[0] != n_complex_pairs:
+        raise ValueError(
+            "gated_compressed_rope gate must have shape "
+            f"({n_complex_pairs},), got {tuple(gate.shape)}"
+        )
+    if base_positions.shape == (1, seq_len):
+        base_positions = base_positions.expand(batch_size, -1)
+    elif base_positions.shape != (batch_size, seq_len):
+        raise ValueError(
+            "gated_compressed_rope base positions must have shape "
+            f"(1, {seq_len}) or ({batch_size}, {seq_len}), "
+            f"got {tuple(base_positions.shape)}"
+        )
+
+    base_freqs = freqs_cis[base_positions]
+    compressed_positions = torch.arange(
+        seq_len, device=base_positions.device, dtype=base_positions.dtype
+    ).view(1, seq_len)
+    delta_positions = compressed_positions - base_positions
+
+    # Row 1 is exp(i * inv_freq). Multiplying the base cache by the delta
+    # rotation avoids reconstructing/wrapping the absolute base phase.
+    inv_freq = torch.angle(freqs_cis[1]).to(device=gate.device)
+    delta_phase = (
+        delta_positions.to(dtype=inv_freq.dtype).unsqueeze(-1)
+        * inv_freq.view(1, 1, n_complex_pairs)
+        * gate.to(dtype=inv_freq.dtype).view(1, 1, n_complex_pairs)
+    )
+    delta_rotation = torch.polar(torch.ones_like(delta_phase), delta_phase)
+    gated_freqs = base_freqs * delta_rotation
+
+    lookup_positions = torch.arange(
+        batch_size * seq_len, device=freqs_cis.device, dtype=torch.long
+    ).view(batch_size, seq_len)
+    return (
+        gated_freqs.reshape(batch_size * seq_len, n_complex_pairs),
+        lookup_positions,
+    )
+
+
 def restore_encoder_residual(model: nn.Module, train_args: dict) -> bool:
     """Restore the checkpoint's behavior-only encoder residual setting."""
     enabled = not bool(train_args.get("no_encoder_residual", False))
@@ -627,6 +695,12 @@ class Zip2ZipLlama3Model(Decoder):
         # odd pairs use the compressed-token index. Requires
         # base_token_positions=True. Off preserves the single-axis path exactly.
         two_axis_rope: bool = False
+        # Learn a per-layer/per-complex-pair interpolation from pretrained
+        # base-stream RoPE (gate=0) toward compressed-index RoPE (gate=1).
+        # Only layers at or above gated_rope_start_layer are changed. This is
+        # mutually exclusive with the fixed 50/50 two-axis experiment.
+        gated_compressed_rope: bool = False
+        gated_rope_start_layer: int = 16
         # Guarantee the hyper-encoder emits EXACTLY zero at init, so the first
         # hypertoken embedding equals its first base token's embedding (the
         # documented intent of the encoder_residual design). The existing
@@ -669,10 +743,15 @@ class Zip2ZipLlama3Model(Decoder):
             )
 
     def __init__(self, config: Config):
-        if config.two_axis_rope:
+        if config.two_axis_rope and config.gated_compressed_rope:
+            raise ValueError(
+                "two_axis_rope and gated_compressed_rope are mutually exclusive"
+            )
+        if config.two_axis_rope or config.gated_compressed_rope:
             if not config.base_token_positions:
                 raise ValueError(
-                    "two_axis_rope requires base_token_positions=True"
+                    "two_axis_rope/gated_compressed_rope requires "
+                    "base_token_positions=True"
                 )
             attention_config = config.layer.attention
             if (
@@ -681,7 +760,8 @@ class Zip2ZipLlama3Model(Decoder):
                 or not getattr(attention_config, "use_rope", False)
             ):
                 raise ValueError(
-                    "two_axis_rope requires complex RoPE enabled in the decoder attention"
+                    "two_axis_rope/gated_compressed_rope requires complex RoPE "
+                    "enabled in the decoder attention"
                 )
             head_dim = (
                 getattr(attention_config, "head_dim", None)
@@ -689,15 +769,36 @@ class Zip2ZipLlama3Model(Decoder):
             )
             if config.rope.dim != head_dim:
                 raise ValueError(
-                    "two_axis_rope requires rope.dim to match the decoder "
+                    "two_axis_rope/gated_compressed_rope requires rope.dim to "
+                    "match the decoder "
                     f"attention head_dim ({config.rope.dim} != {head_dim})"
                 )
-            if head_dim % 4:
+            if config.two_axis_rope and head_dim % 4:
                 raise ValueError(
                     "two_axis_rope requires attention head_dim divisible by 4"
                 )
+            if config.gated_compressed_rope and not (
+                0 <= config.gated_rope_start_layer < config.n_layers
+            ):
+                raise ValueError(
+                    "gated_rope_start_layer must be in "
+                    f"[0, {config.n_layers}), got {config.gated_rope_start_layer}"
+                )
         super().__init__(config)
         self.zip2zip_config = config
+        head_dim = (
+            getattr(config.layer.attention, "head_dim", None)
+            or config.dim // config.layer.attention.n_heads
+        )
+        if config.gated_compressed_rope:
+            self.compressed_rope_gate = nn.Parameter(
+                torch.zeros(
+                    config.n_layers - config.gated_rope_start_layer,
+                    head_dim // 2,
+                )
+            )
+        else:
+            self.register_parameter("compressed_rope_gate", None)
         if config.share_hyper_encoder_weights and config.tie_hyper_encoder:
             raise ValueError("share_hyper_encoder_weights requires tie_hyper_encoder=False")
 
@@ -728,6 +829,7 @@ class Zip2ZipLlama3Model(Decoder):
         # config banner alone cannot tell the two apart. Plain int: never reaches
         # the state dict or FSDP.
         self.two_axis_forwards: int = 0
+        self.gated_rope_forwards: int = 0
         # Which module(s) init_weights() zeroed per encoder role, so a zero-init
         # that silently matches nothing is visible. Populated by
         # _init_hyper_encoder; plain dict, so it never reaches the state dict or
@@ -769,6 +871,8 @@ class Zip2ZipLlama3Model(Decoder):
 
     def init_weights(self, **kwargs):
         super().init_weights(**kwargs)
+        if self.compressed_rope_gate is not None:
+            nn.init.zeros_(self.compressed_rope_gate)
 
         # Initialize token type head
         if self.token_type_head is not None:
@@ -1161,23 +1265,63 @@ class Zip2ZipLlama3Model(Decoder):
                     f"{tuple(layer_freqs_cis.shape)} {layer_freqs_cis.dtype}"
                 )
 
+        gated_rope_active = (
+            self.zip2zip_config.gated_compressed_rope
+            and positions is not None
+        )
+        if gated_rope_active:
+            if positions is None:
+                raise RuntimeError(
+                    "gated_compressed_rope requires base-space positions for "
+                    "compressed input"
+                )
+            self.gated_rope_forwards += 1
+            if self.gated_rope_forwards == 1:
+                print(
+                    "[gated_compressed_rope] active: "
+                    f"layers={self.zip2zip_config.gated_rope_start_layer}-"
+                    f"{self.zip2zip_config.n_layers - 1} "
+                    f"gate_shape={tuple(self.compressed_rope_gate.shape)}"
+                )
+
         use_ac = getattr(self, "gradient_checkpointing", False) and self.training
         with torch.profiler.record_function("Main LM"):
             for layer_id, layer in enumerate(self.layers.values()):
                 with torch.profiler.record_function(f"layer_{layer_id}"):
+                    current_freqs_cis = layer_freqs_cis
+                    current_positions = layer_positions
+                    if (
+                        gated_rope_active
+                        and layer_id >= self.zip2zip_config.gated_rope_start_layer
+                    ):
+                        gate_row = self.compressed_rope_gate[
+                            layer_id - self.zip2zip_config.gated_rope_start_layer
+                        ]
+                        current_freqs_cis, current_positions = (
+                            build_gated_rope_inputs(
+                                self.freqs_cis,
+                                positions,
+                                gate_row,
+                                batch_size=tokens.shape[0],
+                                seq_len=tokens.shape[1],
+                            )
+                        )
                     if use_ac:
                         # Recompute layer activations in backward to save memory.
                         h = torch.utils.checkpoint.checkpoint(
                             layer,
                             h,
-                            layer_freqs_cis,
+                            current_freqs_cis,
                             attention_masks,
-                            layer_positions,
+                            current_positions,
                             use_reentrant=False,
                         )
                     else:
                         h = layer(
-                            h, layer_freqs_cis, attention_masks, layer_positions
+                            h,
+                            current_freqs_cis,
+                            attention_masks,
+                            current_positions,
                         )
 
         h = self.norm(h) if self.norm is not None else h

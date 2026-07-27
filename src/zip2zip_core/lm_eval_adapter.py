@@ -35,6 +35,10 @@ from zip2zip_compression import (
 )
 
 from zip2zip_core.configs import zip2zip_llama_configs
+from zip2zip_core.checkpoint import (
+    prepare_inference_state_dict,
+    strip_wrapper_prefixes,
+)
 from zip2zip_core.data import online_codebook_counts, online_unavailable_targets
 from zip2zip_core.disabled_ids import base_disabled_ids, digit_ids
 from zip2zip_core.model import Zip2ZipLlama3Model, restore_encoder_residual
@@ -58,11 +62,8 @@ _DISABLED_IDS_BY_TOKENIZER = {
 
 
 def _strip_wrapper_prefixes(state_dict: dict) -> dict:
-    out = {}
-    for k, v in state_dict.items():
-        k = k.replace("_fsdp_wrapped_module.", "").replace("_orig_mod.", "")
-        out[k] = v
-    return out
+    """Backward-compatible wrapper around the shared checkpoint helper."""
+    return strip_wrapper_prefixes(state_dict)
 
 
 def _fold_lora_weights(sd: dict, train_args: dict) -> dict:
@@ -74,39 +75,43 @@ def _fold_lora_weights(sd: dict, train_args: dict) -> dict:
     rename to X.weight — otherwise load_state_dict(strict=False) silently skips
     every decoder weight and the model scores with random layers.
     """
-    bases = [k[: -len(".base_layer.weight")] for k in sd if k.endswith(".base_layer.weight")]
-    if not bases:
-        return sd
-    rank = train_args.get("lora_rank") or 0
-    alpha = train_args.get("lora_alpha") or 1.0
-    scaling = (alpha / rank) if rank else 1.0
-    out = dict(sd)
-    for base in bases:
-        w = out.pop(f"{base}.base_layer.weight")
-        a = out.pop(f"{base}.lora_A.weight", None)
-        b = out.pop(f"{base}.lora_B.weight", None)
-        if a is not None and b is not None:
-            w = w.float() + (b.float() @ a.float()) * scaling
-        out[f"{base}.weight"] = w
-        bias = out.pop(f"{base}.base_layer.bias", None)
-        if bias is not None:
-            out[f"{base}.bias"] = bias
-    print(f"[zip2zip-lm-eval] folded LoRA into {len(bases)} linear layers (scaling={scaling:g})")
+    bases = [
+        k[: -len(".base_layer.weight")]
+        for k in sd
+        if k.endswith(".base_layer.weight")
+    ]
+    out = prepare_inference_state_dict(sd, train_args)
+    if bases:
+        rank = int(train_args["lora_rank"])
+        scaling = float(train_args["lora_alpha"]) / rank
+        print(
+            f"[zip2zip-lm-eval] folded LoRA into {len(bases)} linear layers "
+            f"(scaling={scaling:g})"
+        )
     return out
 
 
 def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.dtype):
     """Load a checkpoint produced by zip2zip_core.train.
 
-    Reads meta.pt (if present) to recover the training arguments and rebuilds
-    the matching model config; loads model.pt non-strictly so older B/C/recon
-    experiment checkpoints still load.
+    Requires meta.pt to recover the training arguments and rebuilds
+    the matching model config; strictly loads normalized model weights so an
+    incomplete or structurally mismatched checkpoint cannot score silently.
     """
     meta_path = os.path.join(ckpt_dir, "meta.pt")
-    train_args: dict = {}
-    if os.path.exists(meta_path):
-        meta = torch.load(meta_path, map_location="cpu", weights_only=False)
-        train_args = meta.get("args", {}) or {}
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(
+            f"required checkpoint metadata is missing: {meta_path}; evaluation "
+            "cannot safely restore behavior-only model settings"
+        )
+    meta = torch.load(meta_path, map_location="cpu", weights_only=False)
+    if not isinstance(meta, dict):
+        raise ValueError(f"checkpoint metadata {meta_path} must be a dictionary")
+    train_args = meta.get("args")
+    if not isinstance(train_args, dict) or not train_args:
+        raise ValueError(
+            f"checkpoint args in {meta_path} must be a non-empty dictionary"
+        )
 
     cfg_key = train_args.get("model_config", "1B")
     cfg = zip2zip_llama_configs[cfg_key]
@@ -144,6 +149,17 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
     if train_args.get("two_axis_rope"):
         overrides["two_axis_rope"] = True
         print("[zip2zip-lm-eval] two-axis RoPE: enabled from meta.pt")
+    if train_args.get("gated_compressed_rope"):
+        overrides["gated_compressed_rope"] = True
+        if train_args.get("gated_rope_start_layer") is not None:
+            overrides["gated_rope_start_layer"] = int(
+                train_args["gated_rope_start_layer"]
+            )
+        print(
+            "[zip2zip-lm-eval] gated compressed-coordinate RoPE: enabled "
+            f"from layer {overrides.get('gated_rope_start_layer', cfg.gated_rope_start_layer)} "
+            "from meta.pt"
+        )
     if overrides:
         cfg = dataclasses.replace(cfg, **overrides)
 
@@ -170,25 +186,10 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
     )
     sd = _strip_wrapper_prefixes(sd)
     sd = _fold_lora_weights(sd, train_args)
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    if missing:
-        print(f"[zip2zip-lm-eval] missing keys ({len(missing)}): {missing[:5]}")
-    if unexpected:
-        print(f"[zip2zip-lm-eval] unexpected keys ({len(unexpected)}): {unexpected[:5]}")
-
-    # The load is strict=False (LoRA folding leaves benign gaps), so a config that
-    # is tied while the checkpoint is untied would SILENTLY leave the output
-    # encoder at random init. Hard-fail if the output encoder never got weights.
-    if (
-        not cfg.tie_hyper_encoder
-        and not cfg.share_hyper_encoder_weights
-        and any(k.startswith("hyper_output") for k in missing)
-    ):
-        raise RuntimeError(
-            "untied checkpoint is missing hyper_output.* weights after load — the "
-            "output encoder would score with random weights. Check the checkpoint "
-            "and the untied_hyper_encoder flag in its meta.pt."
-        )
+    # Canonical training checkpoints are complete after wrapper normalization and
+    # LoRA folding.  A permissive load can otherwise evaluate random decoder or
+    # hyper-encoder weights while merely printing a warning.
+    model.load_state_dict(sd, strict=True)
 
     model.eval()
     return model, cfg, train_args

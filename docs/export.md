@@ -4,12 +4,18 @@
 
 zip2zip-core (training) and [zip2zip](https://github.com/epfl-dlab/zip2zip) (inference) use different model formats. This document covers the export process and how the two formats relate.
 
+Both `model.pt` and its matching `meta.pt` are required. Export fails when
+metadata is absent because behavior-only position geometry cannot be inferred
+from weights safely. Encoder residual mode is restored from metadata by
+default; the manual exporter accepts `--residual` or `--no_residual` only as
+explicit overrides.
+
 ## Format comparison
 
 | | zip2zip-core (torchtitan) | zip2zip (HuggingFace) |
 |---|---|---|
 | **Decoder weights** | `model.pt` (torchtitan keys) | `model.safetensors` (HF Llama keys) |
-| **Encoder weights** | Inside `model.pt` (`hyper_encoder.*`) | `encoders.safetensors` (`input_encoder.*`) |
+| **Encoder weights** | Inside `model.pt` (`hyper_encoder.*`, optional `hyper_output.*`) | `encoders.safetensors` (`input_encoder.*`, optional `output_encoder.*`) |
 | **Config** | `meta.pt` (training args) | `zip2zip_config.json` |
 | **Optimizer** | `optimizer.pt` | Not included |
 | **HF branch** | `main` | `hf` |
@@ -62,12 +68,13 @@ export(
 )
 ```
 
-Checkpoints whose `meta.pt` records `base_token_positions` or `two_axis_rope`
-are intentionally refused by both export paths. The external HuggingFace
-runtime currently assigns one compressed-index RoPE position to every decoder
-token; exporting either geometry would load successfully but evaluate with the
-wrong attention. Use the in-core evaluation/inference paths until equivalent
-runtime support exists.
+Checkpoints whose `meta.pt` records `base_token_positions`, `two_axis_rope`, or
+`gated_compressed_rope` are intentionally refused by both export paths. The
+external HuggingFace runtime currently assigns one compressed-index RoPE
+position to every decoder token and has no learned per-layer position gates;
+exporting any of these geometries would load successfully but evaluate with
+the wrong attention. This includes v0.7.1. Use the in-core
+evaluation/inference paths until equivalent runtime support exists.
 
 ### Batch export
 
@@ -86,8 +93,10 @@ The `export()` function in `src/zip2zip_core/export.py` performs these steps:
 `model.pt` contains both decoder and encoder weights. The state dict is split into:
 
 - **Decoder keys**: `tok_embeddings.*`, `layers.*`, `norm.*`, `output.*`
-- **Encoder keys**: `hyper_encoder.*` (prefix stripped)
-- **Skipped keys**: `token_type_head.*`, `hyper_output.*` (not used by inference)
+- **Input-encoder keys**: `hyper_encoder.*` (prefix stripped)
+- **Output-encoder keys**: `hyper_output.*` for untied checkpoints (prefix
+  stripped and retained)
+- **Skipped keys**: `token_type_head.*` (not used by inference)
 
 ### 2. Convert decoder weights
 
@@ -108,7 +117,11 @@ Decoder weights use torchtitan naming conventions. `Llama3StateDictAdapter.to_hf
 
 ### 3. Save encoder weights
 
-Encoder weights are prefixed with `input_encoder.` and saved to `encoders.safetensors`. The `tie_encoders=True` config means the input encoder is shared as the output encoder (no separate `output_encoder.*` weights).
+Input-encoder weights are prefixed with `input_encoder.` and saved to
+`encoders.safetensors`. For an untied checkpoint, `hyper_output.*` is also
+saved as `output_encoder.*` and the generated config sets
+`tie_encoders=false`. A tied checkpoint contains only `input_encoder.*` and
+sets `tie_encoders=true`.
 
 ### 4. Generate zip2zip_config.json
 

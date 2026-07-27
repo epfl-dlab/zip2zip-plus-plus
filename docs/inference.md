@@ -33,7 +33,12 @@ python scripts/inference.py \
     --ckpt-dir /path/to/step_6000
 ```
 
-This script loads the `Zip2ZipLlama3Model` directly from `model.pt` and uses `CodebookManager` (Rust LZW state machine) to drive autoregressive generation.
+This script loads the `Zip2ZipLlama3Model` directly from `model.pt`, folds
+training-time LoRA adapters into the decoder, and uses `CodebookManager` (the
+Rust LZW state machine) to drive autoregressive generation. Hyper-token outputs
+are expanded back to base tokens before updating the dictionary and decoding.
+Behavior-only geometry is recovered from `meta.pt`, including base positions,
+legacy v0.7 two-axis RoPE, and v0.7.1 gated compressed-position RoPE.
 
 There is also `scripts/generate.py` with a similar interface using `Zip2ZipTokenizer` for encoding/decoding.
 

@@ -95,6 +95,9 @@ Three `runai submit`-ready wrappers, all under `scripts/`, sharing the `Z2Z_SCRA
 
 All three write JSON results + a `tee`'d log to `$Z2Z_SCRATCH/logs/eval`, with the model name
 (and task name, if `TASKS` is set) baked into the output filename for traceability.
+Training-checkpoint evaluation requires the matching `meta.pt` and fails before
+scoring if it is absent; otherwise behavior-only RoPE settings could silently
+fall back to the wrong geometry.
 `eval_ckpt_rcp.sh` can additionally log to W&B (results, per-sample tables, compression
 ratios): set `WANDB=1` + `WANDB_NAME`/`WANDB_PROJECT`, and pass `WANDB_API_KEY` into the
 job env. Run names get an `eval-` prefix automatically.
@@ -162,6 +165,13 @@ could restore:
   odd pairs use compressed-token positions in every decoder layer. The results
   JSON records `base_token_positions` and `two_axis_rope`, and the pipeline
   audits the latter when `RECIPE=v0.7`.
+- `gated compressed-coordinate RoPE: enabled ... from meta.pt` — required for a v0.7.1
+  checkpoint. It confirms that the learned compressed-coordinate delta was
+  restored and reports its first active decoder layer (16 for the named
+  recipe). Results JSON records `gated_compressed_rope` and
+  `gated_rope_start_layer`; the pipeline audits both after every smoke, final,
+  and WikiText evaluation. `base_view_replay_prob` is training provenance in
+  `meta.pt`, not an evaluation switch.
 - `hyper-encoder residual: disabled from meta.pt` — for a checkpoint trained with
   `NO_ENCODER_RESIDUAL=1` (an ablation; no production run uses it). This is the one
   line that appears only in the *non-default* case, so its absence is normal and

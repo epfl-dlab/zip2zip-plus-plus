@@ -129,6 +129,7 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         online_codebook_mask: bool = False,
         max_active_codebook_size: int | None = None,
         debug_samples: int = 0,
+        include_base_view: bool = False,
     ):
         self.data_dir = data_dir
         self.seq_len = seq_len
@@ -139,6 +140,7 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         self.mode = mode
         self.remap_codebook = remap_codebook
         self.online_codebook_mask = online_codebook_mask
+        self.include_base_view = include_base_view
         self.max_active_codebook_size = (
             max_codebook_size
             if max_active_codebook_size is None
@@ -168,6 +170,8 @@ class Zip2ZipDataset(IterableDataset, Stateful):
             )
         if self.online_codebook_mask and self.mode != "lm":
             raise ValueError("online_codebook_mask is supported only in mode='lm'")
+        if self.include_base_view and self.mode != "lm":
+            raise ValueError("include_base_view is supported only in mode='lm'")
         if self.online_codebook_mask and self.remap_codebook:
             raise ValueError(
                 "online_codebook_mask requires remap_codebook=False because "
@@ -320,6 +324,74 @@ class Zip2ZipDataset(IterableDataset, Stateful):
             offset += span_len
         return torch.BoolTensor(compressed_mask)
 
+    def _count_unmasked_target_base_tokens(self, labels, codebook) -> int:
+        """Base tokens represented by labels that actually enter the loss.
+
+        ``n_base_tokens`` is a reporting denominator, not a description of the
+        whole input window. Counting prompt/input spans or targets subsequently
+        replaced by ``-100`` understates nats/base-token and overstates the
+        effective compression ratio on assistant-masked corpora.
+        """
+        cb_dict = codebook.to_dict()
+        total = 0
+        for tok in labels.tolist():
+            tok = int(tok)
+            if tok == -100:
+                continue
+            total += len(cb_dict[tok]) if tok >= self.initial_vocab_size else 1
+        return total
+
+    def _make_base_view(self, chunk, chunk_mask):
+        """An uncompressed CLM window from the same raw ``2 * seq_len`` chunk.
+
+        For masked corpora, choose the earliest length-``seq_len`` target window
+        with the most valid labels. This is deterministic across ranks/workers,
+        preserves the original assistant mask, and avoids selecting an all-masked
+        base replay view when the compressed sample itself has valid targets.
+        """
+        n = self.seq_len
+        if len(chunk) < n + 1:
+            raise ValueError(
+                f"base replay needs at least seq_len+1={n + 1} raw tokens, "
+                f"got {len(chunk)}"
+            )
+
+        start = 0
+        mask = None
+        if chunk_mask is not None:
+            mask = np.asarray(chunk_mask, dtype=np.bool_)
+            if len(mask) != len(chunk):
+                raise ValueError(
+                    f"base replay chunk/mask length mismatch: "
+                    f"{len(chunk)} vs {len(mask)}"
+                )
+            # For start s, labels correspond to raw mask[s+1 : s+n+1].
+            prefix = np.concatenate(
+                [np.zeros(1, dtype=np.int64), np.cumsum(mask, dtype=np.int64)]
+            )
+            n_starts = len(chunk) - n
+            valid_counts = (
+                prefix[n + 1 : n + 1 + n_starts]
+                - prefix[1 : 1 + n_starts]
+            )
+            start = int(valid_counts.argmax())
+
+        base_input = torch.LongTensor(chunk[start : start + n])
+        base_labels = torch.LongTensor(chunk[start + 1 : start + n + 1])
+        if mask is not None:
+            target_mask = torch.from_numpy(
+                mask[start + 1 : start + n + 1].copy()
+            )
+            base_labels[~target_mask] = -100
+
+        base_n_base_tokens = int((base_labels != -100).sum().item())
+        if base_n_base_tokens == 0:
+            raise RuntimeError(
+                "base replay selected an all-masked window from a compressed "
+                "sample that was expected to contain valid targets"
+            )
+        return base_input, base_labels, base_n_base_tokens
+
     def _iter_lm(self, shards, mask_shards=None):
         """Original language modeling mode: next-token prediction on compressed sequences."""
         while True:
@@ -398,13 +470,6 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                         )
                         continue
 
-                    # Count base tokens represented by compressed sequence
-                    cb_dict = codebook.to_dict()
-                    n_base_tokens = sum(
-                        len(cb_dict[tok]) if tok >= self.initial_vocab_size else 1
-                        for tok in compressed
-                    )
-
                     x = torch.LongTensor(compressed[:-1])
                     y = torch.LongTensor(compressed[1:])
                     if chunk_mask is not None:
@@ -440,6 +505,13 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                         if not (y != -100).any():
                             continue
 
+                    # Reporting denominator: only target labels that survived
+                    # every mask above contribute, expanded back to base space.
+                    # This deliberately does not affect ``backward_loss``.
+                    n_base_tokens = self._count_unmasked_target_base_tokens(
+                        y, codebook
+                    )
+
                     cb = self._codebook_to_tensor(codebook)
 
                     # Remap to compact codebook
@@ -458,6 +530,12 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                         "codebook": cb,
                         "n_base_tokens": n_base_tokens,
                     }
+                    if self.include_base_view:
+                        (
+                            sample["base_input"],
+                            sample["base_labels"],
+                            sample["base_n_base_tokens"],
+                        ) = self._make_base_view(chunk, chunk_mask)
                     if self.online_codebook_mask:
                         sample["codebook_counts"] = available_counts
                         sample["online_skipped_targets"] = online_skipped_targets
@@ -775,6 +853,21 @@ def remap_collate_fn(batch, pad_token_id, max_subtokens, max_active_codebook_siz
         "codebook": codebooks,
         "n_base_tokens": n_base_tokens,
     }
+    base_fields = {"base_input", "base_labels", "base_n_base_tokens"}
+    has_base_fields = [base_fields <= set(inp) for inp in inputs_list]
+    if any(has_base_fields):
+        if not all(has_base_fields):
+            raise ValueError("base replay fields must be present on every sample")
+        inputs["base_input"] = torch.stack(
+            [inp["base_input"] for inp in inputs_list]
+        )
+        inputs["base_labels"] = torch.stack(
+            [inp["base_labels"] for inp in inputs_list]
+        )
+        inputs["base_n_base_tokens"] = torch.tensor(
+            [inp["base_n_base_tokens"] for inp in inputs_list],
+            dtype=torch.long,
+        )
     if "codebook_counts" in inputs_list[0]:
         inputs["codebook_counts"] = torch.stack(
             [inp["codebook_counts"] for inp in inputs_list]
@@ -804,6 +897,7 @@ def build_dataloader(
     remap_codebook: bool = True,
     online_codebook_mask: bool = False,
     debug_samples: int = 0,
+    include_base_view: bool = False,
 ) -> DataLoader:
     """Build a Zip2Zip DataLoader with remapping collation."""
     dataset = Zip2ZipDataset(
@@ -820,6 +914,7 @@ def build_dataloader(
         remap_codebook=remap_codebook,
         online_codebook_mask=online_codebook_mask,
         max_active_codebook_size=max_active_codebook_size,
+        include_base_view=include_base_view,
         debug_samples=debug_samples,
     )
 

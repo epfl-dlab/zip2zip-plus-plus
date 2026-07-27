@@ -9,8 +9,8 @@ under pytest.
 Invariants proven:
   R1  the registry is internally consistent: exactly one status=current, CURRENT
       points at it, every `extends` resolves, no inheritance cycles.
-  R2  v0.6.4 resolves to the five validated levers; v0.6.5 and v0.7 are
-      exactly that parent plus their single experimental lever.
+  R2  v0.6.4 resolves to the five validated levers; the archived experiments
+      and v0.7.1 resolve to their exact declared deltas.
   R3  the ledger property: every recipe differs from its parent by exactly the
       keys in its own `env` block (so the file reads as "parent + one change").
   R4  every env key any recipe sets is ACTUALLY CONSUMED by both launchers — the
@@ -23,7 +23,9 @@ Invariants proven:
       an off-recipe checkpoint is reported as custom with the right diff.
   R8  docs/finetuning.md documents CURRENT and lists exactly its resolved levers
       (anti-drift: the docs table cannot silently disagree with the code).
+  R9  the RCP launcher forwards the complete v0.7.1 contract and training seed.
 """
+import ast
 import os
 import re
 import subprocess
@@ -77,6 +79,12 @@ EXPECTED_V07 = {
     **EXPECTED_V064,
     "TWO_AXIS_ROPE": "1",
 }
+EXPECTED_V071 = {
+    **EXPECTED_V064,
+    "GATED_COMPRESSED_ROPE": "1",
+    "GATED_ROPE_START_LAYER": "16",
+    "BASE_VIEW_REPLAY_PROB": "0.25",
+}
 
 
 def bash(script):
@@ -112,16 +120,44 @@ def main():
           and R.RECIPES["v0.7"]["extends"] == "v0.6.4"
           and R.RECIPES["v0.7"]["status"] == "negative",
           f"{sorted(R.resolve('v0.7').items())}")
+    check("R2_v071_is_v064_plus_gated_rope_and_replay",
+          R.resolve("v0.7.1") == EXPECTED_V071
+          and R.RECIPES["v0.7.1"]["extends"] == "v0.6.4"
+          and R.RECIPES["v0.7.1"]["status"] == "candidate"
+          and "TWO_AXIS_ROPE" not in R.resolve("v0.7.1"),
+          f"{sorted(R.resolve('v0.7.1').items())}")
 
     # ---- R2b: resume-hard coverage for levers that live OUTSIDE ENV_KEYS ----
     # lora_alpha sets scaling = alpha/rank as a runtime attribute, so a resume
     # that changes it loads weights fine and silently changes the model.
-    import zip2zip_core.train as _train_mod, inspect as _inspect
-    _hard_src = _inspect.getsource(_train_mod.validate_resume_args)
-    _missing = [k for k in ("lora_alpha", "hyper_causal_mask", "no_remap_codebook")
-                if f'"{k}"' not in _hard_src]
+    # Read the source instead of importing train.py: launch hosts may not have
+    # torch installed yet, and this registry suite is intentionally stdlib-only.
+    _train_src = open(
+        os.path.join(REPO, "src", "zip2zip_core", "train.py")
+    ).read()
+    _train_ast = ast.parse(_train_src)
+    _resume_node = next(
+        node
+        for node in _train_ast.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "validate_resume_args"
+    )
+    _hard_src = ast.get_source_segment(_train_src, _resume_node) or ""
+    _missing = [
+        k
+        for k in (
+            "lora_alpha",
+            "hyper_causal_mask",
+            "no_remap_codebook",
+            "gated_compressed_rope",
+            "gated_rope_start_layer",
+            "base_view_replay_prob",
+            "gradient_accumulation_steps",
+        )
+        if f'"{k}"' not in _hard_src
+    ]
     check("R2b_runtime_only_levers_are_resume_hard", not _missing,
-          "lora_alpha/hyper_causal_mask/no_remap_codebook are compared on resume"
+          "runtime geometry/replay/accumulation levers are compared on resume"
           if not _missing else f"NOT in the hard list: {_missing}")
 
     # ---- R3: ledger property — each version = parent + its own env block ----
@@ -185,7 +221,16 @@ def main():
     )
     check("R5_v07_explicit_off_wins",
           bash(v07_cmd).stdout.strip() == "0",
-          "TWO_AXIS_ROPE=0 overrides the v0.7 candidate")
+          "TWO_AXIS_ROPE=0 overrides the archived v0.7 recipe")
+    v071_cmd = (
+        f'R=$({sys.executable} scripts/recipes.py v0.7.1 2>/dev/null); '
+        'GATED_COMPRESSED_ROPE=0; BASE_VIEW_REPLAY_PROB=0.10; '
+        'eval "$R"; printf "%s|%s|%s|%s" "$GATED_COMPRESSED_ROPE" '
+        '"$GATED_ROPE_START_LAYER" "$BASE_VIEW_REPLAY_PROB" "${TWO_AXIS_ROPE-unset}"'
+    )
+    check("R5_v071_explicit_overrides_win",
+          bash(v071_cmd).stdout.strip() == "0|16|0.10|unset",
+          "explicit gate-off/replay override wins and legacy two-axis stays unset")
 
     # ---- R6: unknown name is fatal ----
     bad = subprocess.run([sys.executable, RECIPES_PY, "v9.9"],
@@ -218,6 +263,17 @@ def main():
           and "MEASURED NEGATIVE" in candidate.stderr
           and "TWO_AXIS_ROPE" in candidate.stdout,
           "v0.7 still resolves, but warns it lost to v0.6.4")
+    v071 = subprocess.run(
+        [sys.executable, RECIPES_PY, "v0.7.1"],
+        capture_output=True,
+        text=True,
+    )
+    check("R6_v071_candidate_warns_but_works",
+          v071.returncode == 0
+          and "UNMEASURED CANDIDATE" in v071.stderr
+          and "GATED_COMPRESSED_ROPE" in v071.stdout
+          and "BASE_VIEW_REPLAY_PROB" in v071.stdout,
+          "v0.7.1 resolves all levers and remains explicitly unmeasured")
 
     # ---- R7: identify() round-trip, for EVERY recipe ----
     wrong = []
@@ -271,6 +327,27 @@ def main():
           f"docs lists {sorted(listed.items())}"
           if listed == resolved else
           f"MISMATCH docs={sorted(listed.items())} code={sorted(resolved.items())}")
+
+    # ---- R9: launcher forwards the exact low-level contract ----
+    finetune_src = open(LAUNCHERS[0]).read()
+    required_cli = {
+        "--gated_compressed_rope",
+        '--gated_rope_start_layer "$GATED_ROPE_START_LAYER"',
+        '--base_view_replay_prob "$BASE_VIEW_REPLAY_PROB"',
+        '--seed "$SEED"',
+    }
+    missing_cli = sorted(fragment for fragment in required_cli
+                         if fragment not in finetune_src)
+    check("R9_finetune_forwards_v071_and_seed", not missing_cli,
+          "gated flag, layer, replay, and seed reach train.py"
+          if not missing_cli else f"missing launcher fragments: {missing_cli}")
+
+    pipeline_src = open(LAUNCHERS[1]).read()
+    audit_fields = ("gated_compressed_rope", "gated_rope_start_layer")
+    missing_audit = [field for field in audit_fields if field not in pipeline_src]
+    check("R9_pipeline_audits_gated_eval_geometry", not missing_audit,
+          "final/smoke JSONs audit the restored gated geometry"
+          if not missing_audit else f"missing audit fields: {missing_audit}")
 
     return summarize(results)
 

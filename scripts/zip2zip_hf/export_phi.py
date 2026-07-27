@@ -38,8 +38,10 @@ import torch
 from zip2zip_core.configs import zip2zip_llama_configs
 from zip2zip_core.disabled_ids import compute_disabled_ids
 from zip2zip_core.export import (
-    _split_state_dict, _infer_encoder_config, _merge_lora_weights, _lora_scaling_from_meta,
-    _disable_digit_ids_from_meta, _resolve_encoder_n_heads, refuse_base_token_positions,
+    _split_state_dict, _infer_encoder_config, _prepare_export_state_dict,
+    _disable_digit_ids_from_meta, _resolve_encoder_n_heads,
+    _encoder_residual_from_meta, _validate_hf_decoder_state_dict,
+    refuse_base_token_positions,
 )
 
 PHI_TOKENIZER = "microsoft/Phi-3.5-mini-instruct"
@@ -114,7 +116,7 @@ def main():
     model_pt = os.path.join(args.ckpt_dir, "model.pt")
     print(f"Loading {model_pt} ...")
     sd = torch.load(model_pt, map_location="cpu", weights_only=True)
-    sd = _merge_lora_weights(sd, _lora_scaling_from_meta(args.ckpt_dir))
+    sd = _prepare_export_state_dict(sd, args.ckpt_dir)
     decoder_sd, encoder_sd, output_encoder_sd = _split_state_dict(sd)
     untied = bool(output_encoder_sd)
     enc_info = _infer_encoder_config(sd)
@@ -123,6 +125,7 @@ def main():
     print("Converting decoder -> HF-Llama -> fused Phi3 ...")
     adapter = Llama3StateDictAdapter(cfg, None)   # cfg has .layer.attention.n_heads/.dim
     hf_llama_sd = adapter.to_hf(decoder_sd)
+    _validate_hf_decoder_state_dict(hf_llama_sd, n_layers)
     phi3_sd = _fuse_llama_to_phi3(hf_llama_sd, n_layers)
     save_file({k: v.contiguous().clone() for k, v in phi3_sd.items()},
               os.path.join(args.output_dir, "model.safetensors"))
@@ -172,6 +175,7 @@ def main():
 
     # ---- zip2zip_config.json (self-contained base + training-time compression) ----
     n_heads = _resolve_encoder_n_heads(args.ckpt_dir, enc_info["hidden_size"], args.encoder_n_heads)
+    residual = _encoder_residual_from_meta(args.ckpt_dir)
     z = {
         "base_model_name_or_path": os.path.abspath(args.output_dir),
         "encoder_type": "res_latent_attn",
@@ -182,7 +186,7 @@ def main():
             "intermediate_size": enc_info["intermediate_size"],
             "num_heads": n_heads,
             "causal": False,
-            "residual": True,
+            "residual": residual,
             "tie_encoders": not untied,
             "position_encoding": None,
         },
@@ -196,7 +200,7 @@ def main():
     with open(os.path.join(args.output_dir, "zip2zip_config.json"), "w") as f:
         json.dump(z, f, indent=2)
     print(f"  wrote zip2zip_config.json (initial_vocab_size={vocab_size}, "
-          f"max_subtokens={enc_info['max_subtokens']})")
+          f"max_subtokens={enc_info['max_subtokens']}, residual={residual})")
 
     # Carry meta.pt along so check_export_consistency.py has train_args to
     # compare against -- without this it silently "passes" with nothing checked.

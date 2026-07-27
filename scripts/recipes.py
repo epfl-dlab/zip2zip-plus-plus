@@ -37,8 +37,9 @@ CLI:
 
 ADDING A RECIPE. Add one entry whose `extends` names its parent and whose `env`
 holds ONLY the keys that change. That is this project's versioning convention
-(vX.Y = parent + exactly one change) expressed in code, so this file doubles as
-the experiment ledger: you can read what v0.6.4 is by reading four short blocks.
+(vX.Y = parent + one coherent design change; coordinated settings may require
+more than one key) expressed in code, so this file doubles as the experiment
+ledger: you can read what v0.6.4 is by reading four short blocks.
 
 Stdlib only — the launchers must be able to run this with whatever `python` is
 on PATH, before any venv exists. (`--identify` imports torch lazily; no launcher
@@ -66,6 +67,9 @@ ENV_KEYS = {
     "HYPER_ENCODER_TYPE":       ("hyper_encoder_type",       "str",   "flat"),
     "BASE_TOKEN_POSITIONS":     ("base_token_positions",     "flag",  False),
     "TWO_AXIS_ROPE":            ("two_axis_rope",            "flag",  False),
+    "GATED_COMPRESSED_ROPE":    ("gated_compressed_rope",     "flag",  False),
+    "GATED_ROPE_START_LAYER":   ("gated_rope_start_layer",    "int",   16),
+    "BASE_VIEW_REPLAY_PROB":    ("base_view_replay_prob",     "float", 0.0),
     "ZERO_INIT_ENCODER_OUTPUT": ("zero_init_encoder_output", "flag",  False),
     "NO_ENCODER_RESIDUAL":      ("no_encoder_residual",      "flag",  False),
     "ONLINE_CODEBOOK_MASK":     ("online_codebook_mask",     "flag",  False),
@@ -210,6 +214,20 @@ RECIPES = {
                  "nothing: the decoder wants the base geometry that v0.6.2 "
                  "already gives it on every pair. Strong verdict against the "
                  "dual-position hypothesis.",
+    },
+    "v0.7.1": {
+        "extends": "v0.6.4",
+        "status": "candidate",
+        "description": "zero-gated compressed-position RoPE in upper layers with base replay",
+        "env": {
+            "GATED_COMPRESSED_ROPE": "1",
+            "GATED_ROPE_START_LAYER": "16",
+            "BASE_VIEW_REPLAY_PROB": "0.25",
+        },
+        "notes": "UNMEASURED: preserves base-stream RoPE exactly at initialization, "
+                 "learns a compressed-coordinate delta only in decoder layers 16-31, "
+                 "and replays ordinary base-token views for 25% of microbatches. "
+                 "Branches from v0.6.4; it does not inherit v0.7's hard 50/50 split.",
     },
 }
 

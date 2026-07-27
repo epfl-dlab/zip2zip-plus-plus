@@ -1,8 +1,9 @@
 #!/bin/bash
 # Finetune -> eval pipeline for the RCP cluster (Run:AI). ONE sequential job,
-# ONE W&B run containing: training curves, smoke-eval curves per checkpoint
-# (own x-axis 'smoke/step'), the full final eval incl. all per-sample tables
-# (GSM8K generations visible in W&B), and notes pointing at every RCP artifact.
+# With WANDB=1 (default), one W&B run contains training curves, smoke-eval
+# curves, final metrics/sample tables, and artifact notes. With WANDB=0 the
+# same train/eval/audit phases run without an API key or network uploads; JSON,
+# checkpoint, and log artifacts remain on the PVC.
 #
 #   runai submit --name ft-<run-name> \
 #     --image ghcr.io/jkminder/dlab-runai-images/pytorch:master \
@@ -15,20 +16,19 @@
 #
 # Phases (all logged to one pipeline log, job aborts on the first failure):
 #   0. preflight   hard-fail on: existing output dir (no silent "(1)" suffixes),
-#                  missing data/masks, missing WANDB_API_KEY
+#                  missing data/masks, and (only with WANDB=1) missing API key
 #   1. train       scripts/finetune_phi35_rcp.sh (its own env/venv), 4 GPUs,
-#                  W&B run created under a pre-chosen id = one run for everything
+#                  optionally creates the shared W&B run
 #   2. smoke       every SMOKE_EVERY-th checkpoint: arc_easy,hellaswag,winogrande,
-#                  gsm8k_boxed @ LIMIT=SMOKE_LIMIT -> logged into the same W&B run
-#                  at x = smoke/step (1 GPU)
+#                  gsm8k_boxed @ LIMIT=SMOKE_LIMIT -> JSON always, plus W&B
+#                  smoke/step curves when enabled (1 GPU)
 #   3. final eval  last checkpoint: full 'default' preset (with all sample tables
-#                  -> W&B) + wikitext perplexity (logged under final/)
-#   4. notes       append final-ckpt path, RCP log paths, and a copy-paste-ready
-#                  runai command for the remaining perplexity corpora that logs
-#                  into this same W&B run (eval_ckpt_rcp.sh RESUME_WANDB_ID)
+#                  in JSON and optionally W&B) + wikitext perplexity
+#   4. artifacts   WANDB=1: append paths and the remaining-perplexity command to
+#                  W&B notes. WANDB=0: print the same local artifact paths.
 #
 # Env vars:
-#   RUN_NAME=...      (required) also the W&B run name — make it exhaustive
+#   RUN_NAME=...      required output name; also the W&B name when enabled
 #   RECIPE=v0.6.4     (recommended) the named recipe: fills in every recipe env
 #                     var you did not set yourself. THIS IS THE CURRENT STANDARD
 #                     RECIPE — see `python scripts/recipes.py --list`. Explicit
@@ -41,6 +41,9 @@
 #   SMOKE_TASKS=arc_easy,hellaswag,winogrande,gsm8k_boxed
 #   TOKENIZER=microsoft/Phi-3.5-mini-instruct
 #   WANDB_PROJECT=zip2zip-core
+#   WANDB_ENTITY=epfl-dlab  W&B entity used consistently by train/eval/backfill
+#   WANDB=1         one W&B train/eval run (default); requires WANDB_API_KEY
+#   WANDB=0         fully offline: no API-key check and no W&B logging/uploads
 #   SKIP_SMOKE=0      set 1 to skip intermediate smoke evals
 #   SKIP_FULL_PPL=0   set 1 to also skip the wikitext perplexity in phase 3
 #   EVAL_MODE=        force eval_harness --eval_mode for all evals; set to
@@ -68,8 +71,17 @@
 #                     (v0.6.2 recipe). Inherited by the train launcher; evals
 #                     auto-configure from meta.pt like the untied flag.
 #   TWO_AXIS_ROPE=    set 1 to split complex RoPE pairs between base-stream
-#                     and compressed-token positions (v0.7 candidate). Requires
+#                     and compressed-token positions (v0.7 negative result).
+#                     Requires
 #                     BASE_TOKEN_POSITIONS=1; evals auto-configure from meta.pt.
+#   GATED_COMPRESSED_ROPE= set 1 for v0.7.1's zero-initialized learned
+#                     compressed-position delta. Mutually exclusive with
+#                     TWO_AXIS_ROPE; eval restores it from meta.pt.
+#   GATED_ROPE_START_LAYER= first decoder layer using the learned delta
+#                     (v0.7.1: 16, so only layers 16-31 in Phi-3.5).
+#   BASE_VIEW_REPLAY_PROB= fraction of training microbatches replayed as
+#                     ordinary base-token views (v0.7.1: 0.25). Training-only;
+#                     recorded in meta.pt and deterministic across ranks/resume.
 #   TOKEN_TYPE_LOSS_WEIGHT= auxiliary base-vs-hyper type loss weight
 #                     (v0.6.3 recipe, 0.05). 0/off = v0.6.2 behavior. Inherited
 #                     by the train launcher; evals auto-configure from meta.pt.
@@ -85,6 +97,8 @@
 #                     already incremental.
 #   FINAL_LIMIT=      per-task sample limit for the FINAL eval (default: full).
 #                     Only for pipeline rehearsals — never for real numbers.
+#   SEED=42           training seed forwarded to train.py.
+#   NUM_WORKERS=1     dataloader workers; set 0 for exact resumable matched runs
 # Anything else the finetune launcher reads (LR, SEQ_LEN, ...) passes through.
 #
 # REHEARSE THE PIPELINE FIRST (~30 min end-to-end, exercises every phase):
@@ -100,7 +114,7 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
 PROJECT_DIR=${PROJECT_DIR:-$Z2Z_SCRATCH/code/zip2zip-core}
-RUN_NAME=${RUN_NAME:?Must set RUN_NAME (also becomes the W&B run name)}
+RUN_NAME=${RUN_NAME:?Must set RUN_NAME (output name and optional W&B run name)}
 
 # Resolve a named recipe HERE, before anything below reads these variables: the
 # digit-protection preflight and every eval phase consume them in THIS process,
@@ -120,11 +134,13 @@ fi
 export RECIPE
 export DATA_DIR=${DATA_DIR:-$Z2Z_SCRATCH/datasets/phi-1B-sft-8shards-eosfix}
 export STEPS=${STEPS:-8000}
+export SEED=${SEED:-42}
 SMOKE_EVERY=${SMOKE_EVERY:-1000}
 SMOKE_LIMIT=${SMOKE_LIMIT:-200}
 SMOKE_TASKS=${SMOKE_TASKS:-arc_easy,hellaswag,winogrande,gsm8k_boxed}
 TOKENIZER=${TOKENIZER:-microsoft/Phi-3.5-mini-instruct}
 export WANDB_PROJECT=${WANDB_PROJECT:-zip2zip-core}
+export WANDB_ENTITY=${WANDB_ENTITY:-epfl-dlab}
 SKIP_SMOKE=${SKIP_SMOKE:-0}
 SKIP_FULL_PPL=${SKIP_FULL_PPL:-0}
 FINAL_LIMIT=${FINAL_LIMIT:-}
@@ -137,13 +153,30 @@ mkdir -p "$EVAL_LOG_DIR" "$PIPE_LOG_DIR"
 TS=$(date +%Y%m%d_%H%M%S)
 PIPELINE_LOG="$PIPE_LOG_DIR/pipeline_${RUN_NAME}_${TS}.log"
 
-# One pre-chosen W&B id ties train + evals into a single run.
-export WANDB_ID=$(python - <<'PY'
+# One pre-chosen W&B id ties train + evals into a single run. Offline runs keep
+# it empty and never call a W&B logger/uploader.
+export WANDB=${WANDB:-1}
+WANDB_ID=${WANDB_ID:-}
+if [ "$WANDB" = "0" ]; then
+    WANDB_ID=""
+elif [ -z "${WANDB_API_KEY:-}" ]; then
+    echo "FATAL: WANDB=1 requires WANDB_API_KEY for the shared train/eval run."
+    echo "Set WANDB=0 to run the complete pipeline offline."
+    exit 1
+elif [ -z "$WANDB_ID" ]; then
+    _wandb_py=$(command -v python3 || command -v python || echo "$PROJECT_DIR/.venv/bin/python")
+    [ -x "$_wandb_py" ] || {
+        echo "FATAL: no Python interpreter found to generate WANDB_ID." >&2
+        exit 1
+    }
+    WANDB_ID=$("$_wandb_py" - <<'PY'
 import secrets, string
 print("".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8)))
 PY
 )
-export WANDB=1
+    unset _wandb_py
+fi
+export WANDB_ID
 export RUN_NAME
 
 {
@@ -152,10 +185,14 @@ echo "  RUN_NAME:    $RUN_NAME"
 echo "  RECIPE:      ${RECIPE:-<none, explicit env only>}"
 echo "  OUTPUT_DIR:  $OUTPUT_DIR"
 echo "  DATA_DIR:    $DATA_DIR"
-echo "  STEPS:       $STEPS  SMOKE_EVERY: $SMOKE_EVERY  SMOKE_LIMIT: $SMOKE_LIMIT"
+echo "  STEPS:       $STEPS  SEED: $SEED  SMOKE_EVERY: $SMOKE_EVERY  SMOKE_LIMIT: $SMOKE_LIMIT"
 echo "  SMOKE_TASKS: $SMOKE_TASKS"
 echo "  SKIP_SMOKE:  $SKIP_SMOKE"
-echo "  W&B:         project=$WANDB_PROJECT run_id=$WANDB_ID name=$RUN_NAME"
+if [ "$WANDB" = "0" ]; then
+    echo "  W&B:         disabled (offline JSON/log artifacts only)"
+else
+    echo "  W&B:         entity=$WANDB_ENTITY project=$WANDB_PROJECT run_id=$WANDB_ID name=$RUN_NAME"
+fi
 echo "  PIPELINE_LOG: $PIPELINE_LOG"
 echo "  git commit:  $(git -C "$PROJECT_DIR" rev-parse --short HEAD)"
 echo "========================================"
@@ -172,10 +209,6 @@ if [ ! -d "$DATA_DIR" ] || ! ls "$DATA_DIR"/shard_*.npy >/dev/null 2>&1; then
 fi
 if ! ls "$DATA_DIR"/mask_*.npy >/dev/null 2>&1; then
     echo "FATAL: DATA_DIR has no mask_*.npy (EOS-in-loss datasets always have masks): $DATA_DIR"
-    exit 1
-fi
-if [ -z "${WANDB_API_KEY:-}" ]; then
-    echo "FATAL: WANDB_API_KEY not set — the pipeline's whole point is one logged W&B run."
     exit 1
 fi
 if [ ! -f "$PROJECT_DIR/scripts/lm_eval_tasks/gsm8k_boxed.yaml" ]; then
@@ -212,9 +245,21 @@ if [ ! -f "$VENV_DIR/bin/activate" ]; then
     python -m venv --system-site-packages "$VENV_DIR"
 fi
 source "$VENV_DIR/bin/activate"
-pip install --quiet "lm-eval==0.4.9" "zip2zip-compression>=0.3.3" wandb
+EVAL_DEPS=("lm-eval==0.4.9" "zip2zip-compression>=0.3.3")
+if [ "$WANDB" != "0" ]; then
+    EVAL_DEPS+=(wandb)
+fi
+pip install --quiet "${EVAL_DEPS[@]}"
 
 cd "$PROJECT_DIR"
+
+EVAL_WANDB_ARGS=(--no_wandb --resume_wandb_id none)
+if [ "$WANDB" != "0" ]; then
+    EVAL_WANDB_ARGS=(
+        --resume_wandb_id "$WANDB_ID"
+        --wandb_project "$WANDB_PROJECT"
+    )
+fi
 
 # Audit: the results JSON must record the eval flags we asked for. Catches
 # plumbing regressions where a control run (EVAL_MODE=base) or a digit-protected
@@ -226,11 +271,21 @@ audit_eval_mode() {
         && [ -z "${DISABLE_DIGIT_IDS:-}" ] \
         && [ -z "${ONLINE_CODEBOOK_MASK:-}" ] \
         && [ -z "${TWO_AXIS_ROPE:-}" ] \
+        && [ -z "${GATED_COMPRESSED_ROPE:-}" ] \
         && return 0
     python - "$1" "${EVAL_MODE:-}" "${DISABLE_DIGIT_IDS:-}" \
-        "${ONLINE_CODEBOOK_MASK:-}" "${TWO_AXIS_ROPE:-}" <<'PY'
+        "${ONLINE_CODEBOOK_MASK:-}" "${TWO_AXIS_ROPE:-}" \
+        "${GATED_COMPRESSED_ROPE:-}" "${GATED_ROPE_START_LAYER:-16}" <<'PY'
 import json, sys
-path, want_mode, want_digits, want_online_raw, want_two_axis_raw = sys.argv[1:6]
+(
+    path,
+    want_mode,
+    want_digits,
+    want_online_raw,
+    want_two_axis_raw,
+    want_gated_raw,
+    want_start_raw,
+) = sys.argv[1:8]
 args = json.load(open(path))["args"]
 if want_mode:
     got = args["eval_mode"]
@@ -258,6 +313,19 @@ if want_two_axis_raw:
         f"two-axis RoPE audit FAILED: {path} recorded "
         f"two_axis_rope={got!r}, expected {want_two_axis!r}"
     )
+if want_gated_raw:
+    want_gated = want_gated_raw != "0"
+    got = args.get("gated_compressed_rope")
+    assert got is want_gated, (
+        f"gated-RoPE audit FAILED: {path} recorded "
+        f"gated_compressed_rope={got!r}, expected {want_gated!r}"
+    )
+    got_start = args.get("gated_rope_start_layer")
+    want_start = int(want_start_raw)
+    assert got_start == want_start, (
+        f"gated-RoPE audit FAILED: {path} recorded "
+        f"gated_rope_start_layer={got_start!r}, expected {want_start!r}"
+    )
 print(f"[pipeline] eval-flags audit OK: {path}")
 PY
 }
@@ -284,10 +352,13 @@ else
                 --no_wandb --resume_wandb_id none \
                 --output_path "$SMOKE_JSON"
             audit_eval_mode "$SMOKE_JSON"
-            python scripts/log_results_to_wandb.py \
-                --json "$SMOKE_JSON" \
-                --resume_id "$WANDB_ID" --project "$WANDB_PROJECT" \
-                --prefix smoke --step "$step"
+            if [ "$WANDB" != "0" ]; then
+                python scripts/log_results_to_wandb.py \
+                    --json "$SMOKE_JSON" \
+                    --resume_id "$WANDB_ID" --entity "$WANDB_ENTITY" \
+                    --project "$WANDB_PROJECT" \
+                    --prefix smoke --step "$step"
+            fi
         else
             echo "--- smoke eval: step_$step skipped (no checkpoint) ---"
         fi
@@ -303,20 +374,22 @@ python scripts/eval_harness.py \
     --ckpt_dir "$FINAL_CKPT" \
     --tokenizer "$TOKENIZER" \
     --preset default \
-    --resume_wandb_id "$WANDB_ID" --wandb_project "$WANDB_PROJECT" \
+    "${EVAL_WANDB_ARGS[@]}" \
     ${FINAL_LIMIT:+--limit "$FINAL_LIMIT"} \
     ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
     ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
     --output_path "$MC_JSON" 2>&1 | tee "$MC_LOG"
 audit_eval_mode "$MC_JSON"
 
-# lm-eval's logger above writes the MC metrics as top-level summary keys and
-# uploads the per-sample tables; ALSO log them under final/ so every final
-# metric sits in one consistent W&B section next to final/wikitext/*.
-python scripts/log_results_to_wandb.py \
-    --json "$MC_JSON" \
-    --resume_id "$WANDB_ID" --project "$WANDB_PROJECT" \
-    --prefix final --step "$STEPS"
+# With W&B enabled, also log under final/ so every final metric sits in one
+# consistent section next to final/wikitext/*. Offline runs keep the same JSON.
+if [ "$WANDB" != "0" ]; then
+    python scripts/log_results_to_wandb.py \
+        --json "$MC_JSON" \
+        --resume_id "$WANDB_ID" --entity "$WANDB_ENTITY" \
+        --project "$WANDB_PROJECT" \
+        --prefix final --step "$STEPS"
+fi
 
 PPL_JSON=""
 if [ "$SKIP_FULL_PPL" = "0" ]; then
@@ -332,13 +405,29 @@ if [ "$SKIP_FULL_PPL" = "0" ]; then
         --no_wandb --resume_wandb_id none \
         --output_path "$PPL_JSON"
     audit_eval_mode "$PPL_JSON"
-    python scripts/log_results_to_wandb.py \
-        --json "$PPL_JSON" \
-        --resume_id "$WANDB_ID" --project "$WANDB_PROJECT" \
-        --prefix final --step "$STEPS"
+    if [ "$WANDB" != "0" ]; then
+        python scripts/log_results_to_wandb.py \
+            --json "$PPL_JSON" \
+            --resume_id "$WANDB_ID" --entity "$WANDB_ENTITY" \
+            --project "$WANDB_PROJECT" \
+            --prefix final --step "$STEPS"
+    fi
 fi
 
-# ---------- phase 4: pin every artifact path in the W&B run notes ----------
+# ---------- phase 4: report/pin artifacts ----------
+if [ "$WANDB" = "0" ]; then
+    echo "=== phase 4/4: offline artifact summary ==="
+    echo "  final checkpoint: $FINAL_CKPT"
+    echo "  pipeline log:     $PIPELINE_LOG"
+    echo "  training log:     $Z2Z_SCRATCH/logs/train/finetune_${RUN_NAME}_*.log"
+    echo "  final MC JSON:    $MC_JSON"
+    echo "  final MC log:     $MC_LOG"
+    if [ -n "$PPL_JSON" ]; then
+        echo "  WikiText JSON:    $PPL_JSON"
+    fi
+    echo "  smoke JSONs:      $EVAL_LOG_DIR/results_${RUN_NAME}_step*_smoke_${TS}.json"
+    echo "=== pipeline complete offline: $RUN_NAME ==="
+else
 echo "=== phase 4/4: append artifact paths to W&B notes ==="
 # Run:AI job name for the follow-up perplexity job: lowercase, no dots, <50 chars.
 PPL_JOB_NAME=$(printf 'ppl-%s' "$RUN_NAME" | tr '[:upper:]' '[:lower:]' \
@@ -373,13 +462,16 @@ runai submit --name $PPL_JOB_NAME \\
   --environment EVAL_MODE=$EVAL_MODE \\}
   --environment RESUME_WANDB_ID=$WANDB_ID \\
   --environment WANDB_STEP=$STEPS \\
+  --environment WANDB_ENTITY=$WANDB_ENTITY \\
   --environment WANDB_PROJECT=$WANDB_PROJECT \\
   --environment WANDB_API_KEY=\$WANDB_API_KEY \\
   -- bash $PROJECT_DIR/scripts/eval_ckpt_rcp.sh
 [/pending]"
 python scripts/log_results_to_wandb.py \
-    --resume_id "$WANDB_ID" --project "$WANDB_PROJECT" \
+    --resume_id "$WANDB_ID" --entity "$WANDB_ENTITY" \
+    --project "$WANDB_PROJECT" \
     --append_notes "$NOTES"
 
-echo "=== pipeline complete: W&B run $WANDB_PROJECT/$WANDB_ID ($RUN_NAME) ==="
+echo "=== pipeline complete: W&B run $WANDB_ENTITY/$WANDB_PROJECT/$WANDB_ID ($RUN_NAME) ==="
+fi
 } 2>&1 | tee "$PIPELINE_LOG"

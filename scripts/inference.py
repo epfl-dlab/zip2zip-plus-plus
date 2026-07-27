@@ -17,10 +17,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "ext", "torchtitan"))
 
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, GenerationConfig
+from zip2zip_compression import LZWCompressor
 
+from zip2zip_core.checkpoint import prepare_inference_state_dict
 from zip2zip_core.codebook import CodebookManager
 from zip2zip_core.configs import zip2zip_llama_configs
+from zip2zip_core.disabled_ids import compute_disabled_ids
 from zip2zip_core.model import Zip2ZipLlama3Model, restore_encoder_residual
 from zip2zip_core.viz import colorize_by_ngram, render_colored_tokens
 
@@ -28,9 +31,6 @@ from zip2zip_core.viz import colorize_by_ngram, render_colored_tokens
 # ── constants ─────────────────────────────────────────────────────────────────
 DEFAULT_CKPT = "/mnt/scratch/checkpoints/zip2zip_150m_finemath_10bt_ms4/step_6000"
 DEFAULT_TOKENIZER = "bofenghuang/Meta-Llama-3-8B"
-EOS_ID = 128001
-PAD_ID = 128001
-DISABLED_IDS = [128000, 128001, 128002, 128003]
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -48,8 +48,10 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
                   "encoder_intermediate_size")
         if args.get(k) is not None
     }
-    cfg = dataclasses.replace(
-        cfg,
+    gated_start_layer = args.get("gated_rope_start_layer")
+    if gated_start_layer is None:
+        gated_start_layer = cfg.gated_rope_start_layer
+    overrides = dict(
         max_subtokens=args["max_subtokens"],
         max_codebook_size=args["max_codebook_size"],
         hyper_encoder_type=args.get("hyper_encoder_type", "flat"),
@@ -62,21 +64,29 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
         base_token_positions=bool(args.get("base_token_positions", False)),
         # behavior-only two-axis geometry must also be restored from meta.pt.
         two_axis_rope=bool(args.get("two_axis_rope", False)),
+        # v0.7.1 keeps ordinary RoPE and learns a gated compressed-coordinate
+        # delta in a configurable suffix of decoder layers.
+        gated_compressed_rope=bool(args.get("gated_compressed_rope", False)),
+        gated_rope_start_layer=int(gated_start_layer),
         # builds the (eval-unused) token_type_head so its checkpoint weights
         # have a home and the strict load below does not fail on them.
         token_type_loss_weight=float(args.get("token_type_loss_weight") or 0.0),
         **enc_overrides,
     )
+    cfg = dataclasses.replace(cfg, **overrides)
     model = Zip2ZipLlama3Model(cfg)
     print(
         "[inference] decoder RoPE: "
         f"base_positions={cfg.base_token_positions} "
-        f"two_axis={cfg.two_axis_rope}"
+        f"two_axis={cfg.two_axis_rope} "
+        f"gated_compressed={cfg.gated_compressed_rope} "
+        f"gated_start_layer={cfg.gated_rope_start_layer}"
     )
     if not restore_encoder_residual(model, args):
         print("[inference] hyper-encoder residual: disabled from meta.pt")
     model = model.to(device)
     sd = torch.load(f"{ckpt_dir}/model.pt", map_location=device, weights_only=True)
+    sd = prepare_inference_state_dict(sd, args)
     model.load_state_dict(sd, strict=True)
     model.eval()
     return model, args
@@ -85,38 +95,77 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
 
 # ── generation loop ───────────────────────────────────────────────────────────
 
+def _update_codebook_dict(
+    codebook_dict: dict[int, list[int]],
+    updates: torch.Tensor,
+    updates_indices: list[list[int]],
+    vocab_size: int,
+    pad_id: int,
+) -> None:
+    """Register newly installed hyper-token entries for output expansion."""
+    for batch_idx, indices in enumerate(updates_indices):
+        for row, slot in enumerate(indices):
+            codebook_dict[vocab_size + int(slot)] = [
+                int(token)
+                for token in updates[batch_idx, row].tolist()
+                if int(token) != pad_id
+            ]
+
+
+def _sample_next(last_logits: torch.Tensor, temperature: float) -> int:
+    """Greedy decode at zero temperature; categorical sampling otherwise."""
+    if temperature <= 0:
+        return int(last_logits.argmax().item())
+    probs = torch.softmax(last_logits.float() / temperature, dim=-1)
+    return int(torch.multinomial(probs, num_samples=1).item())
+
+
 @torch.no_grad()
 def generate(
     prompt: str,
     model: Zip2ZipLlama3Model,
     codebook_manager: CodebookManager,
+    lzw_compressor: LZWCompressor,
     hf_tokenizer,
+    stop_token_ids: set[int],
     max_new_tokens: int = 128,
-    temperature: float = 1.0,
+    temperature: float = 0.0,
     device: str = "cuda",
-) -> str:
+) -> tuple[str, str]:
+    """Generate compressed tokens and decode them back to base-token text.
+
+    ``max_new_tokens`` counts sampled compressed tokens. A sampled hypertoken
+    can expand to more than one base token in the returned text.
+    """
     cfg = model.zip2zip_config
     vocab_size = cfg.vocab_size
     pad_id = cfg.pad_token_id
 
-    # ── Encode prompt (base tokens only — no LZW compression) ──
+    # Compress the prompt for the decoder, while separately replaying the base
+    # prompt through the online manager to seed the same LZW dictionary.
     base_ids = hf_tokenizer.encode(prompt, add_special_tokens=False)
-    context = torch.tensor([base_ids], dtype=torch.long, device=device)  # (1, T)
+    if not base_ids:
+        raise ValueError("prompt must encode to at least one base token")
+    compressed_ids, _, _ = lzw_compressor.encode(
+        base_ids, padding="do_not_pad", truncation=False
+    )
+    context = torch.tensor(
+        [compressed_ids], dtype=torch.long, device=device
+    )
 
-    # ── Reset state ──
     model.reset_inference_cache()
     codebook_manager.reset()
-
-    # ── Prefill: build initial codebook from prompt base tokens ──
-    codebook_manager.update_codebooks(context)
+    prompt_base_tensor = torch.tensor(
+        [base_ids], dtype=torch.long, device=device
+    )
+    codebook_manager.update_codebooks(prompt_base_tensor)
     updates, updates_indices = codebook_manager.get_new_codes()
 
-    # hyper-token → base-token mapping (for expanding generated hyper tokens)
     codebook_dict: dict[int, list[int]] = {}
-    # _update_codebook_dict(codebook_dict, updates, updates_indices, vocab_size, pad_id)
+    _update_codebook_dict(
+        codebook_dict, updates, updates_indices, vocab_size, pad_id
+    )
 
-    # Run model on the prompt. No codebook tensor — the model uses its internal
-    # _hyper_embeds_buf and _hyper_embeds_used for hyper-token embedding + masking.
     logits = model(
         context,
         codebook_updates=updates,
@@ -127,6 +176,7 @@ def generate(
         logits = logits[0]
 
     generated_base_ids: list[int] = []
+    generated_display_ids: list[int] = []
 
     def _color_decode_ids(ids: list[int]) -> str:
         codebooks = codebook_manager.internal_codebook_manager.get_codebooks()
@@ -138,21 +188,44 @@ def generate(
     # ── Decode loop ──
     for step in range(max_new_tokens):
         last_logits = logits[0, -1, :]  # (vocab_size + max_codebook_size,)
-        if temperature != 1.0:
-            last_logits = last_logits / temperature
-        next_id = int(last_logits.argmax())
+        next_id = _sample_next(last_logits, temperature)
+        if next_id < vocab_size:
+            expansion = [next_id]
+        else:
+            expansion = list(codebook_dict.get(next_id, []))
+            if not expansion:
+                print(
+                    f"[inference] sampled unavailable hyper-token {next_id}; "
+                    "stopping"
+                )
+                break
 
-        generated_base_ids.append(next_id)
-
-        if next_id == EOS_ID:
+        stop_at = [
+            idx for idx, token in enumerate(expansion)
+            if token in stop_token_ids
+        ]
+        if stop_at:
+            cut = stop_at[0]
+            generated_base_ids.extend(expansion[:cut])
+            # A partially emitted hyper-token cannot be represented by its
+            # compressed id in the visualization, so show the surviving bases.
+            generated_display_ids.extend(expansion[:cut])
             break
 
-        # Advance LZW state with the new base tokens
-        new_base_tensor = torch.tensor([[next_id]], dtype=torch.long, device=device)
+        generated_base_ids.extend(expansion)
+        generated_display_ids.append(next_id)
+
+        # Advance online LZW with the emitted BASE expansion. The model context
+        # still receives the single sampled compressed token below.
+        new_base_tensor = torch.tensor(
+            [expansion], dtype=torch.long, device=device
+        )
         codebook_manager.update_codebooks(new_base_tensor)
         updates, updates_indices = codebook_manager.get_new_codes()
+        _update_codebook_dict(
+            codebook_dict, updates, updates_indices, vocab_size, pad_id
+        )
 
-        # Append the *compressed* token (not base expansion) to context
         context = torch.cat(
             [context, torch.tensor([[next_id]], dtype=torch.long, device=device)],
             dim=1,
@@ -167,9 +240,9 @@ def generate(
             logits = logits[0]
 
         if step % 2 == 0:
-            partial_colored = _color_decode_ids(generated_base_ids[-20:])
+            partial_colored = _color_decode_ids(generated_display_ids[-20:])
             ids_str = str(generated_base_ids[-10:])
-            top10_vals, top10_ids = torch.topk(last_logits, 10)
+            _, top10_ids = torch.topk(last_logits, 10)
             top10_tokens = [
                 f"{tid}({repr(hf_tokenizer.decode([tid]))})" if tid < vocab_size
                 else f"{tid}(hyper)"
@@ -178,7 +251,7 @@ def generate(
             print(f"  step {step:3d} | ctx_len={context.shape[1]} | ids={ids_str} | ...{partial_colored}")
             print(f"           top10: {', '.join(top10_tokens)}")
 
-    colored_output = _color_decode_ids(generated_base_ids)
+    colored_output = _color_decode_ids(generated_display_ids)
     return hf_tokenizer.decode(generated_base_ids, skip_special_tokens=True), colored_output
 
 
@@ -188,10 +261,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt", type=str, default="The Eiffel Tower is located in")
     parser.add_argument("--ckpt-dir", type=str, default=DEFAULT_CKPT)
-    parser.add_argument("--tokenizer", type=str, default=DEFAULT_TOKENIZER)
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default=None,
+        help="Tokenizer override. Defaults to meta.pt, then the legacy fallback.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=64)
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="0 = greedy; positive values enable categorical sampling.",
+    )
     cli = parser.parse_args()
+    if cli.temperature < 0:
+        parser.error("--temperature must be non-negative")
+    if cli.max_new_tokens < 0:
+        parser.error("--max-new-tokens must be non-negative")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
@@ -209,32 +296,74 @@ def main():
     cfg = model.zip2zip_config
     print(f"  max_subtokens={cfg.max_subtokens}  max_codebook_size={cfg.max_codebook_size}")
 
-    print(f"Loading tokenizer from {cli.tokenizer}...")
-    hf_tok = AutoTokenizer.from_pretrained(cli.tokenizer)
-
-    # Derive disabled_ids from the tokenizer (matches training) instead of the
-    # hardcoded Llama constant — correct for Phi (specials 0,1,2,32000..32010).
-    derived_disabled = sorted(
-        i for i in (set(hf_tok.all_special_ids or []) | set(hf_tok.get_added_vocab().values()))
-        if 0 <= i < cfg.vocab_size
+    tokenizer_name = (
+        cli.tokenizer or train_args.get("tokenizer") or DEFAULT_TOKENIZER
     )
-    print(f"  disabled_ids={derived_disabled}")
+    print(f"Loading tokenizer from {tokenizer_name}...")
+    hf_tok = AutoTokenizer.from_pretrained(tokenizer_name)
+    if len(hf_tok) > cfg.vocab_size:
+        raise ValueError(
+            f"tokenizer {tokenizer_name!r} has {len(hf_tok)} tokens, but the "
+            f"checkpoint model vocabulary has {cfg.vocab_size}"
+        )
+    trained_tokenizer = train_args.get("tokenizer")
+    if trained_tokenizer and trained_tokenizer != tokenizer_name:
+        print(
+            f"[inference] WARNING: tokenizer override {tokenizer_name!r} differs "
+            f"from training tokenizer {trained_tokenizer!r}"
+        )
 
-    codebook_manager = CodebookManager(
+    disabled_ids = compute_disabled_ids(
+        hf_tok,
+        cfg.vocab_size,
+        disable_digit_ids=bool(train_args.get("disable_digit_ids")),
+    )
+    print(f"  disabled_ids ({len(disabled_ids)}): {disabled_ids}")
+
+    stop_token_ids = {
+        int(token)
+        for token in (hf_tok.eos_token_id, cfg.pad_token_id)
+        if token is not None
+    }
+    try:
+        generation_cfg = GenerationConfig.from_pretrained(tokenizer_name)
+        eos = generation_cfg.eos_token_id
+        if eos is not None:
+            stop_token_ids.update(
+                int(token)
+                for token in (
+                    eos if isinstance(eos, (list, tuple)) else [eos]
+                )
+            )
+    except Exception as exc:
+        print(
+            "[inference] generation config unavailable; using tokenizer EOS "
+            f"only ({type(exc).__name__})"
+        )
+    print(f"  stop_token_ids={sorted(stop_token_ids)}")
+
+    compression_kwargs = dict(
         initial_vocab_size=cfg.vocab_size,
         max_codebook_size=cfg.max_codebook_size,
         max_subtokens=cfg.max_subtokens,
-        embedding_dim=cfg.dim,
         pad_token_id=cfg.pad_token_id,
-        disabled_ids=derived_disabled,
+        disabled_ids=disabled_ids,
     )
+
+    codebook_manager = CodebookManager(
+        embedding_dim=cfg.dim,
+        **compression_kwargs,
+    )
+    lzw_compressor = LZWCompressor(**compression_kwargs)
 
     print(f"\nPrompt: {repr(cli.prompt)}\n")
     output, colored_output = generate(
         cli.prompt,
         model,
         codebook_manager,
+        lzw_compressor,
         hf_tok,
+        stop_token_ids,
         max_new_tokens=cli.max_new_tokens,
         temperature=cli.temperature,
         device=device,

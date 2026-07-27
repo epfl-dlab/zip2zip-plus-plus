@@ -16,8 +16,9 @@ import dataclasses
 
 import torch
 
+from zip2zip_core.checkpoint import prepare_inference_state_dict
 from zip2zip_core.configs import zip2zip_llama_configs
-from zip2zip_core.model import Zip2ZipLlama3Model
+from zip2zip_core.model import Zip2ZipLlama3Model, restore_encoder_residual
 
 # ── parse args ───────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
@@ -55,24 +56,51 @@ else:
 
 # ── read training args saved alongside the checkpoint ─────────────────────────
 meta_path = os.path.join(ckpt_dir, "meta.pt")
-if os.path.exists(meta_path):
-    meta = torch.load(meta_path, map_location="cpu", weights_only=False)
-    train_args = meta.get("args", {})
-    print(f"Checkpoint step: {meta['step']}")
-    print(f"  max_subtokens  : {train_args.get('max_subtokens')}")
-    print(f"  max_codebook_size: {train_args.get('max_codebook_size')}")
-else:
-    train_args = {}
-    print("No meta.pt found — using default config")
+if not os.path.exists(meta_path):
+    raise FileNotFoundError(
+        f"required checkpoint metadata is missing: {meta_path}"
+    )
+meta = torch.load(meta_path, map_location="cpu", weights_only=False)
+if not isinstance(meta, dict) or not isinstance(meta.get("args"), dict):
+    raise ValueError(f"invalid checkpoint metadata: {meta_path}")
+train_args = meta["args"]
+print(f"Checkpoint step: {meta.get('step', '<unknown>')}")
+print(f"  max_subtokens  : {train_args.get('max_subtokens')}")
+print(f"  max_codebook_size: {train_args.get('max_codebook_size')}")
 
 # ── build model (override fields that differ from the default config) ──────────
-MODEL_KEY = args.model_config
+MODEL_KEY = train_args.get("model_config") or args.model_config
 print(f"\nBuilding {MODEL_KEY} model on {DEVICE}...")
 cfg = zip2zip_llama_configs[MODEL_KEY]
-overrides = {k: train_args[k] for k in ("max_subtokens", "max_codebook_size") if k in train_args}
+overrides = {
+    key: train_args[key]
+    for key in (
+        "max_subtokens",
+        "max_codebook_size",
+        "hyper_encoder_type",
+        "encoder_dim",
+        "encoder_n_layers",
+        "encoder_n_heads",
+        "encoder_intermediate_size",
+        "token_type_loss_weight",
+        "gated_rope_start_layer",
+    )
+    if train_args.get(key) is not None
+}
+overrides.update(
+    tie_hyper_encoder=not bool(train_args.get("untied_hyper_encoder")),
+    share_hyper_encoder_weights=bool(
+        train_args.get("share_hyper_encoder_weights")
+    ),
+    base_token_positions=bool(train_args.get("base_token_positions")),
+    two_axis_rope=bool(train_args.get("two_axis_rope")),
+    gated_compressed_rope=bool(train_args.get("gated_compressed_rope")),
+)
 if overrides:
     cfg = dataclasses.replace(cfg, **overrides)
-model = Zip2ZipLlama3Model(cfg).to(DEVICE)
+model = Zip2ZipLlama3Model(cfg)
+restore_encoder_residual(model, train_args)
+model = model.to(DEVICE)
 n_params = sum(p.numel() for p in model.parameters())
 print(f"  params: {n_params/1e6:.1f}M  (max_subtokens={cfg.max_subtokens})")
 
@@ -80,13 +108,9 @@ print(f"  params: {n_params/1e6:.1f}M  (max_subtokens={cfg.max_subtokens})")
 model_path = os.path.join(ckpt_dir, "model.pt")
 print(f"\nLoading checkpoint from {model_path} ...")
 state_dict = torch.load(model_path, map_location=DEVICE, weights_only=True)
-missing, unexpected = model.load_state_dict(state_dict, strict=False)
-if missing:
-    print(f"  WARNING missing keys ({len(missing)}): {missing[:5]}")
-if unexpected:
-    print(f"  WARNING unexpected keys ({len(unexpected)}): {unexpected[:5]}")
-if not missing and not unexpected:
-    print("  All keys matched perfectly.")
+state_dict = prepare_inference_state_dict(state_dict, train_args)
+model.load_state_dict(state_dict, strict=True)
+print("  All keys matched perfectly (strict load).")
 
 # ── forward pass ──────────────────────────────────────────────────────────────
 print("\nRunning forward pass (no codebook)...")

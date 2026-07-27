@@ -44,7 +44,8 @@ def main():
                         "Default: auto-detected from meta.pt's --disable_digit_ids.")
     p.add_argument("--no_disable_digit_ids", dest="disable_digit_ids", action="store_false",
                    help="Force digit protection off even if meta.pt recorded it on.")
-    p.add_argument("--residual", action="store_true", default=True)
+    p.add_argument("--residual", action="store_true", default=None,
+                   help="Force encoder residual on. Default: restore from meta.pt.")
     p.add_argument("--no_residual", dest="residual", action="store_false")
     p.add_argument("--causal", action="store_true", default=False)
     args = p.parse_args()

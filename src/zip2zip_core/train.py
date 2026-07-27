@@ -39,6 +39,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from zip2zip_core.configs import zip2zip_llama_configs
+from zip2zip_core.checkpoint import strip_wrapper_prefixes
 from zip2zip_core.data import build_dataloader
 from zip2zip_core.model import rope_cache_len
 
@@ -53,6 +54,42 @@ def get_lr(step: int, warmup_steps: int, total_steps: int, max_lr: float, min_lr
         return min_lr
     progress = (step - warmup_steps) / (total_steps - warmup_steps)
     return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
+
+
+def base_view_replay_microsteps(
+    step: int,
+    gradient_accumulation_steps: int,
+    probability: float,
+) -> frozenset[int]:
+    """Select whole base-view microbatches deterministically for one step.
+
+    The cumulative-floor schedule is stateless: every rank and a resumed run
+    derive the same answer from the optimizer step alone. The final microstep
+    is deliberately kept compressed so every trainable compressed-only module
+    participates in FSDP's gradient-sync forward/backward.
+    """
+    if step < 1:
+        raise ValueError(f"step must be >= 1, got {step}")
+    if gradient_accumulation_steps < 1:
+        raise ValueError(
+            "gradient_accumulation_steps must be >= 1, got "
+            f"{gradient_accumulation_steps}"
+        )
+    if not 0.0 <= probability < 1.0:
+        raise ValueError(
+            f"base-view replay probability must be in [0, 1), got {probability}"
+        )
+    expected_per_step = gradient_accumulation_steps * probability
+    if math.ceil(expected_per_step - 1e-12) > gradient_accumulation_steps - 1:
+        raise ValueError(
+            "base-view replay leaves no guaranteed compressed final microstep: "
+            f"gradient_accumulation_steps={gradient_accumulation_steps}, "
+            f"probability={probability}"
+        )
+    before = math.floor((step - 1) * expected_per_step + 1e-12)
+    through = math.floor(step * expected_per_step + 1e-12)
+    count = through - before
+    return frozenset(range(count))
 
 
 def _unwrap_model(model):
@@ -481,10 +518,7 @@ def _push_checkpoint_to_hub(ckpt_dir, repo_id, step):
 
 def _clean_state_dict(model_state):
     """Strip FSDP wrapper prefixes for compatibility."""
-    cleaned = {}
-    for k, v in model_state.items():
-        cleaned[k.replace("_fsdp_wrapped_module.", "").replace("_orig_mod.", "")] = v
-    return cleaned
+    return strip_wrapper_prefixes(model_state)
 
 
 def validate_resume_args(resume_dir, args):
@@ -506,6 +540,8 @@ def validate_resume_args(resume_dir, args):
             "max_active_codebook_size", "tokenizer",
             "untied_hyper_encoder", "share_hyper_encoder_weights",
             "base_token_positions", "two_axis_rope",
+            "gated_compressed_rope", "gated_rope_start_layer",
+            "base_view_replay_prob",
             "zero_init_encoder_output", "no_encoder_residual",
             "token_type_loss_weight", "online_codebook_mask",
             # lora_alpha sets scaling = alpha/rank as a RUNTIME attribute
@@ -515,6 +551,13 @@ def validate_resume_args(resume_dir, args):
             "lora_alpha", "hyper_causal_mask", "no_remap_codebook",
             "hyper_encoder_type", "encoder_dim", "encoder_n_layers",
             "encoder_n_heads", "encoder_intermediate_size")
+    if (
+        float(prev.get("base_view_replay_prob", 0.0) or 0.0) > 0.0
+        or float(getattr(args, "base_view_replay_prob", 0.0) or 0.0) > 0.0
+    ):
+        # Replay selection is defined over microsteps, so changing accumulation
+        # changes which examples receive the base view even at the same step.
+        hard += ("gradient_accumulation_steps",)
     soft = ("max_subtokens", "seq_len", "data_dir", "warmstart_steps")
     # Hard keys whose ABSENCE from an old meta.pt has an unambiguous meaning:
     # the flag/objective did not exist, i.e. it was OFF. Treat absence as that
@@ -527,6 +570,9 @@ def validate_resume_args(resume_dir, args):
         "share_hyper_encoder_weights": False,
         "base_token_positions": False,
         "two_axis_rope": False,
+        "gated_compressed_rope": False,
+        "gated_rope_start_layer": 16,
+        "base_view_replay_prob": 0.0,
         "zero_init_encoder_output": False,
         "no_encoder_residual": False,
         "token_type_loss_weight": 0.0,
@@ -723,10 +769,20 @@ def load_hf_pretrained(model, hf_model_name, device):
     missing, unexpected = raw_model.load_state_dict(tt_sd, strict=False)
 
     if dist.get_rank() == 0:
-        hyper_missing = [k for k in missing if k.startswith("hyper_encoder") or k.startswith("token_type_head") or k.startswith("hyper_output")]
+        hyper_missing = [
+            k
+            for k in missing
+            if k.startswith("hyper_encoder")
+            or k.startswith("token_type_head")
+            or k.startswith("hyper_output")
+            or k == "compressed_rope_gate"
+        ]
         other_missing = [k for k in missing if k not in hyper_missing]
         print(f"[init_from_hf] Loaded decoder weights from {hf_model_name}")
-        print(f"  Hyper-encoder params (randomly initialized): {len(hyper_missing)}")
+        print(
+            "  Zip2Zip-specific params (randomly initialized): "
+            f"{len(hyper_missing)}"
+        )
         if other_missing:
             print(f"  ⚠️ Other missing keys: {other_missing}")
         if unexpected:
@@ -779,6 +835,28 @@ def main():
         help="Split complex RoPE pairs 50/50 between base-stream positions "
              "(even pairs) and compressed-token positions (odd pairs). Requires "
              "--base_token_positions. Default off preserves single-axis RoPE.",
+    )
+    parser.add_argument(
+        "--gated_compressed_rope",
+        action="store_true",
+        help="For upper decoder layers, learn a per-frequency interpolation from "
+             "base-stream RoPE (exact at zero initialization) toward compressed-"
+             "index RoPE. Requires --base_token_positions and is incompatible "
+             "with --two_axis_rope.",
+    )
+    parser.add_argument(
+        "--gated_rope_start_layer",
+        type=int,
+        default=16,
+        help="Zero-based first decoder layer using gated compressed RoPE.",
+    )
+    parser.add_argument(
+        "--base_view_replay_prob",
+        type=float,
+        default=0.0,
+        help="Deterministic fraction of whole training microbatches replayed as "
+             "ordinary uncompressed base-token views from the same source chunk. "
+             "The final accumulation microstep always remains compressed.",
     )
     parser.add_argument("--seq_len", type=int, default=4096)
     parser.add_argument("--local_batch_size", type=int, default=8)
@@ -907,8 +985,26 @@ def main():
 
     if args.no_compile:
         args.compile = False
+    if args.two_axis_rope and args.gated_compressed_rope:
+        parser.error(
+            "--two_axis_rope and --gated_compressed_rope are mutually exclusive"
+        )
     if args.two_axis_rope and not args.base_token_positions:
         parser.error("--two_axis_rope requires --base_token_positions")
+    if args.gated_compressed_rope and not args.base_token_positions:
+        parser.error("--gated_compressed_rope requires --base_token_positions")
+    if not 0.0 <= args.base_view_replay_prob < 1.0:
+        parser.error("--base_view_replay_prob must be in [0, 1)")
+    if args.base_view_replay_prob and args.mode != "lm":
+        parser.error("--base_view_replay_prob requires --mode lm")
+    try:
+        base_view_replay_microsteps(
+            1,
+            args.gradient_accumulation_steps,
+            args.base_view_replay_prob,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.online_codebook_mask and not args.no_remap_codebook:
         parser.error("--online_codebook_mask requires --no_remap_codebook")
     if args.online_codebook_mask and args.mode != "lm":
@@ -933,6 +1029,13 @@ def main():
     # config dump, wandb.init, and meta.pt then all agree, the eval adapter
     # rebuilds from concrete values, and validate_resume_args compares them.
     _cfg_defaults = zip2zip_llama_configs[args.model_config]
+    if args.gated_compressed_rope and not (
+        0 <= args.gated_rope_start_layer < _cfg_defaults.n_layers
+    ):
+        parser.error(
+            "--gated_rope_start_layer must be in "
+            f"[0, {_cfg_defaults.n_layers}) for {args.model_config}"
+        )
     for _f in ("encoder_dim", "encoder_n_layers", "encoder_n_heads",
                "encoder_intermediate_size"):
         if getattr(args, _f) is None:
@@ -1019,6 +1122,8 @@ def main():
         share_hyper_encoder_weights=args.share_hyper_encoder_weights,
         base_token_positions=args.base_token_positions,
         two_axis_rope=args.two_axis_rope,
+        gated_compressed_rope=args.gated_compressed_rope,
+        gated_rope_start_layer=args.gated_rope_start_layer,
         zero_init_encoder_output=args.zero_init_encoder_output,
         rope=dataclasses.replace(
             config.rope,
@@ -1066,8 +1171,18 @@ def main():
     # Freeze decoder / apply LoRA
     if args.freeze_decoder or args.lora_rank:
         for name, param in model.named_parameters():
-            if not name.startswith("hyper_encoder") and not name.startswith("hyper_output") and not name.startswith("token_type_head"):
+            if (
+                not name.startswith("hyper_encoder")
+                and not name.startswith("hyper_output")
+                and not name.startswith("token_type_head")
+                and name != "compressed_rope_gate"
+            ):
                 param.requires_grad_(False)
+        if (
+            args.gated_compressed_rope
+            and not model.compressed_rope_gate.requires_grad
+        ):
+            raise RuntimeError("compressed_rope_gate was unexpectedly frozen")
         if rank == 0:
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print(f"[freeze_decoder] Decoder frozen. Trainable params: {trainable:,}")
@@ -1197,6 +1312,9 @@ def main():
         mode=args.mode,
         remap_codebook=not args.no_remap_codebook,
         online_codebook_mask=args.online_codebook_mask,
+        include_base_view=(
+            args.base_view_replay_prob > 0.0 and not args.eval
+        ),
         debug_samples=max(0, args.debug_first_steps * max(1, args.gradient_accumulation_steps)),
     )
 
@@ -1471,6 +1589,19 @@ def main():
                 "[two_axis_rope] enabled: even complex pairs use base-stream "
                 "positions; odd pairs use compressed-token positions"
             )
+        if args.gated_compressed_rope:
+            print(
+                "[gated_compressed_rope] enabled: zero-initialized learned "
+                f"compressed-position delta in layers "
+                f"{args.gated_rope_start_layer}-{config.n_layers - 1}"
+            )
+        if args.base_view_replay_prob:
+            print(
+                "[base_view_replay] enabled: "
+                f"target={args.base_view_replay_prob:.2%}, "
+                f"gradient_accumulation_steps={args.gradient_accumulation_steps}; "
+                "rank-identical stateless schedule, final microstep compressed"
+            )
         if args.warmstart_steps:
             print(f"[warmstart] enabled: decoder-LoRA frozen for first {args.warmstart_steps} steps")
             if args.warmstart_steps >= args.warmup_steps:
@@ -1495,6 +1626,8 @@ def main():
     log_hyper_ratio = 0.0
     log_online_skipped = 0
     log_online_targets = 0
+    log_base_replay_microbatches = 0
+    log_total_microbatches = 0
     log_tokens = 0
     start_time = time.time()
 
@@ -1544,6 +1677,11 @@ def main():
         accum_base_type_acc = 0.0
         accum_hyper_type_acc = 0.0
         accum_hyper_ratio = 0.0
+        replay_microsteps = base_view_replay_microsteps(
+            step,
+            args.gradient_accumulation_steps,
+            args.base_view_replay_prob,
+        )
 
         for micro_step in range(args.gradient_accumulation_steps):
           debug_enabled = step <= args.debug_first_steps
@@ -1559,13 +1697,24 @@ def main():
                 f"codebook={tuple(input_dict['codebook'].shape)} labels={tuple(labels.shape)}",
             )
 
-            x = input_dict["input"].to(device)
+            use_base_view = micro_step in replay_microsteps
+            x = input_dict[
+                "base_input" if use_base_view else "input"
+            ].to(device)
             cb = input_dict["codebook"].to(device)
             codebook_counts = input_dict.get("codebook_counts")
-            if codebook_counts is not None:
+            if codebook_counts is not None and not use_base_view:
                 codebook_counts = codebook_counts.to(device)
-            n_base_tokens = input_dict["n_base_tokens"].to(device)
-            labels = labels.to(device)
+            else:
+                codebook_counts = None
+            n_base_tokens = input_dict[
+                "base_n_base_tokens" if use_base_view else "n_base_tokens"
+            ].to(device)
+            labels = (
+                input_dict["base_labels"] if use_base_view else labels
+            ).to(device)
+            log_base_replay_microbatches += int(use_base_view)
+            log_total_microbatches += 1
             _debug_rank_log(
                 debug_enabled,
                 rank,
@@ -1585,8 +1734,10 @@ def main():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     output = model(
                         x,
-                        codebook=cb,
-                        hyper_causal_mask=args.hyper_causal_mask,
+                        codebook=None if use_base_view else cb,
+                        hyper_causal_mask=(
+                            args.hyper_causal_mask and not use_base_view
+                        ),
                         codebook_counts=codebook_counts,
                     )
                     if use_token_type_head:
@@ -1606,7 +1757,7 @@ def main():
                     )
                 _debug_rank_log(debug_enabled, rank, step, micro_step, "after cross_entropy")
                 valid_mask = flat_labels != -100
-                if args.online_codebook_mask:
+                if args.online_codebook_mask and not use_base_view:
                     skipped = int(
                         input_dict["online_skipped_targets"].sum().item()
                     )
@@ -1740,6 +1891,24 @@ def main():
             dist.all_reduce(relaxed_acc_tensor, op=dist.ReduceOp.AVG)
             _debug_rank_log(debug_enabled, rank, step, -1, "after metric all_reduce")
 
+            gate_stats = None
+            if args.gated_compressed_rope:
+                gate_values = _unwrap_model(model).compressed_rope_gate.detach()
+                if hasattr(gate_values, "full_tensor"):
+                    gate_values = gate_values.full_tensor()
+                gate_values = gate_values.float()
+                gate_stats = {
+                    "min": gate_values.min().item(),
+                    "max": gate_values.max().item(),
+                    "mean": gate_values.mean().item(),
+                    "rms": gate_values.square().mean().sqrt().item(),
+                }
+            replay_rate = (
+                log_base_replay_microbatches / log_total_microbatches
+                if log_total_microbatches
+                else 0.0
+            )
+
             if use_token_type_head:
                 avg_type_loss = log_type_loss / args.log_freq
                 avg_type_acc = log_type_acc / args.log_freq
@@ -1808,6 +1977,13 @@ def main():
                         f"online_skip={online_skip_rate:.6f} "
                         f"(n={int(online_skipped_value)}) | "
                     )
+                if args.base_view_replay_prob:
+                    log_msg += f"base_replay={replay_rate:.4f} | "
+                if gate_stats is not None:
+                    log_msg += (
+                        f"rope_gate_mean={gate_stats['mean']:.3e} | "
+                        f"rope_gate_rms={gate_stats['rms']:.3e} | "
+                    )
                 hyper_lr_suffix = f" | hyper_lr={hyper_lr:.2e}" if hyper_lr != lr else ""
                 log_msg += (
                     f"lr={lr:.2e}{hyper_lr_suffix} | grad_norm={grad_norm:.4f} | "
@@ -1820,7 +1996,7 @@ def main():
                 if args.wandb:
                     log_dict = {
                         "loss": base_loss_tensor.item(),
-                        "ppl": math.exp(base_loss_tensor.item()),
+                        "ppl": _ppl_val,
                         "acc": acc_tensor.item(),
                         "base_token_acc": base_token_acc_tensor.item(),
                         "hyper_token_acc": hyper_token_acc_tensor.item(),
@@ -1843,6 +2019,17 @@ def main():
                     if args.online_codebook_mask:
                         log_dict["online_skipped_targets"] = online_skipped_value
                         log_dict["online_skipped_target_rate"] = online_skip_rate
+                    if args.base_view_replay_prob:
+                        log_dict["base_view_replay_rate"] = replay_rate
+                    if gate_stats is not None:
+                        log_dict.update(
+                            {
+                                "rope_gate_min": gate_stats["min"],
+                                "rope_gate_max": gate_stats["max"],
+                                "rope_gate_mean": gate_stats["mean"],
+                                "rope_gate_rms": gate_stats["rms"],
+                            }
+                        )
                     wandb.log(log_dict, step=step)
 
             log_loss = 0.0
@@ -1859,6 +2046,8 @@ def main():
             log_hyper_ratio = 0.0
             log_online_skipped = 0
             log_online_targets = 0
+            log_base_replay_microbatches = 0
+            log_total_microbatches = 0
             log_tokens = 0
             start_time = time.time()
 

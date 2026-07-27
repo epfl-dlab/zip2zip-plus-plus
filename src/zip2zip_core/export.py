@@ -13,9 +13,15 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from collections.abc import Mapping
 
 import torch
 
+from zip2zip_core.checkpoint import (
+    merge_lora_weights,
+    prepare_inference_state_dict,
+    strip_wrapper_prefixes,
+)
 from zip2zip_core.disabled_ids import compute_disabled_ids
 
 
@@ -31,40 +37,62 @@ def _merge_lora_weights(sd: dict, scaling: float = 1.0) -> dict:
     `scaling` must match the training-time LoRA scaling (alpha / rank); see LoRALinear.forward.
     Non-LoRA checkpoints are returned unchanged.
     """
-    if not any("base_layer" in k for k in sd):
-        return sd
-
-    lora_suffixes = (".base_layer.weight", ".lora_A.weight", ".lora_B.weight")
-    merged = {}
-    for k, v in sd.items():
-        if k.endswith(".base_layer.weight"):
-            prefix = k[: -len(".base_layer.weight")]
-            lora_a = sd.get(f"{prefix}.lora_A.weight")
-            lora_b = sd.get(f"{prefix}.lora_B.weight")
-            if lora_a is not None and lora_b is not None:
-                merged[f"{prefix}.weight"] = v + scaling * (lora_b @ lora_a)
-            else:
-                merged[f"{prefix}.weight"] = v
-        elif not any(k.endswith(s) for s in lora_suffixes):
-            merged[k] = v
-    return merged
+    normalized = strip_wrapper_prefixes(sd)
+    return merge_lora_weights(normalized, scaling=scaling)
 
 
 def _lora_scaling_from_meta(ckpt_dir: str) -> float:
-    """Read LoRA scaling (alpha / rank) from the checkpoint's meta.pt, default 1.0.
-
-    Falls back to 1.0 when meta.pt is missing or the run was not LoRA (rank is None/0).
-    """
+    """Read LoRA scaling (alpha / rank) from the checkpoint's meta.pt."""
     meta_pt = os.path.join(ckpt_dir, "meta.pt")
     if not os.path.exists(meta_pt):
-        return 1.0
+        raise FileNotFoundError(
+            f"required checkpoint metadata is missing: {meta_pt}"
+        )
     meta = torch.load(meta_pt, map_location="cpu", weights_only=False)
     train_args = meta.get("args", {}) if isinstance(meta, dict) else {}
     rank = train_args.get("lora_rank")
     alpha = train_args.get("lora_alpha")
-    if rank and alpha:
+    if rank:
+        if not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+            raise ValueError(f"invalid lora_rank in {meta_pt}: {rank!r}")
+        if alpha is None:
+            raise ValueError(
+                f"LoRA checkpoint metadata {meta_pt} has lora_rank={rank} "
+                "but no lora_alpha"
+            )
         return float(alpha) / float(rank)
     return 1.0
+
+
+def _train_args_from_meta(ckpt_dir: str) -> Mapping[str, object]:
+    """Load the training arguments needed for strict checkpoint conversion."""
+    meta_pt = os.path.join(ckpt_dir, "meta.pt")
+    if not os.path.exists(meta_pt):
+        raise FileNotFoundError(
+            f"required checkpoint metadata is missing: {meta_pt}; export "
+            "cannot safely reconstruct behavior-only model settings"
+        )
+    meta = torch.load(meta_pt, map_location="cpu", weights_only=False)
+    if not isinstance(meta, dict):
+        raise ValueError(f"checkpoint metadata {meta_pt} must be a dictionary")
+    train_args = meta.get("args")
+    if not isinstance(train_args, Mapping) or not train_args:
+        raise ValueError(
+            f"checkpoint args in {meta_pt} must be a non-empty mapping"
+        )
+    return train_args
+
+
+def _prepare_export_state_dict(sd: dict, ckpt_dir: str) -> dict:
+    """Normalize wrappers and fold LoRA using mandatory checkpoint metadata."""
+    return prepare_inference_state_dict(sd, _train_args_from_meta(ckpt_dir))
+
+
+def _encoder_residual_from_meta(ckpt_dir: str) -> bool:
+    """Restore the encoder's behavior-only residual setting."""
+    return not bool(
+        _train_args_from_meta(ckpt_dir).get("no_encoder_residual", False)
+    )
 
 
 def refuse_base_token_positions(ckpt_dir: str) -> None:
@@ -74,11 +102,14 @@ def refuse_base_token_positions(ckpt_dir: str) -> None:
     a checkpoint trained with base-space or two-axis positions would load fine
     and silently score with the wrong geometry. Export support is a separate task.
     """
-    meta_pt = os.path.join(ckpt_dir, "meta.pt")
-    if not os.path.exists(meta_pt):
-        return
-    meta = torch.load(meta_pt, map_location="cpu", weights_only=False)
-    train_args = meta.get("args", {}) if isinstance(meta, dict) else {}
+    train_args = _train_args_from_meta(ckpt_dir)
+    if train_args and train_args.get("gated_compressed_rope"):
+        raise NotImplementedError(
+            "this checkpoint was trained with --gated_compressed_rope; the "
+            "ext/zip2zip HF runtime has no gated compressed-coordinate RoPE "
+            "path, so an export would silently compute wrong attention "
+            "geometry. Evaluate it through the in-core adapter instead."
+        )
     if train_args and train_args.get("two_axis_rope"):
         raise NotImplementedError(
             "this checkpoint was trained with --two_axis_rope; the ext/zip2zip "
@@ -100,11 +131,7 @@ def _disable_digit_ids_from_meta(ckpt_dir: str) -> bool:
     --disable_digit_ids). Exported disabled_ids must match this or the export
     silently merges digits the model never saw as hyper-tokens in training —
     the same mismatch class as the chat-token bug, for digits instead."""
-    meta_pt = os.path.join(ckpt_dir, "meta.pt")
-    if not os.path.exists(meta_pt):
-        return False
-    meta = torch.load(meta_pt, map_location="cpu", weights_only=False)
-    train_args = meta.get("args", {}) if isinstance(meta, dict) else {}
+    train_args = _train_args_from_meta(ckpt_dir)
     return bool(train_args.get("disable_digit_ids"))
 
 
@@ -125,13 +152,10 @@ def _resolve_encoder_n_heads(ckpt_dir: str, hidden_size: int, explicit: int | No
     if explicit is not None:
         n_heads, source = explicit, "explicit --encoder_n_heads"
     else:
-        meta_pt = os.path.join(ckpt_dir, "meta.pt")
-        if os.path.exists(meta_pt):
-            meta = torch.load(meta_pt, map_location="cpu", weights_only=False)
-            train_args = meta.get("args", {}) if isinstance(meta, dict) else {}
-            val = train_args.get("encoder_n_heads")
-            if isinstance(val, int) and val > 0:
-                n_heads, source = val, "meta.pt train args"
+        train_args = _train_args_from_meta(ckpt_dir)
+        val = train_args.get("encoder_n_heads")
+        if isinstance(val, int) and val > 0:
+            n_heads, source = val, "meta.pt train args"
         if n_heads is None:
             n_heads, source = hidden_size // 64, "hidden_size // 64 (legacy fallback)"
 
@@ -242,6 +266,47 @@ def _make_llama_config(model_config_name: str | None, sd: dict):
     return cfg
 
 
+def _validate_hf_decoder_state_dict(sd: dict, n_layers: int) -> None:
+    """Reject incomplete or architecture-mismatched decoder exports."""
+    if not isinstance(n_layers, int) or isinstance(n_layers, bool) or n_layers <= 0:
+        raise ValueError(f"decoder n_layers must be a positive integer, got {n_layers!r}")
+
+    expected = {
+        "model.embed_tokens.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+    }
+    per_layer = (
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "mlp.gate_proj.weight",
+        "mlp.up_proj.weight",
+        "mlp.down_proj.weight",
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+    )
+    for layer_id in range(n_layers):
+        expected.update(
+            f"model.layers.{layer_id}.{suffix}" for suffix in per_layer
+        )
+
+    actual = set(sd)
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"missing={missing[:8]}")
+        if unexpected:
+            details.append(f"unexpected={unexpected[:8]}")
+        raise ValueError(
+            "incomplete or architecture-mismatched decoder checkpoint: "
+            + "; ".join(details)
+        )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -255,7 +320,7 @@ def export(
     max_codebook_size: int = 4096,
     disabled_ids: list[int] | None = None,
     disable_digit_ids: bool | None = None,
-    residual: bool = True,
+    residual: bool | None = None,
     causal: bool = False,
 ):
     """Export a zip2zip-core checkpoint to ext/zip2zip HF format.
@@ -275,7 +340,8 @@ def export(
             training. If None, auto-detected from meta.pt's --disable_digit_ids
             (self-healing, same pattern as lm_eval_adapter.py) — passing an
             explicit disabled_ids list skips this entirely.
-        residual: Use residual connection in encoder (default True)
+        residual: Use residual connection in encoder. If None, restore the
+            checkpoint's behavior-only setting from meta.pt.
         causal: Use causal masking in encoder (default False)
     """
     os.makedirs(output_dir, exist_ok=True)
@@ -285,10 +351,12 @@ def export(
     model_pt = os.path.join(ckpt_dir, "model.pt")
     print(f"Loading {model_pt} ...")
     sd = torch.load(model_pt, map_location="cpu", weights_only=True)
-    lora_scaling = _lora_scaling_from_meta(ckpt_dir)
     if any("base_layer" in k for k in sd):
-        print(f"  Merging LoRA adapters with scaling=alpha/rank={lora_scaling:g}")
-    sd = _merge_lora_weights(sd, lora_scaling)
+        print("  Merging LoRA adapters with scaling=alpha/rank from meta.pt")
+    sd = _prepare_export_state_dict(sd, ckpt_dir)
+    if residual is None:
+        residual = _encoder_residual_from_meta(ckpt_dir)
+        print(f"  encoder residual={residual} (from meta.pt)")
 
     decoder_sd, encoder_sd, output_encoder_sd = _split_state_dict(sd)
     untied = bool(output_encoder_sd)
@@ -306,6 +374,7 @@ def export(
     from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
     adapter = Llama3StateDictAdapter(llama_cfg, None)
     hf_decoder_sd = adapter.to_hf(decoder_sd)
+    _validate_hf_decoder_state_dict(hf_decoder_sd, llama_cfg.n_layers)
 
     # ---- Save model.safetensors ----------------------------------------
     try:

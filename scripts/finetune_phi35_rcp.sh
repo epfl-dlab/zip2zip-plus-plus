@@ -152,6 +152,17 @@ TWOAXIS_FLAG=""
 if [ -n "$TWO_AXIS_ROPE" ] && [ "$TWO_AXIS_ROPE" != "0" ]; then
     TWOAXIS_FLAG="--two_axis_rope"
 fi
+# GATED_COMPRESSED_ROPE=1: v0.7.1 keeps base-stream RoPE as the exact
+# initialization and learns a compressed-position delta only in upper decoder
+# layers. Unlike v0.7, this does not replace half the frequency pairs.
+GATED_COMPRESSED_ROPE=${GATED_COMPRESSED_ROPE:-}
+GATEDROPE_FLAG=""
+if [ -n "$GATED_COMPRESSED_ROPE" ] && [ "$GATED_COMPRESSED_ROPE" != "0" ]; then
+    GATEDROPE_FLAG="--gated_compressed_rope"
+fi
+# Always pass the numeric settings so meta.pt records their effective values.
+GATED_ROPE_START_LAYER=${GATED_ROPE_START_LAYER:-16}
+BASE_VIEW_REPLAY_PROB=${BASE_VIEW_REPLAY_PROB:-0}
 # TOKEN_TYPE_LOSS_WEIGHT=w: auxiliary base-vs-hyper next-token type loss
 # (v0.6.3 recipe, w=0.05). 0 = off (no head, v0.6.2 behavior). Always passed
 # explicitly so meta.pt records the effective value; eval needs no env (the
@@ -186,6 +197,7 @@ fi
 
 # Released run: 8000 steps x 32,768 tokens/step = ~262M tokens.
 STEPS=${STEPS:-8000}
+SEED=${SEED:-42}
 SEQ_LEN=${SEQ_LEN:-2048}
 LOCAL_BATCH_SIZE=${LOCAL_BATCH_SIZE:-1}
 # Keep 32,768 tokens/step regardless of GPU count: accum = 32768/(bs*seq*gpus).
@@ -351,10 +363,10 @@ echo "INIT_FROM_HF=$INIT_FROM_HF  TOKENIZER=$TOKENIZER"
 echo "FREEZE_DECODER=$FREEZE_DECODER  LORA_RANK=$LORA_RANK  LORA_ALPHA=$LORA_ALPHA"
 echo "ENCODER: type=$HYPER_ENCODER_TYPE dim=$ENCODER_DIM layers=$ENCODER_N_LAYERS heads=$ENCODER_N_HEADS inter=$ENCODER_INTERMEDIATE_SIZE"
 echo "RECIPE=${RECIPE:-<none, explicit env only>}"
-echo "DIGIT_FLAG='$DIGIT_FLAG'  UNTIED_FLAG='$UNTIED_FLAG'  SHARE_HYPER_ENCODER_FLAG='$SHARE_HYPER_ENCODER_FLAG'  WARMSTART_FLAG='$WARMSTART_FLAG'  BASEPOS_FLAG='$BASEPOS_FLAG'  TWOAXIS_FLAG='$TWOAXIS_FLAG'  ZEROINIT_FLAG='$ZEROINIT_FLAG'  NO_ENCODER_RESIDUAL_FLAG='$NO_ENCODER_RESIDUAL_FLAG'  ONLINECB_FLAG='$ONLINECB_FLAG'  TOKEN_TYPE_LOSS_WEIGHT=$TOKEN_TYPE_LOSS_WEIGHT"
+echo "DIGIT_FLAG='$DIGIT_FLAG'  UNTIED_FLAG='$UNTIED_FLAG'  SHARE_HYPER_ENCODER_FLAG='$SHARE_HYPER_ENCODER_FLAG'  WARMSTART_FLAG='$WARMSTART_FLAG'  BASEPOS_FLAG='$BASEPOS_FLAG'  TWOAXIS_FLAG='$TWOAXIS_FLAG'  GATEDROPE_FLAG='$GATEDROPE_FLAG'  GATED_ROPE_START_LAYER=$GATED_ROPE_START_LAYER  BASE_VIEW_REPLAY_PROB=$BASE_VIEW_REPLAY_PROB  ZEROINIT_FLAG='$ZEROINIT_FLAG'  NO_ENCODER_RESIDUAL_FLAG='$NO_ENCODER_RESIDUAL_FLAG'  ONLINECB_FLAG='$ONLINECB_FLAG'  TOKEN_TYPE_LOSS_WEIGHT=$TOKEN_TYPE_LOSS_WEIGHT"
 echo "CODEBOOK(active)=$MAX_ACTIVE_CODEBOOK_SIZE  LR=$LR->$MIN_LR warmup=$WARMUP_STEPS wd=$WEIGHT_DECAY beta2=$ADAM_BETA2"
 echo "SEQ_LEN=$SEQ_LEN  GRAD_ACCUM=$GRAD_ACCUM  TOKENS/STEP=$TOKENS_PER_STEP (released: 32768)"
-echo "STEPS=$STEPS  MAX_TOKENS=$MAX_TOKENS"
+echo "STEPS=$STEPS  MAX_TOKENS=$MAX_TOKENS  SEED=$SEED"
 echo "DATA_DIR=$DATA_DIR"
 echo "OUTPUT_DIR=$OUTPUT_DIR  RUN_NAME=$RUN_NAME"
 if [ "$TOKENS_PER_STEP" -ne 32768 ]; then
@@ -377,6 +389,7 @@ fi
     --max_active_codebook_size "$MAX_ACTIVE_CODEBOOK_SIZE" \
     --max_codebook_size "$MAX_CODEBOOK_SIZE" \
     --steps "$STEPS" \
+    --seed "$SEED" \
     --max_tokens "$MAX_TOKENS" \
     --seq_len "$SEQ_LEN" \
     --local_batch_size "$LOCAL_BATCH_SIZE" \
@@ -396,6 +409,9 @@ fi
     $SHARE_HYPER_ENCODER_FLAG \
     $BASEPOS_FLAG \
     $TWOAXIS_FLAG \
+    $GATEDROPE_FLAG \
+    --gated_rope_start_layer "$GATED_ROPE_START_LAYER" \
+    --base_view_replay_prob "$BASE_VIEW_REPLAY_PROB" \
     $ZEROINIT_FLAG \
     $WARMSTART_FLAG \
     --token_type_loss_weight "$TOKEN_TYPE_LOSS_WEIGHT" \

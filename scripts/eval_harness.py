@@ -59,13 +59,9 @@ def _resolve_ckpt_dir(args: argparse.Namespace) -> str:
 
         local_dir = None
         for fn in ("model.pt", "meta.pt"):
-            try:
-                p = hf_hub_download(args.hf_repo, fn, revision=args.hf_revision)
-                if local_dir is None:
-                    local_dir = os.path.dirname(p)
-            except Exception:
-                if fn == "model.pt":
-                    raise
+            p = hf_hub_download(args.hf_repo, fn, revision=args.hf_revision)
+            if local_dir is None:
+                local_dir = os.path.dirname(p)
         return local_dir
 
     ckpt = args.ckpt_dir
@@ -130,6 +126,9 @@ def main():
     p.add_argument("--no_wandb", action="store_true", help="Disable W&B logging.")
     p.add_argument("--wandb_project", default=None,
                    help="W&B project name. Defaults to WANDB_PROJECT from project.py.")
+    p.add_argument("--wandb_entity", default=None,
+                   help="W&B entity. Defaults to WANDB_ENTITY from the environment, "
+                        "then the shared project constant.")
     p.add_argument("--wandb_name", default=None, help="W&B run name.")
     p.add_argument("--resume_wandb_id", type=str, required=True,
                    help="W&B run ID to log eval results into (e.g. '8d11iyds'). "
@@ -181,6 +180,12 @@ def main():
     args.eval_mode = lm.eval_mode
     args.base_token_positions = lm.cfg.base_token_positions
     args.two_axis_rope = lm.cfg.two_axis_rope
+    args.gated_compressed_rope = bool(
+        getattr(lm.cfg, "gated_compressed_rope", False)
+    )
+    args.gated_rope_start_layer = int(
+        getattr(lm.cfg, "gated_rope_start_layer", 16)
+    )
     args.online_codebook_mask = lm.online_codebook_mask
     args.online_codebook_mask_active = lm.online_codebook_mask_active
     # Distinguishes "inactive because base mode" from "inactive because this eval
@@ -195,7 +200,9 @@ def main():
     print(f"[eval_harness] eval_mode:    {args.eval_mode}")
     print(
         f"[eval_harness] decoder RoPE: base_positions="
-        f"{args.base_token_positions} two_axis={args.two_axis_rope}"
+        f"{args.base_token_positions} two_axis={args.two_axis_rope} "
+        f"gated_compressed={args.gated_compressed_rope} "
+        f"gated_start_layer={args.gated_rope_start_layer}"
     )
     print(
         f"[eval_harness] online mask:  checkpoint={args.online_codebook_mask} "
@@ -243,6 +250,11 @@ def main():
         from lm_eval.loggers import WandbLogger
         import wandb
 
+        wandb_entity = (
+            args.wandb_entity
+            or os.environ.get("WANDB_ENTITY")
+            or WANDB_ENTITY
+        )
         if args.wandb_name:
             wandb_name = f"eval-{args.wandb_name}"
         elif args.hf_repo:
@@ -256,7 +268,7 @@ def main():
         resume_id = args.resume_wandb_id
         if resume_id and resume_id.lower() != "none":
             wandb.init(
-                entity=WANDB_ENTITY,
+                entity=wandb_entity,
                 project=args.wandb_project or WANDB_PROJECT,
                 id=resume_id,
                 resume="must",
@@ -268,7 +280,7 @@ def main():
             )
         else:
             wandb.init(
-                entity=WANDB_ENTITY,
+                entity=wandb_entity,
                 project=args.wandb_project or WANDB_PROJECT,
                 name=wandb_name,
                 job_type="eval",
