@@ -13,17 +13,56 @@ Training data flows through two stages:
 uv run python scripts/pretokenize.py \
     --output_dir /path/to/tokens \
     --dataset epfl-dlab/llaza-20B \
-    --target_tokens 20e9
+    --model_name microsoft/Phi-3.5-mini-instruct \
+    --target_tokens 20e9 \
+    --tokens_per_shard 39000000
 ```
+
+On RCP use `scripts/pretokenize_llaza20b_rcp.sh`, which wraps the above with the
+Run:AI submission, a disk preflight, and a post-run format check.
 
 ### What it does
 
 1. Loads a HuggingFace dataset (default: `epfl-dlab/llaza-20B`)
-2. Tokenizes each document with the Llama 3 tokenizer, wrapping with `<bos>` / `<eos>`
+2. Tokenizes each document with the given tokenizer, wrapping with `<bos>` / `<eos>`
 3. Concatenates all documents into a continuous token stream
 4. Writes fixed-size shards as `shard_00000.npy`, `shard_00001.npy`, etc.
 
-Each shard contains ~1B tokens as `uint32` values. The script supports resuming — if shards already exist, it picks up from where it left off.
+Each shard contains `--tokens_per_shard` tokens as `uint32` values. **Pass
+`--model_name` explicitly** — the default is the Llama 3.1 tokenizer, which does
+not match the Phi-3.5-mini runs, and `train.py --tokenizer` must agree with
+whatever the data was tokenized with.
+
+`--tokens_per_shard` also sets the peak RAM: a shard is accumulated in a Python
+list before conversion to numpy, at roughly 30-40 bytes per buffered token. The
+1B default therefore needs 35-50 GB; 39M needs about 2 GB.
+
+### Output files
+
+| File | Purpose |
+|------|---------|
+| `shard_%05d.npy` | flat 1-D `uint32` token ids — what the loader reads |
+| `manifest.json` | token/document/shard counts, tokens per shard, `complete` flag |
+| `pending_after_%05d.bin` | tokens accumulated toward the next shard, for exact resume |
+
+The pending file deliberately does not end in `.npy`, because the loader treats
+every non-`mask_` `.npy` in the directory as a token shard.
+
+### Resuming
+
+Re-running the same command on an existing output directory resumes exactly: the
+manifest records how many documents were consumed, and the pending file holds the
+leftover tokens, so the result is identical to an uninterrupted run. This works
+because the document order is fixed by `shuffle(seed=42)`.
+
+A directory holding shards but **no** manifest cannot be resumed — nothing records
+where the stream stopped — and the script aborts rather than restart from document
+0, which would write byte-identical duplicates of the existing shards into
+higher-numbered files. Either empty the directory, or pass
+`--assume_docs_processed N` if the run log tells you the count.
+
+If a job was killed mid-flush, the manifest's shard count will disagree with the
+files on disk; delete the highest-numbered `shard_*.npy` and re-run.
 
 ### Options
 
@@ -32,10 +71,16 @@ Each shard contains ~1B tokens as `uint32` values. The script supports resuming 
 | `--output_dir` | (required) | Output directory for `.npy` shards |
 | `--dataset` | `epfl-dlab/llaza-20B` | HuggingFace dataset path |
 | `--dataset_name` | None | Dataset config name (e.g. `sample-10BT`) |
-| `--model_name` | `meta-llama/Llama-3.1-8B` | Tokenizer to use |
-| `--tokens_per_shard` | 1B | Tokens per shard file |
+| `--model_name` | `meta-llama/Llama-3.1-8B` | Tokenizer to use — set this explicitly |
+| `--tokens_per_shard` | 1B | Tokens per shard file; also sets peak RAM |
 | `--target_tokens` | 20B | Total tokens to produce |
 | `--min_doc_length` | 50 | Filter out short documents (characters) |
+| `--assume_docs_processed` | -1 | Resume a manifest-less directory by supplying the document count |
+
+Note that `--target_tokens` does not bound the intermediate cost: `load_dataset`
+is not streaming and `.map` is eager, so the whole split is tokenized into the
+HuggingFace Arrow cache before the first shard is written. For a 20B-token corpus
+budget roughly 46 GB of parquet, 160 GB of Arrow cache, and 75 GiB of output.
 
 ### Loss masks (optional)
 

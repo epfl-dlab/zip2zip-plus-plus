@@ -762,6 +762,7 @@ Single source of truth for where things live on the cluster (`$SCRATCH =
 | Phi SFT data (mathchat, v0.3) | `$SCRATCH/datasets/phi-1B-sft-8shards-mathchat` | eosfix + math docs re-rendered as multi-turn chat via exact NuminaMath problem matching; experimental until v0.3 validates |
 | Phi SFT data (legacy) | *deleted 2026-07-15* | was `phi-1B-sft-8shards` (EOS masked out); v0.1-repro trained on it — superseded by eosfix after v0.2 validated |
 | Llama SFT data | `$SCRATCH/datasets/zip2zip-1B-sft-8shards` | For a future Llama-3.2-1B reproduction; do not delete |
+| Phi pretraining data (20B) | `$SCRATCH/datasets/phi-20B-tokens-513shards` | Raw `epfl-dlab/llaza-20B`, Phi tokenizer, 513 shards of 39M — same settings as the CSCS `phi-20B-tokens-512shards` corpus, so byte-identical to it. **No `mask_*.npy`** (raw text has no assistant turns), so `pipeline_ft_eval_rcp.sh` rejects it — train with `finetune_phi35_rcp.sh`. Built by `pretokenize_llaza20b_rcp.sh` |
 | Checkpoints | `$SCRATCH/zip2zip-outputs/<RUN_NAME>/step_N` | `train.py` suffixes `(N)` on name collision — always pick a fresh `RUN_NAME`; the verified baseline is `andrea-z2z-phi35-4B-repro-1BData-v0.1-Zip2zipCore(1)/step_8000` |
 | Eval logs + results JSON | `$SCRATCH/logs/eval/` | JSONs are the record when `WANDB=0`; backfill with `scripts/log_results_to_wandb.py` |
 | Train / tokenize logs | `$SCRATCH/logs/train/`, `$SCRATCH/logs/tokenize/` | |
