@@ -71,7 +71,7 @@ export HF_HOME=$Z2Z_SCRATCH/.cache/huggingface
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
-PROJECT_DIR=$Z2Z_SCRATCH/code/zip2zip-core
+PROJECT_DIR=${PROJECT_DIR:-$Z2Z_SCRATCH/code/zip2zip-core}
 LOG_DIR=$Z2Z_SCRATCH/logs/eval
 mkdir -p "$LOG_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
