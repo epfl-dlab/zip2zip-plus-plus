@@ -508,6 +508,11 @@ def validate_resume_args(resume_dir, args):
             "base_token_positions", "two_axis_rope",
             "zero_init_encoder_output", "no_encoder_residual",
             "token_type_loss_weight", "online_codebook_mask",
+            # lora_alpha sets scaling = alpha/rank as a RUNTIME attribute
+            # (lora.py), not a state-dict entry: changing it on resume loads the
+            # weights happily and silently changes the model's function. The
+            # other two change what the objective is and what the codebook means.
+            "lora_alpha", "hyper_causal_mask", "no_remap_codebook",
             "hyper_encoder_type", "encoder_dim", "encoder_n_layers",
             "encoder_n_heads", "encoder_intermediate_size")
     soft = ("max_subtokens", "seq_len", "data_dir", "warmstart_steps")

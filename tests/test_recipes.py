@@ -113,6 +113,17 @@ def main():
           and R.RECIPES["v0.7"]["status"] == "negative",
           f"{sorted(R.resolve('v0.7').items())}")
 
+    # ---- R2b: resume-hard coverage for levers that live OUTSIDE ENV_KEYS ----
+    # lora_alpha sets scaling = alpha/rank as a runtime attribute, so a resume
+    # that changes it loads weights fine and silently changes the model.
+    import zip2zip_core.train as _train_mod, inspect as _inspect
+    _hard_src = _inspect.getsource(_train_mod.validate_resume_args)
+    _missing = [k for k in ("lora_alpha", "hyper_causal_mask", "no_remap_codebook")
+                if f'"{k}"' not in _hard_src]
+    check("R2b_runtime_only_levers_are_resume_hard", not _missing,
+          "lora_alpha/hyper_causal_mask/no_remap_codebook are compared on resume"
+          if not _missing else f"NOT in the hard list: {_missing}")
+
     # ---- R3: ledger property — each version = parent + its own env block ----
     offenders = []
     for name, spec in R.RECIPES.items():

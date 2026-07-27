@@ -833,8 +833,10 @@ The rest:
 - **A resume whose position cannot be restored is a hard error**, covering: a
   checkpoint from a `NUM_WORKERS>0` run or from before this existed; a changed
   `world_size` (shards are split `rank::world_size`); and a changed corpus — the
-  position records each shard's name and size, so pointing `DATA_DIR` at a
-  different dataset is refused even when the shard count matches. Restart from
+  position records each shard's name and size — and each loss mask's, since the
+  masks decide which labels enter the loss and live in separate files — so
+  pointing `DATA_DIR` at a different dataset, or at the same tokens with
+  regenerated masks, is refused even when the shard count matches. Restart from
   step 0, or accept the replay deliberately with `--allow_data_replay`. Most
   launchers do not forward extra arguments, so the flag also reads
   `ALLOW_DATA_REPLAY=1` straight from the environment and therefore works from

@@ -639,6 +639,21 @@ class Zip2ZipDataset(IterableDataset, Stateful):
             for path in self.shard_files
         ]
 
+    def _mask_identity(self):
+        """Identity of this rank's loss masks, or None when the corpus has none.
+
+        The masks decide WHICH labels enter the loss, so swapping them mid-run
+        mixes two objectives in one run. They live in separate files from the
+        token shards, so identical tokens with regenerated masks would otherwise
+        pass every other check.
+        """
+        if self.mask_files is None:
+            return None
+        return [
+            (os.path.basename(path), os.path.getsize(path))
+            for path in self.mask_files
+        ]
+
     def state_dict(self):
         """Position in this rank's data stream, for an exact resume."""
         return {
@@ -646,6 +661,7 @@ class Zip2ZipDataset(IterableDataset, Stateful):
             "offset": self._offset,
             "mode": self.mode,
             "shards": self._shard_identity(),
+            "masks": self._mask_identity(),
         }
 
     def check_state_dict(self, state_dict):
@@ -682,6 +698,34 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                 f"position belongs to a different dataset for this rank: {detail}. "
                 f"Check DATA_DIR (currently {self.data_dir})"
             )
+        # Masks were added to the recorded identity after `shards`, so a state
+        # written by an older build simply has no "masks" key: skip rather than
+        # refuse, or resuming any checkpoint from before the change would break.
+        if "masks" in state_dict:
+            saved_masks = state_dict["masks"]
+            current_masks = self._mask_identity()
+            if saved_masks is not None:
+                saved_masks = [tuple(entry) for entry in saved_masks]
+            if saved_masks != current_masks:
+                if (saved_masks is None) != (current_masks is None):
+                    detail = (
+                        "the checkpoint trained WITH loss masks and this corpus has "
+                        "none" if current_masks is None else
+                        "the checkpoint trained WITHOUT loss masks and this corpus "
+                        "has them"
+                    )
+                else:
+                    detail = (
+                        f"masks differ: {[n for n, _ in saved_masks]} vs "
+                        f"{[n for n, _ in current_masks]}"
+                        if [n for n, _ in saved_masks] != [n for n, _ in current_masks]
+                        else "same mask names but different sizes (regenerated)"
+                    )
+                raise ValueError(
+                    f"position belongs to a different loss objective: {detail}. "
+                    "Which labels enter the loss would change mid-run"
+                )
+
         if not 0 <= state_dict["shard_idx"] < len(self.shard_files):
             raise ValueError(
                 f"saved shard_idx={state_dict['shard_idx']} is out of range for "

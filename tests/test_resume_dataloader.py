@@ -284,6 +284,42 @@ def main():
                 "size — the count-only guard would have accepted this silently",
             )
 
+        # ---- D12: regenerated loss masks are a different objective ----
+        # The masks decide which labels enter the loss and live in separate files
+        # from the tokens, so identical tokens with rebuilt masks would pass every
+        # other check. Relevant whenever a dataset is re-tokenized.
+        with tempfile.TemporaryDirectory() as remask_dir:
+            write_shards(remask_dir, n_shards=2, tokens_per_shard=1600)
+            # Same tokens, masks rebuilt at a different length.
+            for i in range(2):
+                np.save(
+                    os.path.join(remask_dir, f"mask_{i:03d}.npy"),
+                    np.ones(1600 // 2, dtype=bool),
+                )
+            remasked = make_dataset(remask_dir)
+            same_tokens = [
+                os.path.basename(p) for p in remasked.shard_files
+            ] == [os.path.basename(p) for p in make_dataset(data_dir).shard_files]
+            mask_refused = False
+            try:
+                remasked.load_state_dict(good)
+            except ValueError as exc:
+                mask_refused = "different loss objective" in str(exc)
+            check(
+                "D12_regenerated_masks_refused",
+                same_tokens and mask_refused,
+                "identical token shards, rebuilt masks: refused instead of "
+                "silently mixing two objectives in one run",
+            )
+        check(
+            "D12_missing_masks_key_is_tolerated",
+            (lambda st: refuses(st, "IMPOSSIBLE") is False)(
+                {k: v for k, v in good.items() if k != "masks"}
+            ),
+            "a state from before masks were recorded still resumes, instead of "
+            "breaking every pre-existing checkpoint",
+        )
+
         # ---- D11: worker slicing keeps shards and masks paired ----
         # Pre-existing defect found while reviewing this work: __iter__ sliced the
         # token shards per worker but handed the iterator the rank-level mask
