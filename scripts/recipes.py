@@ -227,6 +227,16 @@ RECIPES = {
         "notes": "Xinxian exploratory run: tests whether the first-token residual "
                  "interferes with the recurrent pattern learned by the hierarchical composer.",
     },
+    "vx0.6.4.5": {
+        "extends": "vx0.6.4.3",
+        "status": "exploratory",
+        "description": "hierarchical hyper-encoder trained with merge size 3",
+        "env": {"MAX_SUBTOKENS": "3"},
+        "notes": "Xinxian exploratory run: tests whether the hierarchical encoder "
+                 "learns useful recurrent structure under a smaller train-time "
+                 "merge size. Eval-time merge-size transfer still requires a "
+                 "separate override implementation.",
+    },
     "v0.6.5": {
         "extends": "v0.6.4",
         "status": "negative",
