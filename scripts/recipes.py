@@ -77,6 +77,7 @@ ENV_KEYS = {
     "WARMSTART_STEPS":          ("warmstart_steps",          "int",   0),
     # off = the Phi3.5-mini config default, the only model config this line uses
     "ENCODER_N_LAYERS":         ("encoder_n_layers",         "int",   2),
+    "MAX_SUBTOKENS":            ("max_subtokens",            "int",   4),
 }
 
 # A mainline child may contain exactly one concrete delta, on exactly one
