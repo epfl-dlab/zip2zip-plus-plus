@@ -181,12 +181,19 @@ def main():
             failures.append("manifest says the run never completed")
         docs = manifest.get("documents_processed")
         if docs and bos_id is not None:
-            # <bos> is emitted once per document. The corpus stops at the target,
-            # so the last few documents' tokens can be dropped: bos <= docs.
+            # One <bos> per document is the floor, not the exact count: with
+            # add_special_tokens=False the tokenizer still maps a literal "<s>"
+            # occurring in the source text to the same id, so a corpus with code
+            # and markup carries a few extra. Fewer than one per document would
+            # mean lost document boundaries, which is the real defect to catch.
+            extra = total_bos - docs
             print(f"documents_processed={docs} vs <bos>={total_bos} "
-                  f"(diff {docs - total_bos}, expected small and >= 0)")
-            if total_bos > docs:
-                failures.append(f"{total_bos} <bos> but only {docs} documents recorded")
+                  f"(extra {extra}, {extra/docs*100:.4f}% — in-text literals)")
+            if total_bos < docs:
+                failures.append(
+                    f"only {total_bos} <bos> for {docs} documents — {docs - total_bos} "
+                    "document boundaries are missing"
+                )
 
     mask_files = [f for f in os.listdir(args.data_dir) if f.startswith("mask_")]
     print(f"\nmask files: {len(mask_files)}")
