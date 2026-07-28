@@ -200,3 +200,55 @@ support the hypothesis that the hierarchical hyper-encoder learns reusable
 structure rather than overfitting to one merge-size setting.
 
 Implementation: add an eval-time merge-size override, then launch training and evaluation as separate jobs.
+
+Transfer eval: compare the `vx0.6.4.5` checkpoint trained with merge size 3
+against the `vx0.6.4.3` merge-size-4 baseline, with both its native merge-size-3
+eval and the forced merge-size-4 eval.
+
+| Version | Train max_subtokens | Eval max_subtokens | ARC-c | ARC-e | HellaSwag | OBQA | PIQA | WinoGrande | GSM8K strict \| flexible | Wiki byte_ppl↓ | gen_compression_ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `vx0.6.4.3` | 4 | 4 | **0.5597** | **0.8359** | **0.7252** | 0.4640 | 0.8003 | 0.7348 | 0.201 \| **0.6308** | 1.6586 | 1.2490 |
+| `vx0.6.4.5` | 3 | 3 | 0.5529 | 0.8333 | 0.7224 | **0.4680** | 0.8058 | **0.7459** | **0.211** \| 0.6118 | **1.6581** | 1.2527 |
+| `vx0.6.4.5` | 3 | 4 | 0.5520 | 0.8321 | 0.7231 | **0.4680** | **0.8063** | **0.7459** | 0.208 \| 0.6179 | 1.6600 | 1.2538 |
+
+Takeaway: the merge-size-3 run appears to transfer cleanly to eval merge
+size 4, but this conclusion may be biased by how small the actual compression
+difference is between `max_subtokens=3` and `max_subtokens=4`. The `4 -> 4` and
+`3 -> 3` results are very close overall, and `4 -> 4` is still better on several
+MC tasks.
+
+Compression ratio differences are tiny:
+
+| Setting | ms4 | ms3 | Relative diff |
+|---|---:|---:|---:|
+| Train summary | 1.38337 | 1.37389 | ~0.69% |
+| Default eval input | 1.07716 | 1.07697 | ~0.018% |
+| Wiki eval input | 1.16898 | 1.16643 | ~0.22% |
+
+So `max_subtokens=3` does not actually make the eval inputs much less
+compressed. Most merges likely already have length <=3, or the length-4 cap only
+affects a very small fraction of tokens. This means the smaller merge size is not
+exposed strongly enough to produce a stable improvement. Generation is also
+short-form here, so the output-side compression difference is limited as well,
+as reflected by the similar `gen_compression_ratio` values.
+
+The one place where the setting has more room to matter is Wikitext, the only
+long-context task:
+
+| Eval set | Requests / windows | Base tokens | Avg base tokens per request |
+|---|---:|---:|---:|
+| MC + GSM8K | 63,889 | 13,541,095 | ~212 |
+| Wikitext | 114 | 353,256 | ~3,100 |
+
+The compressed-token difference between ms3 and ms4 is also larger on Wikitext:
+
+| Eval set | ms3 vs ms4 compressed-token difference |
+|---|---:|
+| MC + GSM8K | ~0.0175% |
+| Wikitext | ~0.22% |
+
+Notably, the clearest degradation from forced ms4 appears exactly on Wikitext:
+byte-ppl worsens from `1.6581` to `1.6600`. This is also the only setting where
+native ms3 is clearly better than forced ms4. That suggests the transfer cost may
+only become visible when merge size has enough opportunity to actually change the
+compression pattern.
