@@ -44,18 +44,28 @@ history. The cleanup is split by what W&B actually scopes per run:
   `eval_ckpt_rcp.sh` run keeps them visible, being the only copy there.
 - **Sections, order and open/collapsed state are project-scoped**: a run cannot
   ship its own panel layout. `scripts/wandb_workspace_view.py` defines them as
-  code, and pipeline phase 4 refreshes the view when `WANDB_VIEW_URL` points at
-  one (a failure there never fails the pipeline). The eval venv installs
-  `wandb-workspaces` next to `wandb` for it, W&B runs only.
+  code, and pipeline phase 4 refreshes the project's shared saved view
+  ([z2z clean](https://wandb.ai/epfl-dlab/zip2zip-core?nw=ajtwww7qjwp), the
+  `VIEW_URL` constant in that file). `WANDB_VIEW=0` skips it; a failure there
+  never fails the pipeline. The eval venv installs `wandb-workspaces` next to
+  `wandb` for it, W&B runs only.
 
-Create the view once, then reuse its URL — saving a freshly constructed
-`Workspace` always creates a *new* view, so a pipeline that saved without a URL
-would leave one saved view behind per run:
+One view serves the whole team, so nobody needs per-user setup: whoever runs the
+pipeline brings it up to date, and the content is fully determined by the script,
+so concurrent refreshes cannot conflict. Two consequences worth knowing:
+
+- **Manual panel edits to that view are reverted by the next pipeline run.** For a
+  personal arrangement, use the UI's "Save as new view", or point
+  `WANDB_VIEW_URL` at your own view.
+- A view belongs to one entity/project. `--view-url` is rejected when it names a
+  different project than the run logged to, because `from_url` takes its target
+  from the URL — otherwise a `WANDB_PROJECT=llaza` run would rewrite the
+  `zip2zip-core` view.
+
+To create a separate view from scratch (prints the new URL):
 
 ```bash
-python scripts/wandb_workspace_view.py --apply          # prints the view URL
-# then pass that URL on every run:
-runai submit ... --environment WANDB_VIEW_URL='<printed URL>'
+python scripts/wandb_workspace_view.py --apply --view-url ''
 ```
 
 ```bash

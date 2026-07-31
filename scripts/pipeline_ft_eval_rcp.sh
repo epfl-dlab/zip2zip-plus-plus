@@ -45,17 +45,20 @@
 #   WANDB_ENTITY=epfl-dlab  W&B entity used consistently by train/eval/backfill
 #   WANDB=1         one W&B train/eval run (default); requires WANDB_API_KEY
 #   WANDB=0         fully offline: no API-key check and no W&B logging/uploads
-#   WANDB_VIEW_URL=   URL of the W&B saved view to refresh in phase 4, so this
-#                     run's ~124 keys land in the reading order defined by
-#                     scripts/wandb_workspace_view.py. Panels are project-scoped
-#                     (a run cannot ship its own layout), hence a view URL and
-#                     not a per-run setting. EMPTY = skip the refresh: saving a
-#                     view without a URL creates a NEW one, which would pile up
-#                     one view per run. Create it once with
-#                     `python scripts/wandb_workspace_view.py --apply` and pass
-#                     the URL it prints. Cosmetic: a failure never fails the
+#   WANDB_VIEW=1      phase 4 refreshes the project's SHARED W&B saved view so
+#                     this run's ~124 keys land in the reading order defined by
+#                     scripts/wandb_workspace_view.py (VIEW_URL in that file).
+#                     Panels are project-scoped, so one view serves everyone: no
+#                     per-user setup, and whoever runs the pipeline keeps it up
+#                     to date. Manual panel edits to that view are reverted by
+#                     the next run - copy it to your own view in the UI instead.
+#                     Set 0 to skip. Cosmetic: a failure never fails the
 #                     pipeline. Needs wandb-workspaces, installed by the eval
 #                     venv alongside wandb when WANDB=1.
+#   WANDB_VIEW_URL=   override: refresh THIS view instead of the shared one. It
+#                     must belong to $WANDB_ENTITY/$WANDB_PROJECT; the script
+#                     refuses a cross-project URL rather than overwriting the
+#                     wrong project's view.
 #   WANDB_VIEW_NAME='z2z clean'  display name written to that view
 #   SKIP_SMOKE=0      set 1 to skip intermediate smoke evals
 #   SKIP_FULL_PPL=0   set 1 to also skip the wikitext perplexity in phase 3
@@ -180,6 +183,7 @@ export WANDB_ENTITY=${WANDB_ENTITY:-epfl-dlab}
 SKIP_SMOKE=${SKIP_SMOKE:-0}
 SKIP_FULL_PPL=${SKIP_FULL_PPL:-0}
 FINAL_LIMIT=${FINAL_LIMIT:-}
+WANDB_VIEW=${WANDB_VIEW:-1}
 WANDB_VIEW_URL=${WANDB_VIEW_URL:-}
 WANDB_VIEW_NAME=${WANDB_VIEW_NAME:-z2z clean}
 
@@ -526,16 +530,13 @@ python scripts/log_results_to_wandb.py \
 # run, so they cannot be set from the logging calls: re-save the view instead.
 # Duplicate panels are suppressed at log time (train.py and eval_harness.py call
 # define_metric(hidden=True)); this only fixes the reading order.
-if [ -n "$WANDB_VIEW_URL" ]; then
+if [ "$WANDB_VIEW" != "0" ]; then
     echo "--- refreshing saved view '$WANDB_VIEW_NAME' ---"
     python scripts/wandb_workspace_view.py --apply \
         --entity "$WANDB_ENTITY" --project "$WANDB_PROJECT" \
-        --view-name "$WANDB_VIEW_NAME" --view-url "$WANDB_VIEW_URL" \
+        --view-name "$WANDB_VIEW_NAME" \
+        ${WANDB_VIEW_URL:+--view-url "$WANDB_VIEW_URL"} \
         || echo "[pipeline] saved-view refresh skipped (cosmetic; see message above)"
-else
-    echo "[pipeline] no WANDB_VIEW_URL: saved view not refreshed. Create it once with"
-    echo "           python scripts/wandb_workspace_view.py --apply"
-    echo "           then pass the printed URL as WANDB_VIEW_URL on future runs."
 fi
 
 echo "=== pipeline complete: W&B run $WANDB_ENTITY/$WANDB_PROJECT/$WANDB_ID ($RUN_NAME) ==="

@@ -101,22 +101,35 @@ def test_duplicate_panels_are_hidden_where_they_are_logged():
 
 def test_pipeline_refreshes_the_saved_view_without_being_able_to_fail():
     source = PIPELINE.read_text()
-    assert "scripts/wandb_workspace_view.py --apply" in source
-    assert "WANDB_VIEW_URL=${WANDB_VIEW_URL:-}" in source
-    # Refresh only against a known view: saving without a URL creates a new view
-    # every time, which would leave one saved view per pipeline run behind.
-    assert 'if [ -n "$WANDB_VIEW_URL" ]; then' in source
+    assert "WANDB_VIEW=${WANDB_VIEW:-1}" in source
     # Anchor on the guarded block itself, not on the first mention of the script
     # (the env-var documentation in the header mentions it too).
-    guard_at = source.index('if [ -n "$WANDB_VIEW_URL" ]; then')
+    guard_at = source.index('if [ "$WANDB_VIEW" != "0" ]; then')
     block = source[guard_at:guard_at + 600]
     assert "scripts/wandb_workspace_view.py --apply" in block
-    assert '--view-url "$WANDB_VIEW_URL"' in block
+    # No URL of its own: the shared view is the script's default, so every user
+    # refreshes the same view without setting anything. The env var only overrides.
+    assert '${WANDB_VIEW_URL:+--view-url "$WANDB_VIEW_URL"}' in block
     # Cosmetic step at the very end of a multi-hour job: it must never turn a
     # finished run into a failed one.
     assert "|| echo" in block
     # ... and the package it needs is installed by the eval venv, W&B-only.
     assert "EVAL_DEPS+=(wandb wandb-workspaces)" in source
+
+
+def test_shared_view_is_the_default_and_is_project_matched():
+    layout = _load_layout()
+    assert layout.VIEW_URL.startswith("https://wandb.ai/")
+    # The default view must live in the project the script defaults to, or every
+    # pipeline run would refuse the refresh on its own guard.
+    assert f"/{layout.ENTITY}/{layout.PROJECT}" in layout.VIEW_URL
+    assert "?nw=" in layout.VIEW_URL, "must be a saved-view URL, not the project URL"
+
+    source = LAYOUT.read_text()
+    assert 'p.add_argument("--view-url", default=VIEW_URL' in source
+    # Cross-project overwrite guard: from_url takes its target from the URL, so
+    # without this a run logging to another project rewrites this one's view.
+    assert "but this run is " in source
 
 
 def test_layout_covers_every_metric_train_py_logs():

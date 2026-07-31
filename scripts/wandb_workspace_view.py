@@ -39,9 +39,19 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from urllib.parse import urlparse
 
 ENTITY = "epfl-dlab"
 PROJECT = "zip2zip-core"
+
+# The project's shared saved view, created once on 2026-07-31. Every pipeline run
+# refreshes THIS view, for whoever launches it, so the team converges on one
+# layout instead of each person needing their own env var. The content is fully
+# determined by this file, so concurrent refreshes are harmless.
+# Consequence to know: manual panel edits made in the UI on this view are
+# reverted by the next pipeline run. Use the UI's "Save as new view" for a
+# personal arrangement, or point --view-url at your own view.
+VIEW_URL = "https://wandb.ai/epfl-dlab/zip2zip-core?nw=ajtwww7qjwp"
 
 # x-axis of each family. The eval families are logged on their own step metric
 # (log_results_to_wandb.py --step) because a resumed training run's global step
@@ -436,6 +446,18 @@ def apply(
     sections = build_sections(layout, ws, wr)
 
     if view_url:
+        # A saved view belongs to one entity/project. Refuse to rewrite a view
+        # that lives somewhere other than where this run logged: without this,
+        # a run with WANDB_PROJECT=llaza would silently overwrite the
+        # zip2zip-core view, because from_url takes the target from the URL.
+        target = urlparse(view_url).path.strip("/").split("/")
+        if len(target) >= 2 and (target[0], target[1]) != (entity, project):
+            raise SystemExit(
+                f"--view-url points at {target[0]}/{target[1]} but this run is "
+                f"{entity}/{project}. Pass a view URL for that project, or "
+                f"drop --view-url to create one."
+            )
+
         # save() on a freshly constructed Workspace creates a NEW saved view
         # every call (interface.py: empty _internal_name -> _generate_view_name).
         # Loading the existing view first is what makes a re-run overwrite it
@@ -472,11 +494,11 @@ def main() -> None:
     p.add_argument("--apply", action="store_true",
                    help="Save the layout as a saved view (never touches the default workspace).")
     p.add_argument("--view-name", default="z2z clean")
-    p.add_argument("--view-url", default=None,
-                   help="URL of the saved view to overwrite. Without it, --apply "
-                        "CREATES a view and prints its URL: a fresh Workspace() "
-                        "always saves to a new view, so re-running without this "
-                        "would pile up one view per run.")
+    p.add_argument("--view-url", default=VIEW_URL,
+                   help="Saved view to overwrite (default: the project's shared "
+                        "view). Pass '' to CREATE a new view instead and print "
+                        "its URL: a fresh Workspace() always saves to a new view, "
+                        "so this must never be the default in a loop.")
     p.add_argument("--gate-layers", default="0:32", help="rope_gate layer range, START:END")
     p.add_argument("--gate-pairs", default="32:48", help="rope_gate pair range, START:END")
     args = p.parse_args()
