@@ -208,7 +208,9 @@ def test_pipeline_offline_routes_all_eval_and_upload_paths():
 def test_wandb_entity_is_consistent_across_pipeline_phases():
     source = PIPELINE.read_text()
     assert "export WANDB_ENTITY=${WANDB_ENTITY:-epfl-dlab}" in source
-    assert source.count('--entity "$WANDB_ENTITY"') == 4
+    # smoke backfill, final MC backfill, wikitext backfill, notes append,
+    # saved-view refresh: every W&B-touching phase resolves the same entity.
+    assert source.count('--entity "$WANDB_ENTITY"') == 5
     assert "--environment WANDB_ENTITY=$WANDB_ENTITY" in source
 
     eval_source = (REPO / "scripts" / "eval_ckpt_rcp.sh").read_text()

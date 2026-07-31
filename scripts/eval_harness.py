@@ -306,6 +306,16 @@ def main():
         if "versions" in results:
             results["versions"] = {k: str(v) for k, v in results["versions"].items()}
         wandb_logger.post_init(results)
+        if resume_id and resume_id.lower() != "none":
+            # Pipeline path: log_results_to_wandb.py logs these same numbers as
+            # final/<task>/<metric> on their own checkpoint-step x-axis. lm-eval
+            # then writes an unprefixed <task>/<metric> copy on the training
+            # run's step axis, i.e. a duplicate panel per metric. Hide those
+            # auto-panels; the values stay in the run. A standalone eval run
+            # (resume_id none) keeps them visible, because there they are the
+            # only copy of the result.
+            for task_name in (results.get("results") or {}):
+                wandb.define_metric(f"{task_name}/*", hidden=True)
         wandb_logger.log_eval_result()
         eval_stats = {
             f"eval/{k}": v

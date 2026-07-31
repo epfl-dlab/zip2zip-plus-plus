@@ -1264,6 +1264,14 @@ def main():
                 config=vars(args),
             )
 
+            # `compressed/backward_loss` is byte-for-byte the bare
+            # `backward_loss`: both are compat_backward_loss. Suppress its
+            # auto-panel so every workspace does not get two identical curves.
+            # The value stays in the run history (only the panel is hidden), and
+            # `objective/backward_loss` stays visible: it is the one that
+            # differs once base-view replay is on.
+            wandb.define_metric("compressed/backward_loss", hidden=True)
+
             run_name = wandb.run.name
             if not args.no_hf_repo and args.hf_repo is None:
                 args.hf_repo = f"{HF_ORG}/candidate-{run_name}"

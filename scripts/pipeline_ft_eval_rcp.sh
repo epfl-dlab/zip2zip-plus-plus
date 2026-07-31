@@ -25,7 +25,8 @@
 #   3. final eval  last checkpoint: full 'default' preset (with all sample tables
 #                  in JSON and optionally W&B) + wikitext perplexity
 #   4. artifacts   WANDB=1: append paths and the remaining-perplexity command to
-#                  W&B notes. WANDB=0: print the same local artifact paths.
+#                  W&B notes, then refresh the project's saved workspace view.
+#                  WANDB=0: print the same local artifact paths.
 #
 # Env vars:
 #   RUN_NAME=...      required output name; also the W&B name when enabled
@@ -44,6 +45,18 @@
 #   WANDB_ENTITY=epfl-dlab  W&B entity used consistently by train/eval/backfill
 #   WANDB=1         one W&B train/eval run (default); requires WANDB_API_KEY
 #   WANDB=0         fully offline: no API-key check and no W&B logging/uploads
+#   WANDB_VIEW_URL=   URL of the W&B saved view to refresh in phase 4, so this
+#                     run's ~124 keys land in the reading order defined by
+#                     scripts/wandb_workspace_view.py. Panels are project-scoped
+#                     (a run cannot ship its own layout), hence a view URL and
+#                     not a per-run setting. EMPTY = skip the refresh: saving a
+#                     view without a URL creates a NEW one, which would pile up
+#                     one view per run. Create it once with
+#                     `python scripts/wandb_workspace_view.py --apply` and pass
+#                     the URL it prints. Cosmetic: a failure never fails the
+#                     pipeline. Needs wandb-workspaces, installed by the eval
+#                     venv alongside wandb when WANDB=1.
+#   WANDB_VIEW_NAME='z2z clean'  display name written to that view
 #   SKIP_SMOKE=0      set 1 to skip intermediate smoke evals
 #   SKIP_FULL_PPL=0   set 1 to also skip the wikitext perplexity in phase 3
 #   EVAL_MODE=        force eval_harness --eval_mode for all evals; set to
@@ -167,6 +180,8 @@ export WANDB_ENTITY=${WANDB_ENTITY:-epfl-dlab}
 SKIP_SMOKE=${SKIP_SMOKE:-0}
 SKIP_FULL_PPL=${SKIP_FULL_PPL:-0}
 FINAL_LIMIT=${FINAL_LIMIT:-}
+WANDB_VIEW_URL=${WANDB_VIEW_URL:-}
+WANDB_VIEW_NAME=${WANDB_VIEW_NAME:-z2z clean}
 
 OUTPUT_BASE=${OUTPUT_BASE:-$Z2Z_SCRATCH/zip2zip-outputs}
 OUTPUT_DIR=$OUTPUT_BASE/$RUN_NAME
@@ -270,7 +285,11 @@ fi
 source "$VENV_DIR/bin/activate"
 EVAL_DEPS=("lm-eval==0.4.9" "zip2zip-compression>=0.3.3")
 if [ "$WANDB" != "0" ]; then
-    EVAL_DEPS+=(wandb)
+    # wandb-workspaces is only used by phase 4 to re-save the saved view
+    # (panels are project-scoped, so no run can carry its own layout). It is
+    # pure python on top of wandb, and the phase is guarded to never fail the
+    # pipeline if the install is unavailable.
+    EVAL_DEPS+=(wandb wandb-workspaces)
 fi
 pip install --quiet "${EVAL_DEPS[@]}"
 
@@ -502,6 +521,22 @@ python scripts/log_results_to_wandb.py \
     --resume_id "$WANDB_ID" --entity "$WANDB_ENTITY" \
     --project "$WANDB_PROJECT" \
     --append_notes "$NOTES"
+
+# Sections and panel order are a property of the PROJECT workspace, not of a
+# run, so they cannot be set from the logging calls: re-save the view instead.
+# Duplicate panels are suppressed at log time (train.py and eval_harness.py call
+# define_metric(hidden=True)); this only fixes the reading order.
+if [ -n "$WANDB_VIEW_URL" ]; then
+    echo "--- refreshing saved view '$WANDB_VIEW_NAME' ---"
+    python scripts/wandb_workspace_view.py --apply \
+        --entity "$WANDB_ENTITY" --project "$WANDB_PROJECT" \
+        --view-name "$WANDB_VIEW_NAME" --view-url "$WANDB_VIEW_URL" \
+        || echo "[pipeline] saved-view refresh skipped (cosmetic; see message above)"
+else
+    echo "[pipeline] no WANDB_VIEW_URL: saved view not refreshed. Create it once with"
+    echo "           python scripts/wandb_workspace_view.py --apply"
+    echo "           then pass the printed URL as WANDB_VIEW_URL on future runs."
+fi
 
 echo "=== pipeline complete: W&B run $WANDB_ENTITY/$WANDB_PROJECT/$WANDB_ID ($RUN_NAME) ==="
 fi
