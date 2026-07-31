@@ -289,13 +289,17 @@ fi
 source "$VENV_DIR/bin/activate"
 EVAL_DEPS=("lm-eval==0.4.9" "zip2zip-compression>=0.3.3")
 if [ "$WANDB" != "0" ]; then
-    # wandb-workspaces is only used by phase 4 to re-save the saved view
-    # (panels are project-scoped, so no run can carry its own layout). It is
-    # pure python on top of wandb, and the phase is guarded to never fail the
-    # pipeline if the install is unavailable.
-    EVAL_DEPS+=(wandb wandb-workspaces)
+    EVAL_DEPS+=(wandb)
 fi
 pip install --quiet "${EVAL_DEPS[@]}"
+if [ "$WANDB" != "0" ]; then
+    # Installed on its own line, non-fatally, and NOT in EVAL_DEPS: it is needed
+    # only by the phase-4 saved-view refresh, which is cosmetic. In EVAL_DEPS a
+    # PyPI hiccup on this one package would take down the whole pipeline right
+    # before the evals, under set -e.
+    pip install --quiet wandb-workspaces \
+        || echo "[pipeline] wandb-workspaces unavailable: phase 4 will skip the view refresh"
+fi
 
 cd "$PROJECT_DIR"
 

@@ -113,8 +113,12 @@ def test_pipeline_refreshes_the_saved_view_without_being_able_to_fail():
     # Cosmetic step at the very end of a multi-hour job: it must never turn a
     # finished run into a failed one.
     assert "|| echo" in block
-    # ... and the package it needs is installed by the eval venv, W&B-only.
-    assert "EVAL_DEPS+=(wandb wandb-workspaces)" in source
+    # The package it needs is installed by the eval venv, W&B-only, and OUTSIDE
+    # EVAL_DEPS: that pip call is fatal under set -e, and a cosmetic dependency
+    # must not be able to kill a pipeline on its way to the evals.
+    assert "EVAL_DEPS+=(wandb wandb-workspaces)" not in source
+    install_at = source.index("pip install --quiet wandb-workspaces")
+    assert "|| echo" in source[install_at:install_at + 200]
 
 
 def test_shared_view_is_the_default_and_is_project_matched():

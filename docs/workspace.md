@@ -47,8 +47,9 @@ history. The cleanup is split by what W&B actually scopes per run:
   code, and pipeline phase 4 refreshes the project's shared saved view
   ([z2z clean](https://wandb.ai/epfl-dlab/zip2zip-core?nw=ajtwww7qjwp), the
   `VIEW_URL` constant in that file). `WANDB_VIEW=0` skips it; a failure there
-  never fails the pipeline. The eval venv installs `wandb-workspaces` next to
-  `wandb` for it, W&B runs only.
+  never fails the pipeline. The eval venv installs `wandb-workspaces` for it on
+  W&B runs, on its own non-fatal pip line — a cosmetic dependency must not be
+  able to abort a pipeline on its way to the evals.
 
 One view serves the whole team, so nobody needs per-user setup: whoever runs the
 pipeline brings it up to date, and the content is fully determined by the script,
