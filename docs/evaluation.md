@@ -78,6 +78,71 @@ override preset values.
 
 `TASKS=...` env var (or `--tasks`) restricts a preset to one task without editing the YAML.
 
+### Repeated-window Wikitext stress tests
+
+`zip2zip_wikitext_repeat4` and `zip2zip_wikitext_repeat8` are opt-in
+merge-size-transfer stress tests. They are not part of any default preset or
+pipeline, and the standard Wikitext task is unchanged.
+
+The local corpora are built with the
+`microsoft/Phi-3.5-mini-instruct` tokenizer. They are suitable for Zip2Zip
+checkpoints that use that exact tokenizer; forced evaluation at a merge size
+not seen during training is supported only by hierarchical hyper-encoders.
+Other tokenizers need their own rebuilt corpus because token-aware block
+boundaries, single-window guarantees, and LZW compression patterns change.
+
+Prepare the local JSONL files once from the repository root:
+
+```bash
+uv sync --extra eval
+uv run python scripts/build_repeated_wikitext.py --repeat_n 4
+uv run python scripts/build_repeated_wikitext.py --repeat_n 8
+```
+
+By default the builder writes outside the Git repository:
+
+```text
+../datasets/wikitext-repeat4-phi35/{test.jsonl,manifest.json}
+../datasets/wikitext-repeat8-phi35/{test.jsonl,manifest.json}
+```
+
+The default build location is resolved from the script rather than the current
+working directory. The task YAMLs use the paths above, so run evaluation from
+the repository root. Existing data is never overwritten implicitly; rebuild
+explicitly with `--overwrite`.
+
+Run one task by overriding the task list of the 1,024-token perplexity preset:
+
+```bash
+uv run python scripts/eval_harness.py \
+  --ckpt_dir /path/to/checkpoint \
+  --tokenizer microsoft/Phi-3.5-mini-instruct \
+  --preset perplexity \
+  --tasks zip2zip_wikitext_repeat8 \
+  --eval_max_subtokens 4 \
+  --resume_wandb_id none
+```
+
+For the merge-size transfer comparison, run these three settings:
+
+| Train max_subtokens | Eval max_subtokens | Role |
+|---:|---:|---|
+| 3 | 3 | Native ms3 checkpoint |
+| 3 | 4 | Forced-transfer evaluation of the ms3 checkpoint |
+| 4 | 4 | Native ms4 baseline |
+
+The `3 -> 4` and `4 -> 4` rows should have identical input compression:
+compression depends on the text, tokenizer, and eval-time LZW settings, not on
+model weights. Compare perplexity only within the same repeated corpus; later
+copies are intentionally easier to predict, so repeat-4/repeat-8 absolute PPL
+is not directly comparable to standard Wikitext PPL.
+
+> **Future packaging TODO:** if these stress tests become stable public
+> benchmarks, consider publishing versioned corpus artifacts. Supporting
+> non-Phi tokenizers will require either one token-aware build per tokenizer or
+> a redesigned evaluation that constructs tokenizer-specific windows at run
+> time.
+
 ## RCP cluster wrappers (Run:AI)
 
 Three `runai submit`-ready wrappers, all under `scripts/`, sharing the `Z2Z_SCRATCH` env var

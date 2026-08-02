@@ -252,3 +252,100 @@ byte-ppl worsens from `1.6581` to `1.6600`. This is also the only setting where
 native ms3 is clearly better than forced ms4. That suggests the transfer cost may
 only become visible when merge size has enough opportunity to actually change the
 compression pattern.
+
+#### Repeated-window Wikitext stress test
+
+The standard evaluation above does not activate the distinction between merge
+sizes strongly enough: on ordinary Wikitext, ms4 changes the compressed-token
+count by only about 0.22% relative to ms3. We therefore added an opt-in
+repeated-window Wikitext evaluation. The original Wikitext task and every
+default evaluation preset remain unchanged.
+
+The new evaluation is constructed as follows:
+
+1. Start from the Wikitext-2 raw test split and apply the same detokenization as
+   the standard lm-eval Wikitext task.
+2. Tokenize with the Phi-3.5 tokenizer and split each source document into
+   token-aware blocks.
+3. Decode each block, repeat its text either four or eight times with `\n\n`
+   separators, and re-tokenize it. Source blocks are shortened as necessary so
+   every final row contains at most 1,000 base tokens.
+4. Score every repeated copy with `loglikelihood_rolling`; no copy is excluded
+   from the loss. Because every row fits within the 1,024-token evaluation
+   window, it is scored as one window with a freshly initialized LZW state.
+5. Compute word and byte denominators from the exact repeated text stored in
+   the JSONL. This avoids changing the denominator merely because the corpus is
+   represented as repeated blocks.
+
+The two tasks are `zip2zip_wikitext_repeat4` and
+`zip2zip_wikitext_repeat8`. They are deliberately absent from the default
+pipeline. For each corpus we evaluate the same three settings as above:
+
+- `3 -> 3`: native evaluation of the ms3 checkpoint;
+- `3 -> 4`: forced-ms4 evaluation of the ms3 checkpoint;
+- `4 -> 4`: native evaluation of the ms4 checkpoint.
+
+The `3 -> 4` and `4 -> 4` rows must have exactly the same compression ratio.
+LZW tokenization is determined by the corpus, tokenizer, protected token IDs,
+codebook size, and eval-time `max_subtokens`; it does not depend on model
+weights. This gives the clean comparison we want: both models score exactly
+the same ms4-compressed sequence, and only their learned parameters differ.
+
+The repeated corpora substantially increase both overall compression and the
+frequency with which ms4 actually creates length-4 hypertokens:
+
+| Eval corpus | ms3 compression | ms4 compression | Relative ratio gain | Length-4 share of compressed targets | Base-token coverage by length-4 targets |
+|---|---:|---:|---:|---:|---:|
+| Standard Wikitext | 1.16643 | 1.16898 | ~0.22% | not measured | not measured |
+| Repeat-4 | 1.69861 | 1.71488 | 0.96% | 2.81% | 6.54% |
+| Repeat-8 | 2.02848 | 2.13734 | 5.37% | 15.99% | 29.90% |
+
+The offline span audit exactly reproduces the aggregate compressor counts in
+the evaluation JSONs. Repeat-4 contains 21,221 scored length-4 hypertokens;
+repeat-8 contains 195,628. Thus repeat-8 is no longer a nominal merge-size
+change: almost 30% of its scored base tokens belong to length-4 spans.
+
+Final repeated-window results (`byte_ppl = 2^(bits/byte)`; lower is better):
+
+<table>
+  <thead>
+    <tr>
+      <th rowspan="2">Train &rarr; eval<br><code>max_subtokens</code></th>
+      <th colspan="3">Repeat-4</th>
+      <th colspan="3">Repeat-8</th>
+    </tr>
+    <tr>
+      <th>Byte ppl</th>
+      <th>Bits/byte</th>
+      <th>Input compression</th>
+      <th>Byte ppl</th>
+      <th>Bits/byte</th>
+      <th>Input compression</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td><code>3 &rarr; 3</code></td><td><strong>1.18895</strong></td><td><strong>0.24968</strong></td><td>1.69861</td><td><strong>1.10561</strong></td><td><strong>0.14484</strong></td><td>2.02848</td></tr>
+    <tr><td><code>3 &rarr; 4</code></td><td>1.20498</td><td>0.26900</td><td>1.71488</td><td>1.15337</td><td>0.20585</td><td>2.13734</td></tr>
+    <tr><td><code>4 &rarr; 4</code></td><td>1.19217</td><td>0.25358</td><td>1.71488</td><td>1.11206</td><td>0.15324</td><td>2.13734</td></tr>
+  </tbody>
+</table>
+
+On repeat-4, forced `3 -> 4` is 1.07% worse in byte-ppl than native
+`4 -> 4`, an absolute increase of 0.01542 bits/byte. On repeat-8, where the
+compression patterns diverge much more strongly, that gap grows to 3.71% in
+byte-ppl and 0.05261 bits/byte. Forced `3 -> 4` is also consistently worse than
+the same checkpoint's native `3 -> 3` evaluation.
+
+**Takeaway:** the ms3 checkpoint can execute an unseen ms4 composition without
+collapsing, so the hierarchical hyper-encoder exhibits partial merge-size
+transfer. However, the transfer is not clean or lossless. Once length-4 spans
+are common enough to make the two compression patterns meaningfully different,
+the ms3 checkpoint falls clearly behind the native ms4 checkpoint on the same
+compressed sequence. The original benchmark understated this transfer cost
+because it almost never exercised the additional merge capacity.
+
+The absolute perplexities of repeat-4 and repeat-8 should not be compared as if
+they were natural-language benchmark improvements: later copies are
+intentionally easier to predict. These tasks isolate transfer under recurrent,
+high-compression LZW patterns; they do not by themselves establish general
+long-context performance on non-repeated text.
