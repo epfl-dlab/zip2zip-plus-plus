@@ -349,3 +349,56 @@ they were natural-language benchmark improvements: later copies are
 intentionally easier to predict. These tasks isolate transfer under recurrent,
 high-compression LZW patterns; they do not by themselves establish general
 long-context performance on non-repeated text.
+
+### `vx0.6.4.6` and `vx0.6.4.7`: no-residual initialization
+
+Status: planned.
+
+**Motivation**: the existing no-residual run, `vx0.6.4.2`, starts with
+`gamma = 1, beta = 0`. Its initial encoder output is large, and the trained
+output develops a large shared ruler component. We hypothesize that this
+geometry is driven primarily by the final LayerNorm initialization and the
+resulting large-norm hypertoken embeddings, rather than by the removal of the
+residual path itself. To test this hypothesis, we keep the residual disabled
+and compare two controlled LayerNorm initializations: an exact-zero
+initialization matching the residual model's hyper-encoder branch, and a small
+nonzero initialization at roughly the scale of ordinary token embeddings. We
+then compare both performance and whether the shared ruler disappears.
+
+Both new runs use
+
+`E(H) = F(H)`
+
+with no first-token residual. Only the final LayerNorm initialization changes.
+
+| Version | gamma init | beta init | Step-0 behavior |
+|---|---:|---:|---|
+| `vx0.6.4.6` | 0 | 0 | Every hypertoken output is exactly zero |
+| `vx0.6.4.7` | small | 0 | Token-dependent output with ordinary-token-scale norm |
+
+#### `vx0.6.4.6`: exact zero
+
+Set `gamma = 0, beta = 0`, both trainable. This preserves the controlled
+zero-output start, but without the first-token residual. Gamma and beta can
+learn immediately; earlier encoder layers receive little or no gradient until
+gamma moves away from zero.
+
+#### `vx0.6.4.7`: small meaningful initialization
+
+Use `beta = 0` and a small positive scalar gamma. Exact norm matching is not
+necessary for this first scout. Start approximately with:
+
+- input encoder: `gamma_in ~= 0.04`;
+- output encoder: `gamma_out ~= 0.05`.
+
+Before launch, run a fixed sample of active-codebook entries and measure the
+output norm **after mean pooling**. We only need it to be in roughly the same
+range as ordinary embeddings: about 2.04 for input and 2.63 for output. If it is
+clearly too large or too small, rescale once:
+
+`g_new = g_old * target_norm / measured_norm`.
+
+The post-pooling check is important: `sqrt(3072) ~= 55` is the rough
+per-position LayerNorm scale, not necessarily the final pooled norm. Keep beta
+at zero because nonzero beta directly inserts a shared vector and may create a
+ruler by construction.
