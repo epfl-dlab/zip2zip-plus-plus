@@ -118,6 +118,30 @@
 #                     Only for pipeline rehearsals — never for real numbers.
 #   SEED=42           training seed forwarded to train.py.
 #   NUM_WORKERS=1     dataloader workers; set 0 for exact resumable matched runs
+#   PRETRAIN_DATA_DIR= optional two-stage mode: continued pretraining on this
+#                     (maskless, raw-text) corpus BEFORE the standard finetune.
+#                     Stage 1 trains ${RUN_NAME}-pt on it for PRETRAIN_STEPS as
+#                     its own W&B run, with NUM_WORKERS=0 so a preempted attempt
+#                     resumes from its latest checkpoint on the next retry.
+#                     Stage 2 is the usual finetune below, warm-started from
+#                     stage 1's final weights (fresh optimizer, LR schedule and
+#                     step counter — train.py's RESET_STEP semantics). Unset =
+#                     single-stage, byte-identical to the previous behavior.
+#   PRETRAIN_STEPS=256000     stage-1 steps (default: 32x the 8k finetune)
+#   PRETRAIN_SAVE_FREQ=50000  stage-1 checkpoint cadence: 5 periodic + the
+#                     unconditional final save = 6 checkpoints. In this mode
+#                     stage-2 SAVE_FREQ defaults to 2000 (3 + final = 4;
+#                     10 total); an explicit SAVE_FREQ still wins.
+#   PRETRAIN_REUSE=1  accept an ALREADY COMPLETE ${RUN_NAME}-pt instead of
+#                     failing. Only for recovery (stage 2 died after stage 1
+#                     finished): delete $OUTPUT_BASE/$RUN_NAME, resubmit with
+#                     this flag, and stage 1 is skipped.
+#   Two-stage recovery notes: a mid-run preemption resumes stage 1 by itself on
+#   the next Run:AI retry. If a retry instead crashes loading a checkpoint, that
+#   checkpoint was truncated by the preemption — delete that one step_* dir (or
+#   ${RUN_NAME}-pt/step_$PRETRAIN_STEPS if it died in the final save) and
+#   resubmit. MAX_TOKENS/OUTPUT_DIR from the environment reach stage 2 only,
+#   with their usual single-stage meaning; stage 1 always derives its own.
 # Anything else the finetune launcher reads (LR, SEQ_LEN, ...) passes through.
 #
 # REHEARSE THE PIPELINE FIRST (~30 min end-to-end, exercises every phase):
@@ -242,7 +266,13 @@ echo "========================================"
 # ---------- phase 0: preflight (fail fast, before any GPU work) ----------
 if [ -e "$OUTPUT_DIR" ]; then
     echo "FATAL: output dir already exists: $OUTPUT_DIR"
-    echo "Pick a fresh RUN_NAME — this pipeline never reuses or suffixes dirs."
+    if [ -n "${PRETRAIN_DATA_DIR:-}" ]; then
+        echo "Two-stage mode: to KEEP the finished pretraining in ${OUTPUT_DIR}-pt,"
+        echo "delete only $OUTPUT_DIR and resubmit with PRETRAIN_REUSE=1."
+        echo "Do NOT pick a fresh RUN_NAME — that would redo the pretraining from zero."
+    else
+        echo "Pick a fresh RUN_NAME — this pipeline never reuses or suffixes dirs."
+    fi
     exit 1
 fi
 if [ ! -d "$DATA_DIR" ] || ! ls "$DATA_DIR"/shard_*.npy >/dev/null 2>&1; then
@@ -267,6 +297,93 @@ if [ "${DISABLE_DIGIT_IDS:-}" = "0" ]; then
     echo "treat it as OFF while the eval passthrough would treat it as ON,"
     echo "splitting train/eval distributions. Leave it unset/empty to disable."
     exit 1
+fi
+
+# ---------- optional phase 1a: continued pretraining (PRETRAIN_DATA_DIR) ----------
+# Additive two-stage mode: with PRETRAIN_DATA_DIR unset this block is a no-op.
+# The hand-off to stage 2 is a staging dir holding ONLY stage 1's final
+# model.pt: no meta.pt means train.py starts at step 0, no optimizer.pt means a
+# fresh optimizer, and RESET_STEP=1 reads the SFT data from shard 0 — so the
+# unchanged phase-1 call below runs the standard finetune, merely warm-started
+# from the pretrained weights instead of the HF ones.
+PRETRAIN_DATA_DIR=${PRETRAIN_DATA_DIR:-}
+if [ -n "$PRETRAIN_DATA_DIR" ]; then
+    PRETRAIN_STEPS=${PRETRAIN_STEPS:-256000}
+    PRETRAIN_SAVE_FREQ=${PRETRAIN_SAVE_FREQ:-50000}
+    PT_RUN="${RUN_NAME}-pt"
+    PT_DIR="$OUTPUT_BASE/$PT_RUN"
+    PT_FINAL="$PT_DIR/step_${PRETRAIN_STEPS}"
+
+    # Raw pretraining corpora have no mask_*.npy by design (the loader trains
+    # maskless dirs on every token), so only the shards are required here.
+    if [ ! -d "$PRETRAIN_DATA_DIR" ] || ! ls "$PRETRAIN_DATA_DIR"/shard_*.npy >/dev/null 2>&1; then
+        echo "FATAL: PRETRAIN_DATA_DIR missing or has no shard_*.npy: $PRETRAIN_DATA_DIR"
+        exit 1
+    fi
+
+    if [ -f "$PT_FINAL/model.pt" ]; then
+        # A complete stage-1 dir at submit time is only legitimate when the
+        # operator SAYS it is theirs (recovery after a stage-2 failure). A stale
+        # ${RUN_NAME}-pt from an older experiment must not be reused silently.
+        if [ "${PRETRAIN_REUSE:-}" != "1" ]; then
+            echo "FATAL: $PT_FINAL already exists. If it is this run's own finished"
+            echo "pretraining (e.g. resubmitting after a stage-2 failure), resubmit"
+            echo "with PRETRAIN_REUSE=1. If it belongs to an older experiment,"
+            echo "delete $PT_DIR or pick a fresh RUN_NAME."
+            exit 1
+        fi
+        echo "=== phase 1a: pretraining already complete ($PT_FINAL) — reusing (PRETRAIN_REUSE=1) ==="
+    else
+        PT_RESUME=""
+        if [ -e "$PT_DIR" ]; then
+            if ls "$PT_DIR"/step_*/model.pt >/dev/null 2>&1; then
+                # train.py's validate_resume_args hard-checks the recipe keys in
+                # the checkpoint's meta.pt, so resuming a foreign dir fails loudly.
+                PT_RESUME="latest"
+                echo "=== phase 1a: resuming from the latest checkpoint in $PT_DIR ==="
+            else
+                echo "FATAL: $PT_DIR exists but holds no step_*/model.pt to resume from"
+                echo "(preempted before its first save). Delete it and resubmit."
+                exit 1
+            fi
+        fi
+        # Stage-1 W&B id derived from RUN_NAME, NOT from WANDB_ID: the pipeline
+        # regenerates WANDB_ID on every Run:AI retry, so only a name-derived id
+        # keeps all stage-1 attempts in one W&B run.
+        PT_WANDB_ID=""
+        if [ -n "$WANDB_ID" ]; then
+            _pt_py=$(command -v python3 || command -v python || echo "$PROJECT_DIR/.venv/bin/python")
+            PT_WANDB_ID=$("$_pt_py" - "$PT_RUN" <<'PY'
+import hashlib, sys
+print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:7] + "p")
+PY
+)
+            unset _pt_py
+        fi
+        echo "=== phase 1a: pretraining $PT_RUN ($PRETRAIN_STEPS steps on $PRETRAIN_DATA_DIR) ==="
+        # NUM_WORKERS=0 is what makes the data-stream position restorable, so a
+        # preempted stage 1 can resume instead of hard-erroring (train.py).
+        # OUTPUT_DIR/MAX_TOKENS are pinned empty: an --environment value for
+        # either would otherwise leak in, redirect the checkpoints, or (via
+        # MAX_TOKENS, which train.py obeys INSTEAD of --steps) change how long
+        # each stage runs. Empty makes the launcher derive both from this prefix.
+        RUN_NAME="$PT_RUN" WANDB_RUN_NAME="$PT_RUN" OUTPUT_DIR="" MAX_TOKENS="" \
+        DATA_DIR="$PRETRAIN_DATA_DIR" STEPS="$PRETRAIN_STEPS" \
+        SAVE_FREQ="$PRETRAIN_SAVE_FREQ" NUM_WORKERS=0 \
+        WANDB_ID="$PT_WANDB_ID" RESUME_FROM="$PT_RESUME" RESET_STEP="" \
+            bash "$PROJECT_DIR/scripts/finetune_phi35_rcp.sh"
+        if [ ! -f "$PT_FINAL/model.pt" ]; then
+            echo "FATAL: pretraining finished but $PT_FINAL/model.pt is missing."
+            exit 1
+        fi
+    fi
+
+    mkdir -p "$PT_DIR/sft_init"
+    ln -f "$PT_FINAL/model.pt" "$PT_DIR/sft_init/model.pt" 2>/dev/null \
+        || cp -f "$PT_FINAL/model.pt" "$PT_DIR/sft_init/model.pt"
+    export RESUME_FROM="$PT_DIR/sft_init"
+    export RESET_STEP=1
+    export SAVE_FREQ=${SAVE_FREQ:-2000}
 fi
 
 # ---------- phase 1: train (the launcher owns its env/venv/flags) ----------
