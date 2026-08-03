@@ -120,9 +120,14 @@
 #   NUM_WORKERS=1     dataloader workers; set 0 for exact resumable matched runs
 #   PRETRAIN_DATA_DIR= optional two-stage mode: continued pretraining on this
 #                     (maskless, raw-text) corpus BEFORE the standard finetune.
-#                     Stage 1 trains ${RUN_NAME}-pt on it for PRETRAIN_STEPS as
-#                     its own W&B run, with NUM_WORKERS=0 so a preempted attempt
-#                     resumes from its latest checkpoint on the next retry.
+#                     Stage 1 trains ${RUN_NAME}-pt on it for PRETRAIN_STEPS,
+#                     with NUM_WORKERS=0 so a preempted attempt resumes from
+#                     its latest checkpoint on the next retry. W&B: everything
+#                     ends up in ONE run — stage 1 streams live to a ${RUN_NAME}-pt
+#                     run (train.py's explicit step= makes direct sharing
+#                     impossible: stage-2 steps would restart at 1 and be
+#                     dropped), then phase 4 folds those curves into the main
+#                     run under pt/* on a pt/step axis (wandb_merge_pretrain.py).
 #                     Stage 2 is the usual finetune below, warm-started from
 #                     stage 1's final weights (fresh optimizer, LR schedule and
 #                     step counter — train.py's RESET_STEP semantics). Unset =
@@ -321,6 +326,22 @@ if [ -n "$PRETRAIN_DATA_DIR" ]; then
         exit 1
     fi
 
+    # Stage-1 W&B id derived from RUN_NAME, NOT from WANDB_ID: the pipeline
+    # regenerates WANDB_ID on every Run:AI retry, so only a name-derived id
+    # keeps all stage-1 attempts in one W&B run. Computed here (not in the
+    # training branch) because the phase-4 curve merge needs it even when a
+    # finished stage 1 is being reused.
+    PT_WANDB_ID=""
+    if [ -n "$WANDB_ID" ]; then
+        _pt_py=$(command -v python3 || command -v python || echo "$PROJECT_DIR/.venv/bin/python")
+        PT_WANDB_ID=$("$_pt_py" - "$PT_RUN" <<'PY'
+import hashlib, sys
+print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:7] + "p")
+PY
+)
+        unset _pt_py
+    fi
+
     if [ -f "$PT_FINAL/model.pt" ]; then
         # A complete stage-1 dir at submit time is only legitimate when the
         # operator SAYS it is theirs (recovery after a stage-2 failure). A stale
@@ -346,19 +367,6 @@ if [ -n "$PRETRAIN_DATA_DIR" ]; then
                 echo "(preempted before its first save). Delete it and resubmit."
                 exit 1
             fi
-        fi
-        # Stage-1 W&B id derived from RUN_NAME, NOT from WANDB_ID: the pipeline
-        # regenerates WANDB_ID on every Run:AI retry, so only a name-derived id
-        # keeps all stage-1 attempts in one W&B run.
-        PT_WANDB_ID=""
-        if [ -n "$WANDB_ID" ]; then
-            _pt_py=$(command -v python3 || command -v python || echo "$PROJECT_DIR/.venv/bin/python")
-            PT_WANDB_ID=$("$_pt_py" - "$PT_RUN" <<'PY'
-import hashlib, sys
-print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:7] + "p")
-PY
-)
-            unset _pt_py
         fi
         echo "=== phase 1a: pretraining $PT_RUN ($PRETRAIN_STEPS steps on $PRETRAIN_DATA_DIR) ==="
         # NUM_WORKERS=0 is what makes the data-stream position restorable, so a
@@ -604,6 +612,18 @@ if [ "$WANDB" = "0" ]; then
     echo "=== pipeline complete offline: $RUN_NAME ==="
 else
 echo "=== phase 4/4: append artifact paths to W&B notes ==="
+# Two-stage mode: fold the stage-1 curves into THIS run under pt/* (own
+# pt/step axis), now that every explicit-step write (train/smoke/final) is
+# done — earlier, W&B's monotonic-step rule would drop data. Cosmetic and
+# rerunnable by hand, so a failure never fails the pipeline. The ${RUN_NAME}-pt
+# W&B run stays as the live view of stage 1; delete it in the UI if unwanted.
+if [ -n "${PT_WANDB_ID:-}" ]; then
+    echo "--- merging pretraining curves ($PT_WANDB_ID) into this run ---"
+    python scripts/wandb_merge_pretrain.py \
+        --entity "$WANDB_ENTITY" --project "$WANDB_PROJECT" \
+        --src "$PT_WANDB_ID" --dst "$WANDB_ID" --prefix pt \
+        || echo "[pipeline] pretrain-curve merge skipped — rerun scripts/wandb_merge_pretrain.py manually"
+fi
 # Run:AI job name for the follow-up perplexity job: lowercase, no dots, <50 chars.
 PPL_JOB_NAME=$(printf 'ppl-%s' "$RUN_NAME" | tr '[:upper:]' '[:lower:]' \
     | sed -e 's/[^a-z0-9-]/-/g' | cut -c1-49 | sed -e 's/-*$//')
