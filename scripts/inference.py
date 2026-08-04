@@ -6,10 +6,13 @@ No separate LZWCompressor/Zip2ZipTokenizer is used during inference.
 Usage:
     python scripts/inference.py --prompt "The capital of France is"
     python scripts/inference.py --prompt "1 + 1 =" --max-new-tokens 32 --ckpt-dir /path/to/ckpt
+    python scripts/inference.py --prompt-file prompts.json --output-file generations.jsonl \
+        --instruct --ckpt-dir /path/to/ckpt
 """
 
 import argparse
 import dataclasses
+import json
 import sys
 import os
 
@@ -35,6 +38,7 @@ from zip2zip_core.viz import colorize_by_ngram, render_colored_tokens
 DEFAULT_CKPT = "/mnt/scratch/checkpoints/zip2zip_150m_finemath_10bt_ms4/step_6000"
 DEFAULT_TOKENIZER = "bofenghuang/Meta-Llama-3-8B"
 
+DEFAULT_PROMPT = "The Eiffel Tower is located in"
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -138,6 +142,42 @@ def _sample_next(last_logits: torch.Tensor, temperature: float) -> int:
         return int(last_logits.argmax().item())
     probs = torch.softmax(last_logits.float() / temperature, dim=-1)
     return int(torch.multinomial(probs, num_samples=1).item())
+
+
+def format_prompt(tokenizer, prompt: str, *, instruct: bool) -> str:
+    """Optionally wrap a raw user prompt with the tokenizer's chat template."""
+    if not instruct:
+        return prompt
+    if not getattr(tokenizer, "chat_template", None):
+        raise ValueError(
+            "--instruct requires a tokenizer with a chat_template; "
+            "drop --instruct or select the checkpoint's instruct tokenizer"
+        )
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
+def load_prompts(prompt: str | None, prompt_file: str | None) -> list[str]:
+    """Load one CLI prompt or a JSON file containing a list of prompts."""
+    if prompt_file is None:
+        return [DEFAULT_PROMPT if prompt is None else prompt]
+
+    with open(prompt_file, "r", encoding="utf-8") as file:
+        prompts = json.load(file)
+    if not isinstance(prompts, list):
+        raise ValueError("--prompt-file must contain a JSON list of strings")
+    if not prompts:
+        raise ValueError("--prompt-file must contain at least one prompt")
+    for index, item in enumerate(prompts):
+        if not isinstance(item, str):
+            raise ValueError(
+                f"--prompt-file item {index} must be a string, got "
+                f"{type(item).__name__}"
+            )
+    return prompts
 
 
 @torch.no_grad()
@@ -279,13 +319,36 @@ def generate(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--prompt", type=str, default="The Eiffel Tower is located in")
+    prompt_group = parser.add_mutually_exclusive_group()
+    prompt_group.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help=f"Single prompt (default: {DEFAULT_PROMPT!r}).",
+    )
+    prompt_group.add_argument(
+        "--prompt-file",
+        type=str,
+        default=None,
+        help="JSON file containing a list of prompt strings.",
+    )
+    parser.add_argument(
+        "--output-file",
+        type=str,
+        default=None,
+        help="Optional JSONL output path; one record is flushed per prompt.",
+    )
     parser.add_argument("--ckpt-dir", type=str, default=DEFAULT_CKPT)
     parser.add_argument(
         "--tokenizer",
         type=str,
         default=None,
         help="Tokenizer override. Defaults to meta.pt, then the legacy fallback.",
+    )
+    parser.add_argument(
+        "--instruct",
+        action="store_true",
+        help="Apply the tokenizer's chat template to every prompt.",
     )
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument(
@@ -299,6 +362,10 @@ def main():
         parser.error("--temperature must be non-negative")
     if cli.max_new_tokens < 0:
         parser.error("--max-new-tokens must be non-negative")
+    try:
+        prompts = load_prompts(cli.prompt, cli.prompt_file)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        parser.error(str(exc))
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
@@ -333,6 +400,9 @@ def main():
             f"from training tokenizer {trained_tokenizer!r}"
         )
 
+    prompt_mode = "instruct chat template" if cli.instruct else "raw text"
+    print(f"[inference] prompt mode: {prompt_mode}")
+    print(f"[inference] prompts: {len(prompts)}")
     disabled_ids = compute_disabled_ids(
         hf_tok,
         cfg.vocab_size,
@@ -376,23 +446,52 @@ def main():
     )
     lzw_compressor = LZWCompressor(**compression_kwargs)
 
-    print(f"\nPrompt: {repr(cli.prompt)}\n")
-    output, colored_output = generate(
-        cli.prompt,
-        model,
-        codebook_manager,
-        lzw_compressor,
-        hf_tok,
-        stop_token_ids,
-        max_new_tokens=cli.max_new_tokens,
-        temperature=cli.temperature,
-        device=device,
-    )
-    print(f"\n{'='*60}")
-    print(f"PROMPT:    {cli.prompt}")
-    print(f"GENERATED: {output}")
-    print(f"\nCOLORED (blue=base, yellow=2-gram, orange=3-gram, red=4-gram):")
-    print(colored_output)
+    output_file = None
+    if cli.output_file:
+        os.makedirs(os.path.dirname(os.path.abspath(cli.output_file)), exist_ok=True)
+        output_file = open(cli.output_file, "w", encoding="utf-8")
+        print(f"[inference] writing JSONL results to {cli.output_file}")
+
+    try:
+        for index, raw_prompt in enumerate(prompts):
+            prompt = format_prompt(hf_tok, raw_prompt, instruct=cli.instruct)
+            print(f"\nPrompt {index + 1}/{len(prompts)}: {repr(prompt)}\n")
+            output, colored_output = generate(
+                prompt,
+                model,
+                codebook_manager,
+                lzw_compressor,
+                hf_tok,
+                stop_token_ids,
+                max_new_tokens=cli.max_new_tokens,
+                temperature=cli.temperature,
+                device=device,
+            )
+            print(f"\n{'='*60}")
+            print(f"PROMPT:    {raw_prompt}")
+            print(f"GENERATED: {output}")
+            print(
+                "\nCOLORED (blue=base, yellow=2-gram, "
+                "orange=3-gram, red=4-gram):"
+            )
+            print(colored_output)
+
+            if output_file is not None:
+                json.dump(
+                    {
+                        "index": index,
+                        "prompt": raw_prompt,
+                        "generated": output,
+                        "instruct": cli.instruct,
+                    },
+                    output_file,
+                    ensure_ascii=False,
+                )
+                output_file.write("\n")
+                output_file.flush()
+    finally:
+        if output_file is not None:
+            output_file.close()
 
 
 if __name__ == "__main__":
