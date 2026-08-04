@@ -43,6 +43,10 @@
 #   PRESET=...      Eval preset (default: default_base)
 #   LIMIT=20        Per-task sample limit for smoke tests
 #   TASKS=gsm8k     Comma-separated task override (default: preset's tasks)
+#   LEGACY_UNTRIMMED_STOPS=1  Do not cut generated text at stop strings, as all
+#                   evals before 2026-08 did. Only for bit-exact reproduction of
+#                   those results (pin the old task list via TASKS too — the
+#                   presets gained triviaqa); wrong for text-scored tasks.
 #   Z2Z_SCRATCH=...     Your PVC scratch dir (default: /dlabscratch1/gentilin)
 #   WANDB=1         Log results/samples/compression to W&B (default: off, JSON+log
 #                   only). Requires WANDB_API_KEY in the job env.
@@ -111,6 +115,10 @@ DISABLE_MATHSYM_IDS=${DISABLE_MATHSYM_IDS:-}
 # mask. "0" normalizes to off so it cannot half-trigger the :+ passthrough.
 NO_ONLINE_CODEBOOK_MASK=${NO_ONLINE_CODEBOOK_MASK:-}
 [ "$NO_ONLINE_CODEBOOK_MASK" = "0" ] && NO_ONLINE_CODEBOOK_MASK=""
+# LEGACY_UNTRIMMED_STOPS=1: reproduce pre-2026-08 generation returns bit-exactly
+# (no stop-string cut). "0" normalizes to off like the flags above.
+LEGACY_UNTRIMMED_STOPS=${LEGACY_UNTRIMMED_STOPS:-}
+[ "$LEGACY_UNTRIMMED_STOPS" = "0" ] && LEGACY_UNTRIMMED_STOPS=""
 WANDB=${WANDB:-0}
 WANDB_NAME=${WANDB_NAME:-}
 export WANDB_PROJECT=${WANDB_PROJECT:-llaza}
@@ -142,6 +150,7 @@ VARIANT_TAG="mode-${MODE_TAG}"
 [ -n "$DISABLE_DIGIT_IDS" ] && VARIANT_TAG="${VARIANT_TAG}-nodigits"
 [ -n "$DISABLE_MATHSYM_IDS" ] && VARIANT_TAG="${VARIANT_TAG}-nomathsym"
 [ -n "$NO_ONLINE_CODEBOOK_MASK" ] && VARIANT_TAG="${VARIANT_TAG}-legacycbmask"
+[ -n "$LEGACY_UNTRIMMED_STOPS" ] && VARIANT_TAG="${VARIANT_TAG}-untrimmedstops"
 if [ -n "$LIMIT" ]; then
     LIMIT_TAG=$(printf '%s' "$LIMIT" | tr -cs '[:alnum:]._-' '_')
     VARIANT_TAG="${VARIANT_TAG}-limit${LIMIT_TAG}"
@@ -251,6 +260,7 @@ if [ -n "$CKPT_DIR" ]; then
         ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
         ${DISABLE_MATHSYM_IDS:+--disable_mathsym_ids} \
         ${NO_ONLINE_CODEBOOK_MASK:+--no_online_codebook_mask} \
+        ${LEGACY_UNTRIMMED_STOPS:+--legacy_untrimmed_stops} \
         $WANDB_ARGS \
         $LIMIT_ARG \
         $TASKS_ARG
@@ -266,6 +276,7 @@ else
         ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
         ${DISABLE_MATHSYM_IDS:+--disable_mathsym_ids} \
         ${NO_ONLINE_CODEBOOK_MASK:+--no_online_codebook_mask} \
+        ${LEGACY_UNTRIMMED_STOPS:+--legacy_untrimmed_stops} \
         $WANDB_ARGS \
         $LIMIT_ARG \
         $TASKS_ARG

@@ -71,7 +71,7 @@ override preset values.
 
 | Preset | Use case |
 |--------|----------|
-| `default` | Full MC + generation benchmarks, 2-shot, chat template (matches paper Table 3) |
+| `default` | Full MC + generation benchmarks, 2-shot, chat template (paper Table 3 set + triviaqa) |
 | `perplexity` | Byte-level PPL on wikitext/pile/mc4/dc4, 1024-token rolling window |
 | `default_base` | Same as `default` but no chat template (from-scratch/non-instruct models) |
 | `smoke` | 20 samples/task, no W&B — quick sanity check |
@@ -190,6 +190,28 @@ numbers poison flexible-extract's last-number rule), the diagnostic task
 `boxed-first` filter reading the *first* `\boxed{}`/`####` answer. Use it only to
 decompose "format/stopping artifact vs math ability" — never as the headline number,
 since it isn't comparable with anyone else's published GSM8K results.
+
+## TriviaQA and stop-string trimming
+
+`triviaqa` (built-in lm-eval task, 17,944 validation questions, closed-book) joined the
+`default`/`default_base`/`smoke` presets in 2026-08 as a second generative benchmark. It
+probes factual recall rather than reasoning, and its size makes 2-3pt deltas resolvable
+in a single run (SE ~0.4pt). Unlike GSM8K it is scored by `exact_match` of the whole
+generation against the alias list — no extraction regex — which is why the adapter now
+cuts generated text at the first stop-string occurrence (lm-eval's contract; the
+pre-2026-08 adapter returned the stop string and, in compressed mode, any hyper-token
+expansion overshoot behind it). The tail would systematically depress text-scored
+metrics. It was invisible to GSM8K's first-match filters (`strict-match`, `boxed-first`),
+but `flexible-extract` takes the LAST number, so a re-run of an old checkpoint can score
+a sample differently wherever the discarded tail happened to contain a match (digits are
+impossible in the overshoot of digit-protected checkpoints, but `[$.,]` runs still count)
+— treat trimmed vs untrimmed `flexible-extract` as a comparability boundary rather than
+assuming bit-equality. `--legacy_untrimmed_stops` (env: `LEGACY_UNTRIMMED_STOPS=1` for
+`eval_ckpt_rcp.sh`) restores the old per-request returns bit-exactly; reproducing a full
+pre-2026-08 results artifact also needs the old 7-task list pinned via `TASKS=...`, since
+the presets now include triviaqa and the run-global `eval/*_compression_ratio` aggregates
+absorb every task in the run. The results JSON records the effective setting as
+`trim_stop_strings` in `args`.
 
 ## Eval-log health checks
 

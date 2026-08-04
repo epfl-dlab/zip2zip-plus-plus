@@ -249,6 +249,7 @@ class Zip2ZipLM(LM):
         disable_digit_ids: bool = False,
         disable_mathsym_ids: bool = False,
         eval_max_subtokens: int | None = None,
+        trim_stop_strings: bool = True,
     ):
         super().__init__()
         if not torch.cuda.is_available() and device.startswith("cuda"):
@@ -355,6 +356,7 @@ class Zip2ZipLM(LM):
         self.eval_mode = eval_mode
         self._batch_size = int(batch_size)
         self.hyper_causal_mask = bool(hyper_causal_mask)
+        self.trim_stop_strings = bool(trim_stop_strings)
         # What the CHECKPOINT was trained with (provenance, never overridden).
         self.online_codebook_mask = bool(
             (self.train_args or {}).get("online_codebook_mask")
@@ -453,6 +455,8 @@ class Zip2ZipLM(LM):
             kwargs["hyper_causal_mask"] = kwargs["hyper_causal_mask"].lower() in ("1", "true", "yes")
         if "online_codebook_mask" in kwargs:
             kwargs["online_codebook_mask"] = kwargs["online_codebook_mask"].lower() in ("1", "true", "yes")
+        if "trim_stop_strings" in kwargs:
+            kwargs["trim_stop_strings"] = kwargs["trim_stop_strings"].lower() in ("1", "true", "yes")
         if additional_config:
             for k in ("batch_size", "device"):
                 if k not in kwargs and additional_config.get(k) is not None:
@@ -814,6 +818,25 @@ class Zip2ZipLM(LM):
         idx = torch.multinomial(probs, num_samples=1)
         return int(idx.item())
 
+    def _trim_stops(self, text: str, until: List[str]) -> str:
+        """Cut the decoded continuation at the first stop-string occurrence.
+
+        The generation loops only break AFTER a stop string has landed in the
+        decoded text (and a hyper-token expansion can overshoot it by up to
+        max_subtokens-1 base tokens), so the raw decode still carries the stop
+        string and whatever followed it. lm-eval's contract is that the
+        continuation ends before the stop. Regex-extracted tasks (gsm8k) never
+        noticed the tail; text-scored tasks (triviaqa exact_match, code pass@1)
+        need the cut. trim_stop_strings=False restores the raw return of all
+        evals before 2026-08, for bit-exact legacy comparisons.
+        """
+        if not self.trim_stop_strings:
+            return text
+        for term in until:
+            if term:
+                text = text.split(term)[0]
+        return text
+
     @torch.no_grad()
     def _generate_base(
         self,
@@ -851,7 +874,7 @@ class Zip2ZipLM(LM):
                 break
         self.compression_stats["gen_comp"] += len(gen_ids)
         self.compression_stats["gen_base"] += len(gen_ids)
-        return self.tok_decode(gen_ids)
+        return self._trim_stops(self.tok_decode(gen_ids), until)
 
     @torch.no_grad()
     def _generate_compressed(
@@ -980,7 +1003,7 @@ class Zip2ZipLM(LM):
 
         self.compression_stats["gen_comp"] += n_gen_comp
         self.compression_stats["gen_base"] += len(gen_base_ids)
-        return self.tok_decode(gen_base_ids)
+        return self._trim_stops(self.tok_decode(gen_base_ids), until)
 
     def generate_until(self, requests) -> List[str]:
         out: List[str] = []

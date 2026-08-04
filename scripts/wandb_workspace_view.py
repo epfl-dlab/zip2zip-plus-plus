@@ -89,7 +89,7 @@ TABLE_PANELS = [
     f"{task}_eval_results"
     for task in (
         "arc_challenge", "arc_easy", "hellaswag", "openbookqa", "piqa",
-        "winogrande", "gsm8k", "gsm8k_boxed", "wikitext",
+        "winogrande", "gsm8k", "gsm8k_boxed", "triviaqa", "wikitext",
         "zip2zip_pile", "zip2zip_mc4", "zip2zip_dc4",
     )
 ]
@@ -110,6 +110,7 @@ def build_layout() -> list[dict]:
     verdict = [
         line("GSM8K strict-match", ["final/gsm8k/exact_match_strict-match"], X_FINAL),
         line("GSM8K flexible-extract", ["final/gsm8k/exact_match_flexible-extract"], X_FINAL),
+        line("TriviaQA exact_match", ["final/triviaqa/exact_match_remove_whitespace"], X_FINAL),
     ] + [
         line(f"{task} acc_norm", [f"final/{task}/acc_norm"], X_FINAL)
         for task in MC_TASKS_ACC_NORM
@@ -266,6 +267,11 @@ def build_layout() -> list[dict]:
             X_FINAL,
         ),
         line(
+            "TriviaQA stderr",
+            ["final/triviaqa/exact_match_stderr_remove_whitespace"],
+            X_FINAL,
+        ),
+        line(
             "smoke arc_easy / hellaswag stderr",
             [
                 "smoke/arc_easy/acc_stderr",
@@ -309,10 +315,16 @@ def build_layout() -> list[dict]:
             X_TRAIN,
         ),
         line(
+            "triviaqa (lm-eval keys)",
+            ["triviaqa/exact_match,remove_whitespace"],
+            X_TRAIN,
+        ),
+        line(
             "stderr (lm-eval keys)",
             [f"{task}/acc_stderr" for task in MC_TASKS_ACC_NORM]
             + [f"{task}/acc_norm_stderr" for task in MC_TASKS_ACC_NORM]
-            + ["winogrande/acc_stderr"],
+            + ["winogrande/acc_stderr"]
+            + ["triviaqa/exact_match_stderr,remove_whitespace"],
             X_TRAIN,
         ),
     ]

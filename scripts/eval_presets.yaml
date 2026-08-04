@@ -50,8 +50,8 @@
 
 presets:
   default:
-    description: "2-shot MC + generation benchmarks (matches paper Table 3)"
-    tasks: [arc_challenge, arc_easy, hellaswag, openbookqa, piqa, winogrande, gsm8k]
+    description: "2-shot MC + generation benchmarks (paper Table 3 set + triviaqa)"
+    tasks: [arc_challenge, arc_easy, hellaswag, openbookqa, piqa, winogrande, gsm8k, triviaqa]
     num_fewshot: 2
     max_length: 4096
     eval_mode: compressed
@@ -73,7 +73,7 @@ presets:
 
   default_base:
     description: "2-shot MC benchmarks for from-scratch (non-instruct) models — no chat template"
-    tasks: [arc_challenge, arc_easy, hellaswag, openbookqa, piqa, winogrande, gsm8k]
+    tasks: [arc_challenge, arc_easy, hellaswag, openbookqa, piqa, winogrande, gsm8k, triviaqa]
     num_fewshot: 2
     max_length: 4096
     eval_mode: compressed
@@ -85,7 +85,7 @@ presets:
 
   smoke:
     description: "Quick sanity check — all tasks, 20 samples each, no W&B"
-    tasks: [arc_challenge, arc_easy, hellaswag, openbookqa, piqa, winogrande, gsm8k]
+    tasks: [arc_challenge, arc_easy, hellaswag, openbookqa, piqa, winogrande, gsm8k, triviaqa]
     num_fewshot: 2
     max_length: 4096
     eval_mode: compressed

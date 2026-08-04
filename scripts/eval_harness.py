@@ -5,9 +5,9 @@ Default tasks cover the standard pretraining suite:
     commonsense_qa, medqa_4options, wikitext  (built-in, loglikelihood)
     zip2zip_pile, zip2zip_mc4, zip2zip_dc4    (custom YAMLs, loglikelihood)
 
-Generation tasks are also supported (gsm8k, humaneval, mbpp, ifeval) but are
-opt-in via --tasks because they require generate_until and, for code tasks,
-HF_ALLOW_CODE_EVAL=1 in env.
+Generation tasks are also supported (gsm8k, triviaqa, humaneval, mbpp, ifeval)
+but are opt-in via --tasks because they require generate_until and, for code
+tasks, HF_ALLOW_CODE_EVAL=1 in env plus confirm_run_unsafe_code (not wired up).
 
 Usage:
     python scripts/eval_harness.py --ckpt_dir /path/to/step_6000
@@ -116,6 +116,11 @@ def main():
                         "Use this to compare against v0.1-v0.6.4 numbers, which were "
                         "all produced with the legacy mask. No effect on older "
                         "checkpoints or in base mode.")
+    p.add_argument("--legacy_untrimmed_stops", action="store_true",
+                   help="Return generated text without cutting it at the first "
+                        "stop-string occurrence, as all evals did before 2026-08. "
+                        "Only for bit-exact reproduction of those results — wrong "
+                        "for text-scored tasks like triviaqa.")
     p.add_argument("--disable_digit_ids", action="store_true",
                    help="Diagnostic: add digit tokens to disabled_ids so numbers "
                         "are never LZW-merged into hypertokens (compressed mode).")
@@ -176,6 +181,7 @@ def main():
         disable_digit_ids=args.disable_digit_ids,
         disable_mathsym_ids=args.disable_mathsym_ids,
         eval_max_subtokens=args.eval_max_subtokens,
+        trim_stop_strings=not args.legacy_untrimmed_stops,
     )
     # The adapter auto-enables digit protection for checkpoints trained with it
     # and auto-switches control checkpoints (max_codebook_size=0) to base mode —
@@ -198,6 +204,7 @@ def main():
     )
     args.online_codebook_mask = lm.online_codebook_mask
     args.online_codebook_mask_active = lm.online_codebook_mask_active
+    args.trim_stop_strings = lm.trim_stop_strings
     # Distinguishes "inactive because base mode" from "inactive because this eval
     # deliberately asked for the legacy mask" — otherwise a results JSON cannot
     # be audited for which regime produced its numbers.

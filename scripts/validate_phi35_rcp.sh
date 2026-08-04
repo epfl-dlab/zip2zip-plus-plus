@@ -70,6 +70,12 @@ MODEL="microsoft/Phi-3.5-mini-instruct"
 
 eval "$(python3 "$SCRIPT_DIR/load_preset.py" "$PRESET")"
 
+# The expected-results block above has paper Table 3 numbers only for the
+# original 7 tasks; triviaqa (added to the presets in 2026-08) has no reference
+# row, so keep the validation scope fixed.
+TASKS=${TASKS//,triviaqa/}
+TASKS=${TASKS//triviaqa,/}
+
 LIMIT_ARG=""
 if [ -n "$LIMIT" ]; then
     LIMIT_ARG="--limit $LIMIT"
