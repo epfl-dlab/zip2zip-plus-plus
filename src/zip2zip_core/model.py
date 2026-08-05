@@ -1042,14 +1042,24 @@ class Zip2ZipLlama3Model(Decoder):
         base_ids = tokens.clamp(max=vocab_size - 1)
         h = self.tok_embeddings(base_ids)  # (B, T, dim)
 
+        # Unconditional on purpose: this where() is hyper_embeds' only
+        # differentiable consumer, so under FSDP it decides whether this rank
+        # runs hyper_encoder's backward collectives. Gated on
+        # hyper_mask.any(), a rank whose window has no hypertoken among the
+        # INPUT ids (possible: the window's only hypertoken can sit at the
+        # final, label-only index) silently drops the module from its autograd
+        # graph and the ranks deadlock in NCCL — untied only, since the tied
+        # path keeps hyper_embeds alive through the hyper-logits bmm. With an
+        # all-False mask the where() returns h unchanged and the clamped ids
+        # gather row 0 of a codebook that forward()'s codebook gate guarantees
+        # non-empty, so numerics are identical to the gated version.
         hyper_mask = tokens >= vocab_size
-        if hyper_mask.any():
-            hyper_ids = (tokens - vocab_size).clamp(min=0)  # (B, T)
-            B, T = tokens.shape
-            batch_idx = torch.arange(B, device=tokens.device).unsqueeze(1).expand(B, T)
-            h = torch.where(
-                hyper_mask.unsqueeze(-1), hyper_embeds[batch_idx, hyper_ids], h
-            )
+        hyper_ids = (tokens - vocab_size).clamp(min=0)  # (B, T)
+        B, T = tokens.shape
+        batch_idx = torch.arange(B, device=tokens.device).unsqueeze(1).expand(B, T)
+        h = torch.where(
+            hyper_mask.unsqueeze(-1), hyper_embeds[batch_idx, hyper_ids], h
+        )
 
         return h, hyper_embeds, hyper_out_embeds
 
