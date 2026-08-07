@@ -71,6 +71,7 @@ ENV_KEYS = {
     "GATED_ROPE_START_PAIR":    ("gated_rope_start_pair",     "int",   0),
     "BASE_VIEW_REPLAY_PROB":    ("base_view_replay_prob",     "float", 0.0),
     "ZERO_INIT_ENCODER_OUTPUT": ("zero_init_encoder_output", "flag",  False),
+    "ENCODER_OUTPUT_INIT_SCALE": ("encoder_output_init_scale", "float", 0.0),
     "NO_ENCODER_RESIDUAL":      ("no_encoder_residual",      "flag",  False),
     "ONLINE_CODEBOOK_MASK":     ("online_codebook_mask",     "flag",  False),
     "TOKEN_TYPE_LOSS_WEIGHT":   ("token_type_loss_weight",   "float", 0.0),
@@ -96,6 +97,7 @@ ENV_AXES = {
     "GATED_ROPE_START_PAIR": "positions",
     "BASE_VIEW_REPLAY_PROB": "data",
     "ZERO_INIT_ENCODER_OUTPUT": "initialization",
+    "ENCODER_OUTPUT_INIT_SCALE": "initialization",
     "NO_ENCODER_RESIDUAL": "architecture",
     "ONLINE_CODEBOOK_MASK": "objective",
     "TOKEN_TYPE_LOSS_WEIGHT": "objective",
@@ -203,8 +205,11 @@ RECIPES = {
         "description": "flat hyper-encoder without the residual path",
         "env": {"ZERO_INIT_ENCODER_OUTPUT": "0", "NO_ENCODER_RESIDUAL": "1"},
         "notes": "Xinxian exploratory run: removes the first-token residual from "
-                 "the flat hyper-encoder. ZERO_INIT_ENCODER_OUTPUT is forced off "
-                 "because train.py intentionally rejects zero-init without the residual.",
+                 "the flat hyper-encoder, leaving the default gamma=1 LayerNorm "
+                 "start (large-norm encoder output ~48x the embedding). Its "
+                 "trained output develops the large shared 'ruler'. This is the "
+                 "gamma=1 baseline for the no-residual init sweep vx0.6.4.6 "
+                 "(exact zero) and vx0.6.4.7 (small ordinary-token-scale).",
     },
     "vx0.6.4.3": {
         "extends": "v0.6.4",
@@ -236,6 +241,37 @@ RECIPES = {
                  "learns useful recurrent structure under a smaller train-time "
                  "merge size. Eval-time merge-size transfer still requires a "
                  "separate override implementation.",
+    },
+    "vx0.6.4.6": {
+        "extends": "vx0.6.4.2",
+        "status": "exploratory",
+        "description": "no-residual with exact-zero encoder-output init (gamma=0)",
+        "env": {"ZERO_INIT_ENCODER_OUTPUT": "1"},
+        "notes": "Xinxian exploratory run (shared-ruler exploration): keeps the "
+                 "residual OFF but zero-inits the final LayerNorm (gamma=beta=0), "
+                 "so every hypertoken output starts at EXACTLY zero instead of "
+                 "vx0.6.4.2's gamma=1 large-norm start. With v0.6.4 (residual + "
+                 "gamma=0) and vx0.6.4.2 (no-residual + gamma=1) this isolates "
+                 "whether the shared ruler is driven by the LayerNorm init scale "
+                 "or by removing the residual. Caveat: with no residual the whole "
+                 "embedding is zero at step 0, so only gamma/beta get gradient "
+                 "until gamma leaves zero (earlier encoder layers are briefly "
+                 "starved) -- vx0.6.4.7 is the cleaner-start counterpart.",
+    },
+    "vx0.6.4.7": {
+        "extends": "vx0.6.4.2",
+        "status": "exploratory",
+        "description": "no-residual with small ordinary-token-scale encoder-output init",
+        "env": {"ENCODER_OUTPUT_INIT_SCALE": "0.05"},
+        "notes": "Xinxian exploratory run (shared-ruler exploration): keeps the "
+                 "residual OFF but initializes the final LayerNorm to gamma=0.05 "
+                 "(beta=0), so the encoder output starts token-dependent at "
+                 "roughly 0.05*sqrt(3072) ~ 2.8 ~ ordinary-token norm rather than "
+                 "vx0.6.4.2's ~48x gamma=1 start. Cleaner test of the 'start "
+                 "small and grow gradually' hypothesis than vx0.6.4.6: every "
+                 "encoder layer receives gradient from step 0. Tests whether a "
+                 "small starting output scale keeps the trained geometry off the "
+                 "shared ruler.",
     },
     "v0.6.5": {
         "extends": "v0.6.4",
