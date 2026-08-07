@@ -722,6 +722,15 @@ class Zip2ZipLlama3Model(Decoder):
         # encoder_dim == model_dim — see _init_hyper_encoder. Off = the
         # v0.1-v0.6.3 behavior (encoder starts at ~54x the embedding norm).
         zero_init_encoder_output: bool = False
+        # Small nonzero start for the hyper-encoder output branch: initialize the
+        # final LayerNorm to gamma=encoder_output_init_scale (constant), beta=0, so
+        # the branch emits a token-dependent vector at roughly scale*sqrt(dim) ~
+        # ordinary-token norm instead of the default ~54x start. 0.0 = leave the
+        # standard init (gamma=1) untouched. Used with no_encoder_residual to test
+        # whether a small, gradually-grown output scale avoids the shared-ruler
+        # geometry (xinxian-shared-ruler-exploration: vx0.6.4.7). Mutually
+        # exclusive with zero_init_encoder_output.
+        encoder_output_init_scale: float = 0.0
         reconstruction_loss_weight: float = 0.0
         token_type_loss_weight: float = (
             0.0  # weight for base/hyper token type prediction head
@@ -925,41 +934,69 @@ class Zip2ZipLlama3Model(Decoder):
                 if isinstance(module, (nn.LayerNorm,)):
                     module.reset_parameters()
 
-        # Zero-init encoder output so initial hyper embedding ≈ first base token
+        # Hyper-encoder output-branch start scale. The branch's final gate is
+        # proj_out when encoder_dim != model_dim, otherwise the final LayerNorm.
+        # Three mutually exclusive regimes:
+        #   zero_init_encoder_output -> gate zeroed, branch emits EXACTLY 0. With
+        #     the residual this makes the first hyper embedding == its first base
+        #     token's embedding; WITHOUT the residual (the no-residual exact-zero
+        #     ablation, vx0.6.4.6) the whole hyper embedding starts at exactly 0.
+        #   encoder_output_init_scale > 0 -> final LayerNorm set to gamma=scale,
+        #     beta=0, so the branch emits a token-dependent vector at roughly
+        #     scale*sqrt(dim) ~ ordinary-token norm (the small no-residual start,
+        #     vx0.6.4.7).
+        #   neither -> the default LayerNorm-scaled (~54x embedding) start that
+        #     every v0.1-v0.6.3 run used.
         zeroed: list[str] = []
-        if getattr(self, 'encoder_residual', True):
+        want_zero = bool(self.zip2zip_config.zero_init_encoder_output)
+        init_scale = float(
+            getattr(self.zip2zip_config, "encoder_output_init_scale", 0.0) or 0.0
+        )
+        if want_zero and init_scale > 0.0:
+            raise ValueError(
+                "zero_init_encoder_output and encoder_output_init_scale are "
+                "mutually exclusive (exact-zero vs small-nonzero start); set at "
+                "most one."
+            )
+        # proj_out (present only when encoder_dim != model_dim) is zeroed for a
+        # residual model as before, and also whenever an exact-zero start is
+        # explicitly requested without the residual.
+        if getattr(self, 'encoder_residual', True) or want_zero:
             for name, module in encoder.named_modules():
                 if name.endswith('proj_out') and isinstance(module, nn.Linear):
                     nn.init.zeros_(module.weight)
                     zeroed.append(name)
-            # proj_out exists ONLY when encoder_dim != model_dim, so with the
-            # released Phi recipe (encoder_dim == dim == 3072) the loop above
-            # matches nothing and silently leaves the intent unimplemented: the
-            # encoder then starts emitting a LayerNorm-scaled random vector with
-            # ~54x the norm of the embedding it is supposed to nudge. That is the
-            # initialization every v0.1-v0.6.3 run used and is consistent with
-            # their large early-loss transient.
-            # Zeroing the final LayerNorm (weight AND bias, so the output is
-            # exactly 0 through both the padded and the varlen pooling paths)
-            # restores the intended identity start with no new parameters and no
-            # state-dict change.
-            if not zeroed and self.zip2zip_config.zero_init_encoder_output:
-                tail, prefix = encoder, ""
-                while getattr(tail, "pair_encoder", None) is not None:
-                    tail = tail.pair_encoder
-                    prefix += "pair_encoder."
-                norm = getattr(tail, "norm", None)
-                if not isinstance(norm, nn.LayerNorm):
-                    raise ValueError(
-                        f"zero_init_encoder_output=True but {type(encoder).__name__} "
-                        f"has no proj_out and no final LayerNorm to zero, so a zero "
-                        f"initial encoder output cannot be guaranteed. Use a "
-                        f"hyper_encoder_type with a zeroable final output gate, or "
-                        f"drop the flag."
-                    )
+        # proj_out does not exist when encoder_dim == model_dim (the released Phi
+        # recipe), so with an untouched final LayerNorm the encoder would emit a
+        # LayerNorm-scaled random vector at ~54x the embedding norm — the silent
+        # v0.1-v0.6.3 state. The final LayerNorm is then the only zeroable/
+        # rescalable output gate: zeroing weight AND bias makes the output exactly
+        # 0 through both the padded and the varlen pooling paths; setting
+        # weight=scale, beta=0 gives the small token-dependent start. Neither
+        # changes the state-dict structure.
+        if not zeroed and (want_zero or init_scale > 0.0):
+            tail, prefix = encoder, ""
+            while getattr(tail, "pair_encoder", None) is not None:
+                tail = tail.pair_encoder
+                prefix += "pair_encoder."
+            norm = getattr(tail, "norm", None)
+            if not isinstance(norm, nn.LayerNorm):
+                flag = "zero_init_encoder_output" if want_zero else "encoder_output_init_scale"
+                raise ValueError(
+                    f"{flag} is set but {type(encoder).__name__} has no proj_out "
+                    f"and no final LayerNorm to modify, so the requested initial "
+                    f"encoder output scale cannot be guaranteed. Use a "
+                    f"hyper_encoder_type with a settable final output gate, or "
+                    f"drop the flag."
+                )
+            if want_zero:
                 nn.init.zeros_(norm.weight)
                 nn.init.zeros_(norm.bias)
                 zeroed.append(prefix + "norm")
+            else:
+                nn.init.constant_(norm.weight, init_scale)
+                nn.init.zeros_(norm.bias)
+                zeroed.append(f"{prefix}norm(scale={init_scale:g})")
         self.zero_init_report[role] = zeroed
 
     def reset_inference_cache(self) -> None:

@@ -31,19 +31,23 @@ Invariants proven:
   Z7  fail-loud: an encoder type with neither proj_out nor a final LayerNorm
       raises instead of silently not applying (the original bug's failure mode).
   Z8  the nested-composer type (hierarchical) is covered via pair_encoder.norm.
-  Z9  the model-level guard does not zero an encoder used without the residual.
-  Z10 the CLI rejects zero-init together with --no_encoder_residual.
-  Z11 zero-init and residual mode are hard resume-lineage keys, including when
-      absent from legacy meta.pt (absence means false).
+  Z9  no-residual + zero-init zeroes the encoder AND yields an exactly-zero
+      hypertoken embedding (the vx0.6.4.6 exact-zero start).
+  Z10 the CLI accepts the no-residual init combinations (vx0.6.4.6 exact-zero and
+      vx0.6.4.7 small-scale), previously rejected as mutually exclusive.
+  Z11 zero-init, residual mode, and the encoder-output init scale are hard
+      resume-lineage keys, including when absent from legacy meta.pt (absence
+      means the default).
   Z12 the real lm-eval checkpoint loader restores residual mode from meta.pt,
       and the setting changes encoder composition by exactly the residual term.
   Z13 the compressed-generation checkpoint loader restores the same flag.
+  Z14 no-residual + encoder_output_init_scale gives a token-dependent output at
+      ~scale*sqrt(dim), far below the gamma=1 default (the vx0.6.4.7 start).
+  Z15 zero-init and encoder_output_init_scale are mutually exclusive at build.
 """
 import dataclasses
-import contextlib
 import importlib
 import importlib.util
-import io
 import os
 import sys
 import tempfile
@@ -61,7 +65,7 @@ K = 8
 
 
 def small_cfg(zero_init: bool, encoder_dim: int = DIM, untied: bool = True,
-              enc_type: str = "flat"):
+              enc_type: str = "flat", init_scale: float = 0.0):
     """encoder_dim == DIM reproduces the Phi situation (no proj_out)."""
     base = zip2zip_llama_configs["Phi3.5-mini"]
     return dataclasses.replace(
@@ -75,6 +79,7 @@ def small_cfg(zero_init: bool, encoder_dim: int = DIM, untied: bool = True,
         tie_hyper_encoder=not untied,
         hyper_encoder_type=enc_type,
         zero_init_encoder_output=zero_init,
+        encoder_output_init_scale=init_scale,
         encoder_dim=encoder_dim,
         encoder_n_layers=2,
         encoder_n_heads=4,
@@ -92,6 +97,15 @@ def small_cfg(zero_init: bool, encoder_dim: int = DIM, untied: bool = True,
 def build(zero_init: bool, seed: int = 1, **kw):
     cfg = small_cfg(zero_init, **kw)
     return build_model(cfg, seed=seed), cfg
+
+
+def _disable_varlen(model):
+    """Force the CPU-safe padded attention path (flash-attn varlen is CUDA-only).
+    Needed for models built directly (no-residual case) rather than via build_model."""
+    model.hyper_encoder.disable_varlen = True
+    if getattr(model, "hyper_output", None) is not None:
+        model.hyper_output.disable_varlen = True
+    return model
 
 
 def codebook(cfg, dev, n_real=5):
@@ -272,40 +286,86 @@ def main():
           out.dtype == x.dtype,
           f"out dtype={out.dtype}, input dtype={x.dtype}")
 
-    # ---- Z9: direct model use without residual does not zero the full embedding ----
+    # ---- Z9: no-residual + zero-init -> EXACT-zero hypertoken output (vx0.6.4.6) ----
+    # The shared-ruler exploration deliberately wants this combination: with the
+    # residual off and the encoder zeroed, the whole hypertoken embedding starts
+    # at exactly zero (the exact-zero counterpart of vx0.6.4.2's gamma=1 start).
     cfg_nr = small_cfg(zero_init=True)
     torch.manual_seed(9)
     m_nr = cfg_nr.build()
     m_nr.encoder_residual = False
     with torch.no_grad():
         m_nr.init_weights()
-    check("Z9_no_residual_skips_zero_init",
-          m_nr.zero_init_report["hyper_encoder"] == [],
-          "zero output without a residual would be identically-zero embeddings")
+    _disable_varlen(m_nr)
+    with torch.no_grad():
+        composed_nr = m_nr._encode_codebook_with_weights(
+            codebook(cfg_nr, dev), m_nr.tok_embeddings.weight)[0, :5]
+    check("Z9_no_residual_zero_init_zeroes_and_is_exactly_zero",
+          m_nr.zero_init_report["hyper_encoder"] == ["norm"]
+          and m_nr.zero_init_report["hyper_output"] == ["norm"]
+          and float(composed_nr.abs().max()) == 0.0,
+          f"report={m_nr.zero_init_report}, ||embed||max={float(composed_nr.abs().max())}")
 
-    # ---- Z10: the training CLI rejects the contradictory flag pair ----
-    import zip2zip_core.train as train_mod
-    saved_argv = sys.argv
-    err = io.StringIO()
-    cli_rejected = False
+    # ---- Z14: no-residual + small init scale -> ordinary-token-scale, token-dependent (vx0.6.4.7) ----
+    SCALE = 0.1
+    cfg_ss = small_cfg(zero_init=False, init_scale=SCALE)
+    torch.manual_seed(14)
+    m_ss = cfg_ss.build()
+    m_ss.encoder_residual = False
+    with torch.no_grad():
+        m_ss.init_weights()
+    _disable_varlen(m_ss)
+    # a gamma=1 (default) no-residual model for the "much smaller than default" comparison
+    cfg_big = small_cfg(zero_init=False)
+    torch.manual_seed(14)
+    m_big = cfg_big.build()
+    m_big.encoder_residual = False
+    with torch.no_grad():
+        m_big.init_weights()
+    _disable_varlen(m_big)
+    with torch.no_grad():
+        out_ss = m_ss._encode_codebook_with_weights(
+            codebook(cfg_ss, dev), m_ss.tok_embeddings.weight)[0, :5]
+        out_big = m_big._encode_codebook_with_weights(
+            codebook(cfg_big, dev), m_big.tok_embeddings.weight)[0, :5]
+    n_ss = out_ss.norm(dim=-1)
+    check("Z14_small_scale_report_names_scaled_norm",
+          m_ss.zero_init_report["hyper_encoder"] == [f"norm(scale={SCALE:g})"]
+          and m_ss.zero_init_report["hyper_output"] == [f"norm(scale={SCALE:g})"],
+          f"report={m_ss.zero_init_report}")
+    check("Z14_small_scale_is_token_dependent_not_zero",
+          float(n_ss.min()) > 0.0 and float(n_ss.std()) > 0.0,
+          f"||out|| per entry min={float(n_ss.min()):.4f} std={float(n_ss.std()):.4f} (nonzero, varies)")
+    check("Z14_small_scale_much_smaller_than_default",
+          float(n_ss.mean()) < 0.25 * float(out_big.norm(dim=-1).mean()),
+          f"small={float(n_ss.mean()):.3f} vs default gamma=1={float(out_big.norm(dim=-1).mean()):.3f}")
+
+    # ---- Z15: exact-zero and small-scale starts are mutually exclusive ----
+    raised_me = False
     try:
-        sys.argv = [
-            "train.py", "--data_dir", "/tmp/data", "--output_dir", "/tmp/out",
-            "--zero_init_encoder_output", "--no_encoder_residual",
-        ]
-        with contextlib.redirect_stderr(err):
-            try:
-                train_mod.main()
-            except SystemExit as e:
-                cli_rejected = e.code == 2
-    finally:
-        sys.argv = saved_argv
-    cli_error = err.getvalue()
-    check("Z10_cli_rejects_zero_init_without_residual",
-          cli_rejected
-          and "--zero_init_encoder_output" in cli_error
-          and "--no_encoder_residual" in cli_error,
-          "argparse rejects the mutually exclusive flags before model construction")
+        build(zero_init=True, seed=15, init_scale=0.1)
+    except ValueError as e:
+        raised_me = "mutually exclusive" in str(e)
+    check("Z15_zero_and_scale_mutually_exclusive", raised_me,
+          "config sets at most one of zero_init / encoder_output_init_scale")
+
+    # ---- Z10: the training CLI ACCEPTS the no-residual init combinations ----
+    # These were previously argparse-rejected as a mutually exclusive pair; the
+    # shared-ruler exploration needs them, so the CLI now parses both.
+    import zip2zip_core.train as train_mod
+    base_argv = ["--data_dir", "/tmp/data", "--output_dir", "/tmp/out"]
+    a_zero = train_mod.build_parser().parse_args(
+        base_argv + ["--zero_init_encoder_output", "--no_encoder_residual"])
+    check("Z10_cli_accepts_zero_init_with_no_residual",
+          a_zero.zero_init_encoder_output and a_zero.no_encoder_residual
+          and a_zero.encoder_output_init_scale == 0.0,
+          "vx0.6.4.6: exact-zero start without the residual parses")
+    a_scale = train_mod.build_parser().parse_args(
+        base_argv + ["--no_encoder_residual", "--encoder_output_init_scale", "0.05"])
+    check("Z10_cli_accepts_small_scale_with_no_residual",
+          a_scale.no_encoder_residual and a_scale.encoder_output_init_scale == 0.05
+          and not a_scale.zero_init_encoder_output,
+          "vx0.6.4.7: small ordinary-token-scale start without the residual parses")
 
     # ---- Z11: both behavior/init flags are hard resume-lineage keys ----
     saved_dist = train_mod.dist
@@ -358,6 +418,18 @@ def main():
             check("Z11_no_residual_is_resume_hard",
                   guard_rejects(args_nores, rec_nores),
                   "behavior-only residual mode cannot change silently")
+
+            args_scale = types.SimpleNamespace(
+                **common, zero_init_encoder_output=False,
+                no_encoder_residual=True, encoder_dim=3072,
+                encoder_output_init_scale=0.05,
+            )
+            rec_scale = dict(vars(args_scale))
+            del rec_scale["allow_resume_mismatch"]
+            rec_scale["encoder_output_init_scale"] = 0.0
+            check("Z11_encoder_output_init_scale_is_resume_hard",
+                  guard_rejects(args_scale, rec_scale),
+                  "the encoder-output init scale cannot change silently on resume")
 
             args_hier = types.SimpleNamespace(
                 **common, zero_init_encoder_output=True,

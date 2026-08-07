@@ -680,6 +680,7 @@ def validate_resume_args(resume_dir, args):
             "gated_rope_start_pair",
             "base_view_replay_prob",
             "zero_init_encoder_output", "no_encoder_residual",
+            "encoder_output_init_scale",
             "token_type_loss_weight", "online_codebook_mask",
             # lora_alpha sets scaling = alpha/rank as a RUNTIME attribute
             # (lora.py), not a state-dict entry: changing it on resume loads the
@@ -715,6 +716,7 @@ def validate_resume_args(resume_dir, args):
         "base_view_replay_prob": 0.0,
         "zero_init_encoder_output": False,
         "no_encoder_residual": False,
+        "encoder_output_init_scale": 0.0,
         "token_type_loss_weight": 0.0,
         "online_codebook_mask": False,
     }
@@ -929,7 +931,9 @@ def load_hf_pretrained(model, hf_model_name, device):
             print(f"  ⚠️ Unexpected keys: {unexpected}")
 
 
-def main():
+def build_parser():
+    """The training CLI parser. Extracted so tests can inspect argument
+    acceptance without running main()."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
@@ -953,8 +957,7 @@ def main():
                         help="With --untied_hyper_encoder, re-encode the output role from "
                              "lm_head rows but reuse the input hyper-encoder's weights. "
                              "Default off = train a separate output encoder.")
-    encoder_residual_group = parser.add_mutually_exclusive_group()
-    encoder_residual_group.add_argument(
+    parser.add_argument(
         "--zero_init_encoder_output", action="store_true",
         help="Make the hyper-encoder emit exactly zero at init, so the "
              "first hypertoken embedding equals its first base token's "
@@ -962,7 +965,20 @@ def main():
              "silent no-op: the existing zero-init only touches "
              "proj_out, which does not exist when encoder_dim == dim "
              "(every Phi run), leaving the encoder ~54x too large at "
-             "step 0. Default off = v0.1-v0.6.3 behavior.")
+             "step 0. Default off = v0.1-v0.6.3 behavior. May be combined "
+             "with --no_encoder_residual for the no-residual exact-zero "
+             "start (vx0.6.4.6); mutually exclusive with "
+             "--encoder_output_init_scale.")
+    parser.add_argument(
+        "--encoder_output_init_scale", type=float, default=0.0,
+        help="Small nonzero start for the hyper-encoder output branch: set the "
+             "final LayerNorm to gamma=SCALE (constant), beta=0, so the branch "
+             "emits a token-dependent vector at roughly SCALE*sqrt(dim) ~ "
+             "ordinary-token norm instead of the default ~54x start. 0.0 = off "
+             "(standard gamma=1 init). Intended with --no_encoder_residual to "
+             "test whether a small, gradually-grown output scale avoids the "
+             "shared-ruler geometry (vx0.6.4.7). Mutually exclusive with "
+             "--zero_init_encoder_output.")
     parser.add_argument("--base_token_positions", action="store_true",
                         help="RoPE positions follow the uncompressed stream (each token "
                              "sits at the base-space index of its last constituent) "
@@ -1121,18 +1137,32 @@ def main():
                         help="Number of profiler warmup steps before active profiling")
     parser.add_argument("--disable_varlen", action="store_true",
                         help="Disable varlen attention in hyper-encoder (use padded path instead)")
-    encoder_residual_group.add_argument(
+    parser.add_argument(
         "--no_encoder_residual", action="store_true",
         help="Disable residual connection in hyper-encoder (ablation experiment). "
-             "Incompatible with --zero_init_encoder_output because a zero encoder "
-             "output would make the complete hypertoken embedding zero.")
+             "May be combined with --zero_init_encoder_output (vx0.6.4.6: the "
+             "hypertoken embedding then starts at exactly zero) or with "
+             "--encoder_output_init_scale (vx0.6.4.7: a small ordinary-token-scale "
+             "start) to probe what drives the shared-ruler geometry.")
     parser.add_argument("--debug_first_steps", type=int, default=0,
                         help="Print per-rank progress markers for the first N training steps. "
                              "Useful for diagnosing hangs before step 1 logging.")
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.no_compile:
         args.compile = False
+    if args.zero_init_encoder_output and args.encoder_output_init_scale > 0.0:
+        parser.error(
+            "--zero_init_encoder_output and --encoder_output_init_scale are "
+            "mutually exclusive (exact-zero vs small-nonzero encoder start)"
+        )
+    if args.encoder_output_init_scale < 0.0:
+        parser.error("--encoder_output_init_scale must be >= 0")
     if args.two_axis_rope and args.gated_compressed_rope:
         parser.error(
             "--two_axis_rope and --gated_compressed_rope are mutually exclusive"
@@ -1294,6 +1324,7 @@ def main():
         gated_rope_start_layer=args.gated_rope_start_layer,
         gated_rope_start_pair=args.gated_rope_start_pair,
         zero_init_encoder_output=args.zero_init_encoder_output,
+        encoder_output_init_scale=args.encoder_output_init_scale,
         rope=dataclasses.replace(
             config.rope,
             max_seq_len=rope_cache_len(
