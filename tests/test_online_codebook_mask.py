@@ -566,6 +566,7 @@ def main():
         lm.hyper_causal_mask = True
         lm.online_codebook_mask = True
         lm.online_codebook_mask_active = True
+        lm.multi_view = False
         lm.compression_stats = {
             "in_comp": 0,
             "in_base": 0,
@@ -616,11 +617,11 @@ def main():
             [1, 2, 1, 2, 1, 2, 1], cont_start_base=0
         )
         check("O11_eval_scorer_exact_mask_and_skip",
-              exact_score[2:] == (2, 3)
+              exact_score[2:4] == (2, 3)
               and exact_skipped == 1
-              and legacy_score[2:] == (3, 6),
-              f"exact counts={exact_score[2:]} skipped={exact_skipped} "
-              f"legacy counts={legacy_score[2:]}")
+              and legacy_score[2:4] == (3, 6),
+              f"exact counts={exact_score[2:4]} skipped={exact_skipped} "
+              f"legacy counts={legacy_score[2:4]}")
     finally:
         if lm_eval_stubs:
             sys.modules.pop("zip2zip_core.lm_eval_adapter", None)

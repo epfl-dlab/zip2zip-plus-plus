@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.join(_ROOT, "src"))
 sys.path.insert(0, os.path.join(_ROOT, "ext", "torchtitan"))
 
 from zip2zip_core.lm_eval_adapter import Zip2ZipLM  # noqa: E402  (registers "zip2zip")
+from zip2zip_core.multi_view import derive_multi_view_metrics  # noqa: E402
 from lm_eval import simple_evaluate  # noqa: E402
 from lm_eval.tasks import TaskManager  # noqa: E402
 
@@ -116,6 +117,13 @@ def main():
                         "Use this to compare against v0.1-v0.6.4 numbers, which were "
                         "all produced with the legacy mask. No effect on older "
                         "checkpoints or in base mode.")
+    p.add_argument("--no_multi_view", action="store_true",
+                   help="Disable the multi-view perplexity columns. On by "
+                        "default: rolling-perplexity tasks additionally report "
+                        "multi_view_* metrics that marginalize each hypertoken "
+                        "target over every valid same-text first token "
+                        "(first-token bound). Strict metrics are never "
+                        "affected either way.")
     p.add_argument("--legacy_untrimmed_stops", action="store_true",
                    help="Return generated text without cutting it at the first "
                         "stop-string occurrence, as all evals did before 2026-08. "
@@ -182,6 +190,7 @@ def main():
         disable_mathsym_ids=args.disable_mathsym_ids,
         eval_max_subtokens=args.eval_max_subtokens,
         trim_stop_strings=not args.legacy_untrimmed_stops,
+        multi_view=not args.no_multi_view,
     )
     # The adapter auto-enables digit protection for checkpoints trained with it
     # and auto-switches control checkpoints (max_codebook_size=0) to base mode —
@@ -205,6 +214,7 @@ def main():
     args.online_codebook_mask = lm.online_codebook_mask
     args.online_codebook_mask_active = lm.online_codebook_mask_active
     args.trim_stop_strings = lm.trim_stop_strings
+    args.multi_view = lm.multi_view
     # Distinguishes "inactive because base mode" from "inactive because this eval
     # deliberately asked for the legacy mask" — otherwise a results JSON cannot
     # be audited for which regime produced its numbers.
@@ -253,6 +263,30 @@ def main():
     )
     eval_wall_seconds = time.perf_counter() - eval_start
 
+    # Multi-view perplexity: turn the adapter's per-task loglikelihood sums
+    # into metrics by rescaling the harness-reported strict values (the
+    # denominator cancels; see zip2zip_core.multi_view), then attach the
+    # columns next to each task's strict metrics so every downstream consumer
+    # — the stdout dump below, the results JSON, the W&B logger, and
+    # log_results_to_wandb.py's backfill — inherits them with no extra
+    # plumbing.
+    multi_view = {}
+    for mv_task, mv_sums in lm.multi_view_summary().items():
+        row = (results.get("results") or {}).get(mv_task)
+        reported = {}
+        for k, v in (row or {}).items():
+            name = k.split(",")[0]
+            if name in ("word_perplexity", "byte_perplexity", "bits_per_byte"):
+                reported.setdefault(name, v)
+        derived = derive_multi_view_metrics(mv_sums, reported)
+        multi_view[mv_task] = {**mv_sums, **derived}
+        if row is not None:
+            for k, v in derived.items():
+                if k.startswith(("multi_view_", "segmentation_gap_")) and isinstance(
+                    v, (int, float)
+                ):
+                    row[f"{k},none"] = v
+
     print("\n" + "=" * 72)
     print("Results:")
     print(json.dumps(results.get("results", results), indent=2, default=str))
@@ -261,6 +295,26 @@ def main():
     compression = lm.compression_summary()
     print("Compression (base tokens per compressed token, >1 = more compression):")
     print(json.dumps(compression, indent=2))
+    if multi_view:
+        print("Multi-view perplexity (hypertoken targets marginalized over all "
+              "same-text first tokens; first-token bound):")
+        print(json.dumps(multi_view, indent=2))
+        for mv_task, mv_metrics in multi_view.items():
+            # Back-solving the byte denominator from our strict sum and the
+            # reported byte perplexity must land on a (near-)integer byte
+            # count; anything else means our sums are not the ones behind the
+            # reported metric and the multi-view columns cannot be trusted.
+            implied = mv_metrics.get("implied_byte_denominator")
+            if (
+                isinstance(implied, (int, float))
+                and abs(implied - round(implied)) > 1e-6 * max(1.0, abs(implied))
+            ):
+                print(f"[eval_harness] WARNING: multi-view alignment "
+                      f"self-check FAILED for {mv_task}: implied byte "
+                      f"denominator {implied!r} is not an integer — the "
+                      f"accumulated sums do not match the reported "
+                      f"byte_perplexity, multi_view_* values for this task "
+                      f"are suspect.")
     print(f"Evaluation wall time: {eval_wall_seconds:.1f}s")
     print("=" * 72)
 
@@ -349,6 +403,7 @@ def main():
                     "results": results.get("results"),
                     "configs": results.get("configs"),
                     "compression": compression,
+                    "multi_view": multi_view,
                     "eval_wall_seconds": eval_wall_seconds,
                     "ckpt_dir": ckpt_dir,
                     "tasks": tasks,

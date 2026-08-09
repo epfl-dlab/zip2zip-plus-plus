@@ -43,6 +43,11 @@ from zip2zip_core.checkpoint import (
 from zip2zip_core.data import online_codebook_counts, online_unavailable_targets
 from zip2zip_core.disabled_ids import base_disabled_ids, digit_ids
 from zip2zip_core.model import Zip2ZipLlama3Model, restore_encoder_residual
+from zip2zip_core.multi_view import (
+    MultiViewAccumulator,
+    build_expansion_index,
+    multi_view_candidates,
+)
 
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
@@ -250,6 +255,7 @@ class Zip2ZipLM(LM):
         disable_mathsym_ids: bool = False,
         eval_max_subtokens: int | None = None,
         trim_stop_strings: bool = True,
+        multi_view: bool = True,
     ):
         super().__init__()
         if not torch.cuda.is_available() and device.startswith("cuda"):
@@ -417,6 +423,11 @@ class Zip2ZipLM(LM):
         # in_*: full (context + continuation) sequences fed for scoring.
         # gen_*: tokens emitted by generate_until.
         self.compression_stats = {"in_comp": 0, "in_base": 0, "gen_comp": 0, "gen_base": 0}
+        # Multi-view (segmentation-marginalized) perplexity, accumulated per
+        # rolling-perplexity task and read back via multi_view_summary().
+        # On by default; strict scores returned to lm-eval are unaffected.
+        self.multi_view = bool(multi_view)
+        self._multi_view_accum = MultiViewAccumulator()
         if self.online_codebook_mask_active:
             self.compression_stats.update(
                 online_skipped_targets=0,
@@ -457,6 +468,8 @@ class Zip2ZipLM(LM):
             kwargs["online_codebook_mask"] = kwargs["online_codebook_mask"].lower() in ("1", "true", "yes")
         if "trim_stop_strings" in kwargs:
             kwargs["trim_stop_strings"] = kwargs["trim_stop_strings"].lower() in ("1", "true", "yes")
+        if "multi_view" in kwargs:
+            kwargs["multi_view"] = kwargs["multi_view"].lower() in ("1", "true", "yes")
         if additional_config:
             for k in ("batch_size", "device"):
                 if k not in kwargs and additional_config.get(k) is not None:
@@ -537,21 +550,30 @@ class Zip2ZipLM(LM):
         cont_start_base: int,
         *,
         reject_unavailable_targets: bool = False,
-    ) -> Tuple[float, bool, int, int]:
+        compute_multi_view: bool = False,
+    ) -> Tuple[float, bool, int, int, float, int]:
         """Compress full_ids, run the model, sum logprobs of compressed tokens
         whose base span starts at or after `cont_start_base`.
 
-        Returns (logprob_sum, is_greedy, n_compressed_scored, n_base_scored).
+        Returns (logprob_sum, is_greedy, n_compressed_scored, n_base_scored,
+        multi_view_logprob_sum, n_hyper_scored). With compute_multi_view (only
+        the rolling-perplexity path asks for it, and only when self.multi_view
+        is on), the multi-view sum scores the same positions but, at
+        hypertoken targets, marginalizes over every token whose expansion is
+        a prefix of the target's (the first-token bound; see
+        zip2zip_core.multi_view). It never affects the strict sum or
+        is_greedy, and degenerates to the strict sum when not computed or
+        when no hypertoken was scored.
         """
         if len(full_ids) < 2:
-            return 0.0, True, 0, 0
+            return 0.0, True, 0, 0, 0.0, 0
 
         compressor = LZWCompressor(**self._compressor_kwargs)
         compressed, _, codebook = compressor.encode(
             full_ids, padding="do_not_pad", truncation=False
         )
         if len(compressed) < 2:
-            return 0.0, True, 0, 0
+            return 0.0, True, 0, 0, 0.0, 0
 
         self.compression_stats["in_base"] += len(full_ids)
         self.compression_stats["in_comp"] += len(compressed)
@@ -604,10 +626,20 @@ class Zip2ZipLM(LM):
         logits = out[0] if isinstance(out, tuple) else out
         log_probs = F.log_softmax(logits[0].float(), dim=-1)
 
+        # Ordered so the MC/generation paths (compute_multi_view=False) never
+        # even read self.multi_view and pay zero multi-view overhead.
+        mv_index = (
+            build_expansion_index(cb_dict)
+            if compute_multi_view and self.multi_view
+            else None
+        )
+
         total = 0.0
+        mv_total = 0.0
         is_greedy = True
         n_comp = 0
         n_base = 0
+        n_hyper = 0
         for t in range(len(compressed) - 1):
             target = compressed[t + 1]
             bstart, bend = spans[t + 1]
@@ -624,20 +656,32 @@ class Zip2ZipLM(LM):
                         "The evaluation was stopped instead."
                     )
                 continue
-            total += log_probs[t, target].item()
+            lp_target = log_probs[t, target].item()
+            total += lp_target
+            if mv_index is None or target < V:
+                # Base-token targets have a single view; multi-view == strict.
+                mv_total += lp_target
+            else:
+                cands = multi_view_candidates(target, cb_dict, mv_index, V)
+                mv_total += torch.logsumexp(log_probs[t, cands], dim=0).item()
+                n_hyper += 1
             if int(log_probs[t].argmax().item()) != target:
                 is_greedy = False
             n_comp += 1
             n_base += bend - bstart
-        return total, is_greedy, n_comp, n_base
+        return total, is_greedy, n_comp, n_base, mv_total, n_hyper
 
     @torch.no_grad()
     def _score_base(
         self, full_ids: List[int], cont_start_base: int
-    ) -> Tuple[float, bool, int, int]:
-        """Vanilla LM scoring: feed base tokens, no codebook, base-vocab logits only."""
+    ) -> Tuple[float, bool, int, int, float, int]:
+        """Vanilla LM scoring: feed base tokens, no codebook, base-vocab logits only.
+
+        Base tokens have a single view, so the multi-view sum equals the
+        strict sum by definition (returned for a uniform _score signature).
+        """
         if len(full_ids) < 2:
-            return 0.0, True, 0, 0
+            return 0.0, True, 0, 0, 0.0, 0
         self.compression_stats["in_base"] += len(full_ids)
         self.compression_stats["in_comp"] += len(full_ids)
         x = torch.tensor(full_ids[:-1], dtype=torch.long, device=self._device).unsqueeze(0)
@@ -658,7 +702,7 @@ class Zip2ZipLM(LM):
             if int(log_probs[t].argmax().item()) != target:
                 is_greedy = False
             n += 1
-        return total, is_greedy, n, n
+        return total, is_greedy, n, n, total, 0
 
     def _score(
         self,
@@ -666,6 +710,7 @@ class Zip2ZipLM(LM):
         cont_start_base: int,
         *,
         reject_unavailable_targets: bool = False,
+        compute_multi_view: bool = False,
     ):
         if self.eval_mode == "base":
             return self._score_base(full_ids, cont_start_base)
@@ -673,6 +718,7 @@ class Zip2ZipLM(LM):
             full_ids,
             cont_start_base,
             reject_unavailable_targets=reject_unavailable_targets,
+            compute_multi_view=compute_multi_view,
         )
 
     def compression_summary(self) -> dict:
@@ -695,6 +741,18 @@ class Zip2ZipLM(LM):
                 / s["online_replay_tokens"]
             )
         return s
+
+    def multi_view_summary(self) -> dict:
+        """Per-task strict/multi-view loglikelihood sums from the rolling-
+        perplexity requests. Empty when multi_view is off or no
+        loglikelihood_rolling task ran. Callers turn the sums into metrics
+        with zip2zip_core.multi_view.derive_multi_view_metrics, which rescales
+        the harness-reported strict metrics so the denominator basis (bytes,
+        words, whatever the task counts) cancels exactly.
+        """
+        if not self.multi_view:
+            return {}
+        return self._multi_view_accum.summary()
 
     # ──────────────────────── lm-eval interface ───────────────────────────
 
@@ -730,7 +788,7 @@ class Zip2ZipLM(LM):
             else:
                 cont_start_base = len(ctx_ids)
 
-            lp, greedy, _, _ = self._score(
+            lp, greedy, _, _, _, _ = self._score(
                 full_ids,
                 cont_start_base,
                 reject_unavailable_targets=True,
@@ -743,11 +801,17 @@ class Zip2ZipLM(LM):
         out: List[float] = []
         for req in tqdm(requests, desc="loglikelihood_rolling", disable=len(requests) < 4):
             text = req.args[0]
+            task_name = getattr(req, "task_name", None)
             ids = self.tok_encode(text)
             if len(ids) < 2:
+                if self.multi_view:
+                    self._multi_view_accum.add_document(task_name, 0.0, 0.0, 0, 0)
                 out.append(0.0)
                 continue
             total = 0.0
+            mv_total = 0.0
+            n_targets = 0
+            n_hyper = 0
             for prefix_tokens, pred_tokens in map(
                 make_disjoint_window,
                 get_rolling_token_windows(
@@ -760,8 +824,19 @@ class Zip2ZipLM(LM):
                 full_ids = list(prefix_tokens) + list(pred_tokens)
                 if len(full_ids) < 2:
                     continue
-                lp, _, _, _ = self._score(full_ids, cont_start_base=len(prefix_tokens))
+                lp, _, n_comp, _, mv_lp, nh = self._score(
+                    full_ids,
+                    cont_start_base=len(prefix_tokens),
+                    compute_multi_view=True,
+                )
                 total += lp
+                mv_total += mv_lp
+                n_targets += n_comp
+                n_hyper += nh
+            if self.multi_view:
+                self._multi_view_accum.add_document(
+                    task_name, total, mv_total, n_hyper, n_targets
+                )
             out.append(total)
         return out
 

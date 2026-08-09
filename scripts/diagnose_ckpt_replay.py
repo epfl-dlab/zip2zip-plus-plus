@@ -234,7 +234,7 @@ def eval_style_rolling(lm, ids, max_len):
         full = list(prefix) + list(pred)
         if len(full) < 2:
             continue
-        lp, _, _, n_base = lm._score_compressed(full, cont_start_base=len(prefix))
+        lp, _, _, n_base, *_ = lm._score_compressed(full, cont_start_base=len(prefix))
         total += -lp
         scored += n_base
     return total, scored
@@ -399,7 +399,7 @@ def main():
     nll, n_tok, n_bytes = 0.0, 0, 0
     for chunk, _ in chunks:
         ids = chunk[:4096]
-        lp, _, n, _ = lm._score_base(ids, cont_start_base=1)
+        lp, _, n, _, *_ = lm._score_base(ids, cont_start_base=1)
         nll += -lp; n_tok += n
         n_bytes += len(tokenizer.decode(ids, skip_special_tokens=False).encode("utf-8"))
     log(f"  base-mode: nats/base-token={nll / n_tok:.4f} bits/byte={nll / n_bytes / math.log(2):.4f} "
