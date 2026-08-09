@@ -455,23 +455,45 @@ class Zip2ZipDataset(IterableDataset, Stateful):
 
                     compressed = compressed[: self.seq_len + 1]
 
-                    # A window with ZERO hypertokens makes this rank skip the
-                    # hyper-encoder forward (model gate: (codebook != pad).any())
-                    # while other ranks run it — the FSDP collectives then
-                    # deadlock until the NCCL watchdog aborts the job (observed
-                    # in the first digitsafe run: rare all-number windows have
-                    # no LZW merges once digits are disabled). Skip such windows
-                    # when compression is on; the uncompressed control
-                    # (max_codebook_size=0) skips the hyper path on ALL ranks
-                    # uniformly, which is safe, so it must keep every window.
+                    # A window with ZERO hypertokens in the INPUT slice makes
+                    # this rank's hyper path diverge from the other ranks and
+                    # the FSDP collectives deadlock until the NCCL watchdog
+                    # aborts the job. The model branches on x = compressed[:-1],
+                    # so scan exactly that slice: scanning the full window let
+                    # through a window whose only hypertoken was the final,
+                    # label-only token, which orphaned hyper_encoder from the
+                    # loss on one rank (pt20B step 95231; survivable since the
+                    # unconditional mix in _embed_tokens_train, but the guard
+                    # must match what the model sees). First observed as rare
+                    # all-number windows in the digitsafe run. The uncompressed
+                    # control (max_codebook_size=0) skips the hyper path on ALL
+                    # ranks uniformly, which is safe, so it keeps every window.
                     if self.max_codebook_size > 0 and not any(
-                        t >= self.initial_vocab_size for t in compressed
+                        t >= self.initial_vocab_size for t in compressed[:-1]
                     ):
                         self._debug_log(
                             f"lm skip zero-hypertoken window shard_idx={shard_idx} "
                             f"offset={offset - self.base_chunk_len}"
                         )
                         continue
+
+                    # Without remap the hyper ids index raw LZW rows and the
+                    # collate silently truncates the codebook to
+                    # max_active_codebook_size rows. Inside a seq_len+1 window
+                    # LZW cannot yet have created row max_active — but that is
+                    # a property of the current seq_len, not of this code, so
+                    # fail loudly here instead of surfacing as a CUDA
+                    # device-side assert in the embedding gather.
+                    if self.max_codebook_size > 0 and not self.remap_codebook:
+                        highest = max(compressed)
+                        if highest >= self.initial_vocab_size + self.max_active_codebook_size:
+                            raise ValueError(
+                                f"compressed window references LZW row "
+                                f"{highest - self.initial_vocab_size} but the "
+                                f"collate truncates the codebook to "
+                                f"max_active_codebook_size="
+                                f"{self.max_active_codebook_size} rows"
+                            )
 
                     # Historical reporting denominator: expand the complete
                     # compressed T+1 window, including the first input-only
@@ -575,6 +597,11 @@ class Zip2ZipDataset(IterableDataset, Stateful):
 
         Loss is only computed on the second part (labels set to -100 for the first part).
         Direction is chosen randomly (50/50) per sample.
+
+        NOTE: unlike _iter_lm this mode has no zero-hypertoken window guard, so
+        under multi-GPU FSDP a rank whose sample has no LZW merges can diverge
+        at the model's codebook gate. No current recipe uses this mode; add the
+        guard before pointing a distributed run at it.
         """
         vocab = self.initial_vocab_size
         target_total = self.seq_len - 1  # content budget (excluding 2 special tokens)

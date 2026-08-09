@@ -23,6 +23,12 @@ Invariants proven:
   T6  inference (generation) path: the untied output buffer is populated from the
       OUTPUT encoder and equals the training-path output encoding of the same
       entries; tied path leaves no output buffer.
+  T8  a real codebook with ZERO hypertokens in the input still puts the INPUT
+      encoder in the autograd graph (grads exist, all-zero). This is the FSDP
+      rank-invariance guarantee for the pt20B step-95231 deadlock: the gated
+      embedding mix orphaned hyper_encoder on a rank whose window had its only
+      hypertoken in the labels, so that rank skipped the group's backward
+      collectives and NCCL deadlocked.
 """
 import copy
 import dataclasses
@@ -162,6 +168,21 @@ def main():
     with torch.no_grad():
         mt._embed_tokens_inference(toks, updates, idx)
     check("T6_tied_no_output_buffer", mt._hyper_out_embeds_buf is None)
+
+    # ---- T8: zero-hypertoken input + real codebook -> input encoder in graph ----
+    # Regression for the gated embedding mix: grads must EXIST for every
+    # hyper_encoder parameter (zeros are correct; None means the rank would
+    # skip the group's FSDP backward collectives and deadlock).
+    mu.reset_inference_cache()
+    out8 = mu(toks_base, codebook=cb, hyper_causal_mask=True)
+    logits8 = out8[0] if isinstance(out8, tuple) else out8
+    mu.zero_grad(set_to_none=True)
+    logits8[..., :V].float().sum().backward()
+    grads8 = [p.grad for p in mu.hyper_encoder.parameters()]
+    check("T8_zero_hypertoken_input_encoder_gets_grad",
+          len(grads8) > 0 and all(g is not None for g in grads8),
+          f"{sum(g is not None for g in grads8)}/{len(grads8)} params got grad")
+    mu.zero_grad(set_to_none=True)
 
     # ---- T7: shared-weight untied mode has no hyper_output but re-encodes output role ----
     ms, cfgs = build(untied=True, share=True, seed=4)
