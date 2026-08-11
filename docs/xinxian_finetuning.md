@@ -352,7 +352,7 @@ long-context performance on non-repeated text.
 
 ### `vx0.6.4.6` and `vx0.6.4.7`: no-residual initialization
 
-Status: planned.
+Status: planned. Run in branch `xinxian-shared-ruler-exploration`
 
 **Motivation**: the existing no-residual run, `vx0.6.4.2`, starts with
 `gamma = 1, beta = 0`. Its initial encoder output is large, and the trained
