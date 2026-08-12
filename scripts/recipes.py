@@ -273,6 +273,19 @@ RECIPES = {
                  "small starting output scale keeps the trained geometry off the "
                  "shared ruler.",
     },
+    "vx0.6.4.8": {
+        "extends": "vx0.6.4.4",
+        "status": "exploratory",
+        "description": "hierarchical no-residual with small encoder-output LayerNorm init",
+        "env": {"ENCODER_OUTPUT_INIT_SCALE": "0.05"},
+        "notes": "Xinxian exploratory run: hierarchical counterpart of "
+                 "vx0.6.4.7. Keeps vx0.6.4.4's hierarchical composer and "
+                 "residual OFF, but initializes the pair encoder's final "
+                 "LayerNorm to gamma=0.05 (beta=0) instead of gamma=1. This "
+                 "isolates the LayerNorm initialization omitted from the "
+                 "original vx0.6.4.4 ablation while holding the architecture, "
+                 "data, and training recipe fixed.",
+    },
     "v0.6.5": {
         "extends": "v0.6.4",
         "status": "negative",

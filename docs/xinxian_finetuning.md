@@ -171,16 +171,37 @@ Decision rule: compare against `vx0.6.4.3` first. If removing residual
 initialization helps, use `vx0.6.4.4` as the base for the merge-size transfer
 experiment below; otherwise use `vx0.6.4.3`.
 
-Result: compare the two hierarchical variants.
+Result: compare the three hierarchical variants.
 
 | Version | Residual init | ARC-c | ARC-e | HellaSwag | OBQA | PIQA | WinoGrande | GSM8K strict \| flexible | Wiki byte_ppl↓ | gen_compression_ratio |
 |---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
-| `vx0.6.4.3` | yes | **0.5597** | **0.8359** | **0.7252** | **0.4640** | **0.8003** | 0.7348 | **0.201** \| **0.6308** | **1.6586** | 1.2490 |
-| `vx0.6.4.4` | no | 0.5478 | 0.8304 | 0.7051 | 0.4620 | 0.7965 | **0.7356** | 0.134 \| 0.6141 | 1.7128 | **1.2567** |
+| `vx0.6.4.3` | yes | 0.5597 | **0.8359** | **0.7252** | 0.4640 | **0.8003** | 0.7348 | **0.201** \| **0.6308** | **1.6586** | 1.2490 |
+| `vx0.6.4.4` | no | 0.5478 | 0.8304 | 0.7051 | 0.4620 | 0.7965 | 0.7356 | 0.134 \| 0.6141 | 1.7128 | **1.2567** |
+| `vx0.6.4.8` | no | **0.5606** | 0.8354 | 0.7225 | **0.4800** | 0.7922 | **0.7522** | 0.177 \| 0.5315 | 1.6619 | 1.1986 |
 
-Takeaway: removing the residual path hurts the hierarchical encoder broadly,
-especially Wiki byte-ppl and GSM8K. `vx0.6.4.3` is the cleaner base for any
-merge-size transfer test.
+Takeaway: the broad `vx0.6.4.4` regression was largely an initialization
+confound, not an inherent cost of removing the residual. With the controlled
+`gamma=0.05` start, `vx0.6.4.8` recovers the MC and WikiText performance;
+GSM8K flexible remains the notable regression.
+
+#### `vx0.6.4.8`: revisit no-residual with controlled LayerNorm initialization
+
+Comparison: `vx0.6.4.4` vs `vx0.6.4.8`.
+
+The original no-residual hierarchical ablation also changed the effective
+initialization from the residual recipe's zero-output encoder branch to the
+pair encoder's default final LayerNorm (`gamma = 1`, `beta = 0`). That large
+start was not controlled in the original interpretation of the result.
+
+`vx0.6.4.8` keeps the hierarchical composer and residual-disabled architecture
+from `vx0.6.4.4`, but initializes the pair encoder's final LayerNorm with
+`gamma = 0.05`, `beta = 0`, matching the small-start treatment in
+`vx0.6.4.7`. The pair composer applies its final LayerNorm at every left-fold
+step, so the small scale is reset rather than accumulated with merge depth.
+This makes LayerNorm initialization the only change from `vx0.6.4.4`.
+
+Recipe: `RECIPE=vx0.6.4.8`. Use seed 42 for the direct comparison with
+`vx0.6.4.4`.
 
 ### `vx0.6.4.5`: merge-size transfer test
 
