@@ -71,6 +71,22 @@ presets:
     dtype: bfloat16
     seed: 1234
 
+  # Quick variant of `perplexity`: full wikitext (small, stays 1:1 comparable
+  # with final/wikitext) plus pinned 1000-document subsets of Pile/mC4/dC4
+  # (see scripts/lm_eval_tasks/*_sub1k.yaml — same documents every run, or a
+  # hard error). Every scoring knob must stay identical to `perplexity`; only
+  # the tasks differ. eval_ckpt_rcp.sh logs these runs under subset_ppl/ so
+  # subset numbers never share a panel with full-corpus numbers.
+  perplexity_subset:
+    description: "Quick perplexity: full wikitext + pinned 1k-doc subsets of Pile/mC4/dC4 (1024-token window, logged under subset_ppl/)"
+    tasks: [wikitext, zip2zip_pile_sub1k, zip2zip_mc4_sub1k, zip2zip_dc4_sub1k]
+    num_fewshot: 0
+    max_length: 1024
+    eval_mode: compressed
+    batch_size: 1
+    dtype: bfloat16
+    seed: 1234
+
   default_base:
     description: "2-shot MC benchmarks for from-scratch (non-instruct) models — no chat template"
     tasks: [arc_challenge, arc_easy, hellaswag, openbookqa, piqa, winogrande, gsm8k, triviaqa]

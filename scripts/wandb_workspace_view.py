@@ -59,6 +59,15 @@ VIEW_URL = "https://wandb.ai/epfl-dlab/zip2zip-core?nw=ajtwww7qjwp"
 X_TRAIN = "Step"
 X_FINAL = "final/step"
 X_SMOKE = "smoke/step"
+X_SUBSET = "subset_ppl/step"
+
+# The quick-perplexity preset (eval_ckpt_rcp.sh PRESET=perplexity_subset):
+# full wikitext plus pinned 1000-doc subsets of the three big corpora. Kept in
+# their own section because subset numbers are not comparable with the
+# full-corpus final/ ones.
+SUBSET_PPL_TASKS = [
+    "wikitext", "zip2zip_pile_sub1k", "zip2zip_mc4_sub1k", "zip2zip_dc4_sub1k",
+]
 
 # Panels removed as exact duplicates: same value, logged twice.
 #   train.py:2247 bare `backward_loss`      = compressed_metrics["compat_backward_loss"]
@@ -91,6 +100,7 @@ TABLE_PANELS = [
         "arc_challenge", "arc_easy", "hellaswag", "openbookqa", "piqa",
         "winogrande", "gsm8k", "gsm8k_boxed", "triviaqa", "wikitext",
         "zip2zip_pile", "zip2zip_mc4", "zip2zip_dc4",
+        "zip2zip_pile_sub1k", "zip2zip_mc4_sub1k", "zip2zip_dc4_sub1k",
     )
 ]
 
@@ -142,6 +152,38 @@ def build_layout() -> list[dict]:
             X_SMOKE,
         ),
         line("eval wall seconds", ["smoke/eval/wall_seconds"], X_SMOKE),
+    ]
+
+    subset_ppl = [
+        line(
+            f"{metric} (subset)",
+            [f"subset_ppl/{task}/{metric}" for task in SUBSET_PPL_TASKS],
+            X_SUBSET,
+        )
+        for metric in ("bits_per_byte", "byte_perplexity", "word_perplexity")
+    ] + [
+        line(
+            "multi_view bits_per_byte (subset)",
+            [
+                f"subset_ppl/{task}/multi_view_bits_per_byte"
+                for task in SUBSET_PPL_TASKS
+            ],
+            X_SUBSET,
+        ),
+        line(
+            "segmentation gap bits_per_byte (subset)",
+            [
+                f"subset_ppl/{task}/segmentation_gap_bits_per_byte"
+                for task in SUBSET_PPL_TASKS
+            ],
+            X_SUBSET,
+        ),
+        line(
+            "compression ratio (subset)",
+            ["subset_ppl/eval/input_compression_ratio"],
+            X_SUBSET,
+        ),
+        line("eval wall seconds (subset)", ["subset_ppl/eval/wall_seconds"], X_SUBSET),
     ]
 
     # Legacy vs corrected stay in different sections on purpose: the two use
@@ -332,6 +374,7 @@ def build_layout() -> list[dict]:
     return [
         {"name": "1 Verdetto finale", "open": True, "panels": verdict},
         {"name": "2 Curve smoke", "open": True, "panels": smoke},
+        {"name": "2b Perplexity subset (subset_ppl/, campioni fissi)", "open": False, "panels": subset_ppl},
         {"name": "3 Train - loss/ppl legacy (comparabili v0.6.x)", "open": True, "panels": loss_legacy},
         {"name": "4 Train - loss/ppl corrette (compressed/)", "open": True, "panels": loss_corrected},
         {"name": "5 Train - accuracy legacy", "open": False, "panels": acc_legacy},

@@ -88,6 +88,7 @@ Who writes what, and why the sections are split that way:
 | `objective/backward_loss` | `train.py:2256` | section 3 — the loss actually optimised |
 | `base_view/*`, `rope_gate*` | `train.py:2336`, `:2369` | section 11-12, only with replay / gated RoPE |
 | `smoke/*`, `final/*` | `log_results_to_wandb.py --prefix` | sections 1-2, on their own `*/step` x-axis |
+| `subset_ppl/*` | `log_results_to_wandb.py --prefix` (from `eval_ckpt_rcp.sh PRESET=perplexity_subset`) | section 2b, own `subset_ppl/step` x-axis — pinned 1k-doc subsets, never comparable with `final/*` |
 | `<task>/<metric>`, `evaluation/*`, tables | lm-eval's `WandbLogger`, `eval_harness.py:305` | section 15 |
 | `eval/*_compression_ratio` | `eval_harness.py:311` | section 10 |
 

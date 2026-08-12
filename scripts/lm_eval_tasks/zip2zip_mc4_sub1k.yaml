@@ -1,0 +1,26 @@
+# Pinned 1000-document subset of zip2zip_mc4 (same pinned validation shard),
+# for a quick comparable perplexity. See zip2zip_pile_sub1k.yaml for how the
+# subset is fixed and why it must only ever be logged under subset_ppl/.
+task: zip2zip_mc4_sub1k
+dataset_path: allenai/c4
+test_split: validation
+# Same pinned shard as the parent task — the pinned indices in utils.py are
+# only meaningful against this exact file.
+dataset_kwargs:
+  data_files:
+    validation: en/c4-validation.00000-of-00008.json.gz
+process_docs: !function utils.subset_mc4_sub1k
+output_type: loglikelihood_rolling
+doc_to_text: ""
+doc_to_target: !function utils.doc_to_target
+should_decontaminate: false
+metric_list:
+  - metric: word_perplexity
+  - metric: byte_perplexity
+  - metric: bits_per_byte
+metadata:
+  version: 1.0
+  parent_task: zip2zip_mc4
+  subset_size: 1000
+  subset_seed: 1234
+  pinned_corpus_docs: 45576

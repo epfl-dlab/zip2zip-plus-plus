@@ -40,8 +40,14 @@
 #   CKPT_DIR=...    Local step_N checkpoint dir (mutually exclusive w/ HF_REPO)
 #   TOKENIZER=...   Must match the tokenizer the checkpoint was trained with
 #                   (default: meta-llama/Meta-Llama-3-8B — the Llaza default)
-#   PRESET=...      Eval preset (default: default_base)
-#   LIMIT=20        Per-task sample limit for smoke tests
+#   PRESET=...      Eval preset (default: default_base). PRESET=perplexity_subset
+#                   is the quick perplexity: full wikitext + pinned 1000-doc
+#                   subsets of Pile/mC4/dC4, logged under subset_ppl/ (see
+#                   WANDB_PREFIX below).
+#   LIMIT=20        Per-task sample limit for smoke tests. Refused together with
+#                   PRESET=perplexity_subset + RESUME_WANDB_ID under the default
+#                   prefix: a partial subset score must not enter the
+#                   comparable subset_ppl/ series.
 #   TASKS=gsm8k     Comma-separated task override (default: preset's tasks)
 #   LEGACY_UNTRIMMED_STOPS=1  Do not cut generated text at stop strings, as all
 #                   evals before 2026-08 did. Only for bit-exact reproduction of
@@ -63,7 +69,10 @@
 #                   and (perplexity preset) replaces the notes' [pending]
 #                   command block. Forces --no_wandb on the harness; requires
 #                   WANDB_API_KEY.
-#   WANDB_PREFIX=final  With RESUME_WANDB_ID: metrics namespaced <prefix>/<task>/<metric>
+#   WANDB_PREFIX=final  With RESUME_WANDB_ID: metrics namespaced <prefix>/<task>/<metric>.
+#                   Default: final — except PRESET=perplexity_subset, which
+#                   defaults to subset_ppl and refuses final (quick pinned-subset
+#                   numbers must never share the full-run section).
 #   WANDB_STEP=...  With RESUME_WANDB_ID: checkpoint step, logged on the
 #                   '<prefix>/step' x-axis so it lines up with the pipeline's
 #                   final evals (e.g. final/wikitext/*)
@@ -124,7 +133,34 @@ WANDB_NAME=${WANDB_NAME:-}
 export WANDB_PROJECT=${WANDB_PROJECT:-llaza}
 export WANDB_ENTITY=${WANDB_ENTITY:-epfl-dlab}
 RESUME_WANDB_ID=${RESUME_WANDB_ID:-}
-WANDB_PREFIX=${WANDB_PREFIX:-final}
+# Subset-perplexity runs default to their own W&B section: quick pinned-subset
+# numbers must never sit in the same panels as full-corpus numbers under
+# final/. (The task names differ too — zip2zip_pile_sub1k vs zip2zip_pile —
+# so even a forced shared prefix cannot merge panels, but final/ is refused
+# outright to keep that section full-run-only.)
+if [ "$PRESET" = "perplexity_subset" ]; then
+    WANDB_PREFIX=${WANDB_PREFIX:-subset_ppl}
+    if [ "$WANDB_PREFIX" = "final" ]; then
+        echo "PRESET=perplexity_subset with WANDB_PREFIX=final: refusing —" \
+             "subset numbers must not land in the full-run final/ section." >&2
+        exit 1
+    fi
+    # LIMIT truncates the pinned subset to its first N docs (lm-eval applies
+    # --limit after process_docs), so a LIMIT smoke run logged into the
+    # subset_ppl/ series would silently poison the very comparability the
+    # pinned subset exists for. Smoke-test under a different prefix, or
+    # without RESUME_WANDB_ID.
+    if [ -n "$LIMIT" ] && [ -n "$RESUME_WANDB_ID" ] \
+        && [ "$WANDB_PREFIX" = "subset_ppl" ]; then
+        echo "PRESET=perplexity_subset with LIMIT=$LIMIT and RESUME_WANDB_ID:" \
+             "refusing — a partial subset score under subset_ppl/ is not" \
+             "comparable with the pinned-subset series. Drop LIMIT, or set" \
+             "WANDB_PREFIX to a scratch prefix." >&2
+        exit 1
+    fi
+else
+    WANDB_PREFIX=${WANDB_PREFIX:-final}
+fi
 WANDB_STEP=${WANDB_STEP:-}
 
 if { [ -n "$RESUME_WANDB_ID" ] || [ "$WANDB" != "0" ]; } \
@@ -310,6 +346,8 @@ if [ -n "$RESUME_WANDB_ID" ]; then
     echo "=== logging results into existing W&B run $RESUME_WANDB_ID under $WANDB_PREFIX/ ==="
     # A perplexity run completes the pipeline's follow-up: drop the [pending]
     # command block from the run notes (no-op if the notes don't have one).
+    # perplexity_subset deliberately does NOT match: a quick subset score
+    # leaves the full 4-corpora run pending.
     RESOLVE_PENDING=""
     if [ "$PRESET" = "perplexity" ]; then
         RESOLVE_PENDING="--resolve_pending"

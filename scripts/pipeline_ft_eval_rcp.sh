@@ -661,6 +661,11 @@ runai submit --name $PPL_JOB_NAME \\
   --environment WANDB_PROJECT=$WANDB_PROJECT \\
   --environment WANDB_API_KEY=\$WANDB_API_KEY \\
   -- bash $PROJECT_DIR/scripts/eval_ckpt_rcp.sh
+
+For a quick comparable score first (pinned 1000-doc subsets, well under an
+hour), submit the same job with PRESET=perplexity_subset, drop the TASKS
+line, and use a different --name: it lands under subset_ppl/ in this run and
+leaves this block pending.
 [/pending]"
 python scripts/log_results_to_wandb.py \
     --resume_id "$WANDB_ID" --entity "$WANDB_ENTITY" \
