@@ -423,3 +423,64 @@ The post-pooling check is important: `sqrt(3072) ~= 55` is the rough
 per-position LayerNorm scale, not necessarily the final pooled norm. Keep beta
 at zero because nonzero beta directly inserts a shared vector and may create a
 ruler by construction.
+
+Result (`vx0.6.4.7`): the launched recipe uses a single
+`encoder_output_init_scale = 0.05` (beta = 0) on **both** encoders
+(`gamma_in = gamma_out = 0.05`). Seed 42, against the `v0.6.4` anchor with the
+`gamma = 1` no-residual baseline `vx0.6.4.2` included to isolate the init effect:
+
+| seed 42 | ARC-c | ARC-e | HellaSwag | OBQA | PIQA | WinoGrande | GSM8K strict \| flexible | Wiki byte_ppl↓ | gen_compression_ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `v0.6.4` (residual, γ=0) | **0.5700** | **0.8304** | 0.7233 | 0.4660 | **0.8003** | **0.7443** | 0.215 \| **0.6770** | **1.6574** | **1.2593** |
+| `vx0.6.4.2` (none, γ=1) | 0.5367 | 0.8089 | 0.7104 | 0.4620 | 0.7976 | 0.7427 | 0.152 \| 0.6384 | 1.7052 | 1.2537 |
+| `vx0.6.4.7` (none, γ=0.05) | 0.5546 | 0.8224 | **0.7256** | **0.4760** | 0.7971 | 0.7372 | **0.259** \| 0.6315 | 1.6601 | 1.1922 |
+
+Reading `vx0.6.4.7` against `vx0.6.4.2` (same no-residual, init only): the small
+init recovers most of what the `gamma = 1` start lost — Wiki byte-ppl
+`1.7052 -> 1.6601` (back to `v0.6.4`), and MC rises broadly. So the large-norm
+`gamma = 1` init, not removing the residual, drove `vx0.6.4.2`'s degradation.
+
+Seed replication (seed 43): the seed-42 GSM8K gap does **not** hold up. Same-seed
+against `v0.6.4-seed43`:
+
+| seed 43 | ARC-c | ARC-e | HellaSwag | OBQA | PIQA | WinoGrande | GSM8K strict \| flexible | Wiki byte_ppl↓ | gen_compression_ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `v0.6.4` | 0.5597 | 0.8274 | 0.7250 | 0.4740 | 0.8069 | 0.7482 | 0.256 \| 0.6603 | 1.6578 | 1.2496 |
+| `vx0.6.4.7` | 0.5708 | 0.8274 | 0.7238 | 0.4740 | 0.8009 | 0.7601 | 0.193 \| 0.6664 | 1.6602 | 1.1973 |
+
+Revised takeaway: across the two seeds, `vx0.6.4.7` matches `v0.6.4` on MC, Wiki
+byte-ppl, **and GSM8K** — GSM8K flexible is `0.6315/0.6664` (seed 42/43) vs
+`v0.6.4`'s `0.6770/0.6603`, i.e. within seed noise, so the seed-42 -4.6pt drop
+was mostly a seed artifact, not a robust residual effect. The one difference that
+**does** replicate is `gen_compression_ratio`: `vx0.6.4.7` is consistently lower
+(`1.19/1.20` vs `v0.6.4`'s `1.26/1.25`). So a small no-residual init matches the
+standard recipe on quality; its only robust cost is a bit less generation-time
+compression.
+
+Why compression is lower (mechanism): generation is a per-step argmax between
+each hyper-token and the base vocabulary, and `logit = hidden . E_out`, so a
+hyper-token competes well only if `||E_out||` is on the base-token scale
+(`||W_out|| ~ 2.63`). With the residual, `E_out(H) = W_out[t1] + correction`
+structurally pins the norm at base scale (`v0.6.4`: `||E_out|| ~ 2.95`) and ties
+the hyper-token's logit to its first base token, so it stays a fair competitor.
+The no-residual model has no such anchor: it **starts** at base scale
+(`||E_out|| ~ 2.65` at `gamma = 0.05`) but training drifts the norm **down** to
+`~2.01` (below base) — teacher-forced CE rewards only relative ranking, not norm,
+so nothing holds it up. Under greedy argmax a ~24%-shorter output vector loses
+the hyper-vs-base competition more often, so fewer hyper-tokens are emitted. This
+is invisible to teacher-forced metrics (loss, `hyper_token_acc`, MC, ppl — all
+matched, since those never need to win the argmax) and is why the effect is
+robust across seeds while GSM8K accuracy is not.
+
+Ruler probe (from the trained checkpoints, method as in the embedding report):
+the shared ruler is **gone**. Output-encoder cos-with-mean drops from
+`vx0.6.4.2`'s `0.9984` (γ=1) to `0.59`, at/below the no-residual matched-init
+baseline (~0.64), i.e. not training-induced; input is `0.54`. Hyper-token norm
+returns to ordinary-token scale (`||E_out|| ~ 2.0`, `||E_in|| ~ 3.5`, vs
+`vx0.6.4.2`'s `48.5`). This confirms the shared ruler was driven by the `gamma = 1`
+large-norm init, not by removing the residual.
+
+Follow-up lever: since the trained norm drifts below base (`2.65 -> 2.01`), a
+larger output init (or a light output-norm regularizer) that lands trained
+`||E_out||` back at `~2.63` should recover `gen_compression_ratio` toward
+`v0.6.4`'s level — directly testable with `encoder_output_init_scale`.
