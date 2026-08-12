@@ -678,7 +678,7 @@ def validate_resume_args(resume_dir, args):
             "base_token_positions", "two_axis_rope",
             "gated_compressed_rope", "gated_rope_start_layer",
             "gated_rope_start_pair",
-            "base_view_replay_prob",
+            "base_view_replay_prob", "lossless_windows",
             "zero_init_encoder_output", "no_encoder_residual",
             "token_type_loss_weight", "online_codebook_mask",
             # lora_alpha sets scaling = alpha/rank as a RUNTIME attribute
@@ -713,6 +713,7 @@ def validate_resume_args(resume_dir, args):
         # predates this metadata field. Absence therefore means pair 0.
         "gated_rope_start_pair": 0,
         "base_view_replay_prob": 0.0,
+        "lossless_windows": False,
         "zero_init_encoder_output": False,
         "no_encoder_residual": False,
         "token_type_loss_weight": 0.0,
@@ -999,6 +1000,17 @@ def main():
              "profile sets 32 for Phi-3.5's lowest-frequency third.",
     )
     parser.add_argument(
+        "--lossless_windows",
+        action="store_true",
+        help="lm-mode data windows tile the stream exactly: the offset "
+             "advances by the base-token span of each emitted window instead "
+             "of a fixed 2*seq_len, and windows that compress below seq_len+1 "
+             "tokens extend their raw input instead of being dropped. Default "
+             "off = historical stream, bit-identical. Changes the data stream: "
+             "runs with different settings of this flag are not "
+             "step-comparable.",
+    )
+    parser.add_argument(
         "--base_view_replay_prob",
         type=float,
         default=0.0,
@@ -1145,6 +1157,14 @@ def main():
         parser.error("--base_view_replay_prob must be in [0, 1)")
     if args.base_view_replay_prob and args.mode != "lm":
         parser.error("--base_view_replay_prob requires --mode lm")
+    if args.lossless_windows and args.mode != "lm":
+        parser.error("--lossless_windows requires --mode lm")
+    if args.lossless_windows and args.base_view_replay_prob > 0.0:
+        # The base view is drawn from the full raw chunk, but the lossless
+        # advance is only the emitted window's span, so replayed text would
+        # overlap the next compressed window (double exposure). Untested
+        # combination: forbid it instead of silently changing semantics.
+        parser.error("--lossless_windows is incompatible with --base_view_replay_prob")
     try:
         base_view_replay_microsteps(
             1,
@@ -1485,6 +1505,7 @@ def main():
             args.base_view_replay_prob > 0.0 and not args.eval
         ),
         debug_samples=max(0, args.debug_first_steps * max(1, args.gradient_accumulation_steps)),
+        lossless_windows=args.lossless_windows,
     )
 
     # Reposition the data stream to match the checkpoint. Must happen here: the

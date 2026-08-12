@@ -73,6 +73,7 @@ ENV_KEYS = {
     "ZERO_INIT_ENCODER_OUTPUT": ("zero_init_encoder_output", "flag",  False),
     "NO_ENCODER_RESIDUAL":      ("no_encoder_residual",      "flag",  False),
     "ONLINE_CODEBOOK_MASK":     ("online_codebook_mask",     "flag",  False),
+    "LOSSLESS_WINDOWS":         ("lossless_windows",         "flag",  False),
     "TOKEN_TYPE_LOSS_WEIGHT":   ("token_type_loss_weight",   "float", 0.0),
     "WARMSTART_STEPS":          ("warmstart_steps",          "int",   0),
     # off = the Phi3.5-mini config default, the only model config this line uses
@@ -98,6 +99,7 @@ ENV_AXES = {
     "ZERO_INIT_ENCODER_OUTPUT": "initialization",
     "NO_ENCODER_RESIDUAL": "architecture",
     "ONLINE_CODEBOOK_MASK": "objective",
+    "LOSSLESS_WINDOWS": "data",
     "TOKEN_TYPE_LOSS_WEIGHT": "objective",
     "WARMSTART_STEPS": "optimization",
     "ENCODER_N_LAYERS": "architecture",

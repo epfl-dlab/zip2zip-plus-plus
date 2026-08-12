@@ -111,6 +111,13 @@ class Zip2ZipDataset(IterableDataset, Stateful):
     entries that appear in the token sequence (variable size per sample).
     """
 
+    # lossless_windows: how many base_chunk_len chunks a single window may read
+    # while extending (see _iter_lm). 3 chunks = 3*2*seq_len raw tokens covers
+    # any compression ratio below 3*2*seq_len/(seq_len+1) ~= 6x; natural text
+    # never reaches that, and a bounded cap guarantees forward progress on
+    # pathological streams (the region is then skipped whole).
+    LOSSLESS_MAX_WINDOW_CHUNKS = 3
+
     def __init__(
         self,
         data_dir: str,
@@ -130,6 +137,7 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         max_active_codebook_size: int | None = None,
         debug_samples: int = 0,
         include_base_view: bool = False,
+        lossless_windows: bool = False,
     ):
         self.data_dir = data_dir
         self.seq_len = seq_len
@@ -141,6 +149,15 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         self.remap_codebook = remap_codebook
         self.online_codebook_mask = online_codebook_mask
         self.include_base_view = include_base_view
+        # Off (default): historical behavior, bit-identical — every window
+        # reads a fixed 2*seq_len chunk, advances by that amount, drops the
+        # compressed tail beyond seq_len+1 tokens, and skips windows that
+        # compress to fewer than seq_len+1 tokens. On: lm-mode windows tile
+        # the stream exactly — the offset advances by the base-token span of
+        # the emitted (truncated) window, and under-filled windows extend
+        # their raw input instead of being dropped. Only _iter_lm changes;
+        # "compress" mode ignores the flag.
+        self.lossless_windows = bool(lossless_windows)
         self.max_active_codebook_size = (
             max_codebook_size
             if max_active_codebook_size is None
@@ -172,6 +189,14 @@ class Zip2ZipDataset(IterableDataset, Stateful):
             raise ValueError("online_codebook_mask is supported only in mode='lm'")
         if self.include_base_view and self.mode != "lm":
             raise ValueError("include_base_view is supported only in mode='lm'")
+        if self.lossless_windows and self.mode != "lm":
+            raise ValueError("lossless_windows is supported only in mode='lm'")
+        if self.lossless_windows and self.include_base_view:
+            raise ValueError(
+                "lossless_windows is incompatible with include_base_view: the "
+                "base view is drawn from the full raw chunk, which under the "
+                "lossless advance overlaps the next compressed window"
+            )
         if self.online_codebook_mask and self.remap_codebook:
             raise ValueError(
                 "online_codebook_mask requires remap_codebook=False because "
@@ -420,14 +445,21 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                 )
 
                 while offset + self.base_chunk_len <= len(shard):
+                    # `start` is this window's fixed origin; `offset` keeps the
+                    # historical eager advance so every legacy `continue` below
+                    # behaves exactly as before. Lossless mode re-derives the
+                    # advance from the emitted window instead, always relative
+                    # to `start`.
+                    start = offset
+                    chunk_len = self.base_chunk_len
                     if self._debug_samples_emitted < self.debug_samples:
                         self._debug_log(
                             f"lm chunk shard_idx={shard_idx} offset={offset} "
-                            f"chunk_len={self.base_chunk_len} before encode"
+                            f"chunk_len={chunk_len} before encode"
                         )
-                    chunk = shard[offset : offset + self.base_chunk_len].tolist()
+                    chunk = shard[start : start + chunk_len].tolist()
                     chunk_mask = (
-                        mask_shard[offset : offset + self.base_chunk_len]
+                        mask_shard[start : start + chunk_len]
                         if mask_shard is not None
                         else None
                     )
@@ -451,7 +483,53 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                         )
 
                     if len(compressed) < self.seq_len + 1:
-                        continue
+                        if not self.lossless_windows:
+                            continue
+                        # The window under-filled: this text compresses at
+                        # >= base_chunk_len/seq_len (= 2.0x). The historical
+                        # skip silently removed exactly the most compressible
+                        # windows from training; instead, extend the raw input
+                        # and re-encode until seq_len+1 compressed tokens
+                        # exist (bounded by LOSSLESS_MAX_WINDOW_CHUNKS and the
+                        # shard end).
+                        while (
+                            len(compressed) < self.seq_len + 1
+                            and chunk_len
+                            < self.base_chunk_len * self.LOSSLESS_MAX_WINDOW_CHUNKS
+                            and start + chunk_len + self.base_chunk_len <= len(shard)
+                        ):
+                            chunk_len += self.base_chunk_len
+                            chunk = shard[start : start + chunk_len].tolist()
+                            if mask_shard is not None:
+                                chunk_mask = mask_shard[start : start + chunk_len]
+                            compressor = LZWCompressor(**self.compressor_args)
+                            try:
+                                compressed, _, codebook = compressor.encode(
+                                    chunk, padding="do_not_pad", truncation=False
+                                )
+                            except Exception:
+                                self._debug_log(
+                                    f"lm encode failed during lossless extension "
+                                    f"shard_idx={shard_idx} start={start} "
+                                    f"chunk_len={chunk_len}"
+                                )
+                                break
+                        if len(compressed) < self.seq_len + 1:
+                            # Still under-filled at the cap, the shard end, or
+                            # after a failed re-encode. An UNTRUNCATED encode
+                            # covers its entire raw input, so advancing by its
+                            # expansion skips exactly the region that cannot
+                            # fill a window — nothing before or after it.
+                            self._debug_log(
+                                f"lm skip unfillable lossless window "
+                                f"shard_idx={shard_idx} start={start} "
+                                f"chunk_len={chunk_len} "
+                                f"compressed_len={len(compressed)}"
+                            )
+                            offset = start + self._count_expanded_base_tokens(
+                                compressed, codebook
+                            )
+                            continue
 
                     compressed = compressed[: self.seq_len + 1]
 
@@ -475,6 +553,12 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                             f"lm skip zero-hypertoken window shard_idx={shard_idx} "
                             f"offset={offset - self.base_chunk_len}"
                         )
+                        if self.lossless_windows:
+                            # Skip exactly the window's base span so the text
+                            # behind the truncation point is not lost with it.
+                            offset = start + self._count_expanded_base_tokens(
+                                compressed, codebook
+                            )
                         continue
 
                     # Without remap the hyper ids index raw LZW rows and the
@@ -509,6 +593,8 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                     if chunk_mask is not None:
                         loss_mask = self._compressed_loss_mask(compressed, chunk_mask, codebook)[1:]
                         if not loss_mask.any():
+                            if self.lossless_windows:
+                                offset = start + n_base_tokens
                             continue
                         y[~loss_mask] = -100
 
@@ -537,6 +623,8 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                         online_skipped_targets = int(unavailable.sum().item())
                         y[unavailable] = -100
                         if not (y != -100).any():
+                            if self.lossless_windows:
+                                offset = start + n_base_tokens
                             continue
 
                     # Corrected reporting denominator: expand only target
@@ -575,6 +663,13 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                     if self.online_codebook_mask:
                         sample["codebook_counts"] = available_counts
                         sample["online_skipped_targets"] = online_skipped_targets
+                    if self.lossless_windows:
+                        # Advance by exactly the base span of the emitted
+                        # window (n_base_tokens expands the full truncated
+                        # T+1 window): the next window starts on the first
+                        # base token the truncation dropped, so windows tile
+                        # the stream with no gap and no overlap.
+                        offset = start + n_base_tokens
                     # Publish the resume position. A checkpoint can only be taken
                     # between yields, so syncing here is exactly sufficient: it
                     # names the first chunk this shard has NOT yet emitted.
@@ -964,6 +1059,7 @@ def build_dataloader(
     online_codebook_mask: bool = False,
     debug_samples: int = 0,
     include_base_view: bool = False,
+    lossless_windows: bool = False,
 ) -> DataLoader:
     """Build a Zip2Zip DataLoader with remapping collation."""
     dataset = Zip2ZipDataset(
@@ -982,6 +1078,7 @@ def build_dataloader(
         max_active_codebook_size=max_active_codebook_size,
         include_base_view=include_base_view,
         debug_samples=debug_samples,
+        lossless_windows=lossless_windows,
     )
 
     collate_fn = partial(

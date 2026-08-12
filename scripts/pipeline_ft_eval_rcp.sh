@@ -114,6 +114,17 @@
 #                     The checkpoint records it so compressed offline eval
 #                     automatically uses the matching mask; generation is
 #                     already incremental.
+#   LOSSLESS_WINDOWS= set 1 for lossless lm-mode data windows: the stream
+#                     advances by each emitted window's base-token span
+#                     (instead of a fixed 2*seq_len, which silently dropped
+#                     the compressed tail of every window), and windows that
+#                     compress below seq_len+1 tokens extend their raw input
+#                     instead of being dropped (the old skip removed exactly
+#                     the most compressible text from training). Training-only
+#                     data-stream change, recorded in meta.pt; resume refuses
+#                     a flag mismatch. Runs with different settings are not
+#                     step-comparable — compare on evals. Default off is
+#                     bit-identical to the historical stream.
 #   FINAL_LIMIT=      per-task sample limit for the FINAL eval (default: full).
 #                     Only for pipeline rehearsals — never for real numbers.
 #   SEED=42           training seed forwarded to train.py.
