@@ -7,9 +7,10 @@ perplexity over long texts.
 Two scoring modes:
 
 * "compressed" (default): apply LZW compression over (context + continuation),
-  run the model with the resulting codebook and `hyper_causal_mask=True`
-  (matching `scripts/eval_lm.sh`), then sum the logprobs of compressed tokens
-  whose base-position span is at or after the continuation boundary.
+  then sum the logprobs of compressed tokens whose base-position span is at or
+  after the continuation boundary. v0.1-v0.6.4 and v0.7 checkpoints use the
+  historical `k <= t` codebook mask. The branched v0.6.5 checkpoint records the
+  exact decoder-time mask in `meta.pt`, and this adapter restores it automatically.
 
 * "base": skip compression, feed raw base tokens with no codebook (vanilla LM
   path of the model), and read logprobs from the base-vocab logits. This is OOD
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import time
 from typing import List, Tuple
 
 import torch
@@ -33,7 +35,19 @@ from zip2zip_compression import (
 )
 
 from zip2zip_core.configs import zip2zip_llama_configs
-from zip2zip_core.model import Zip2ZipLlama3Model
+from zip2zip_core.checkpoint import (
+    prepare_inference_state_dict,
+    resolve_gated_rope_start_pair,
+    strip_wrapper_prefixes,
+)
+from zip2zip_core.data import online_codebook_counts, online_unavailable_targets
+from zip2zip_core.disabled_ids import base_disabled_ids, digit_ids
+from zip2zip_core.model import Zip2ZipLlama3Model, restore_encoder_residual
+from zip2zip_core.multi_view import (
+    MultiViewAccumulator,
+    build_expansion_index,
+    multi_view_candidates,
+)
 
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
@@ -54,28 +68,71 @@ _DISABLED_IDS_BY_TOKENIZER = {
 
 
 def _strip_wrapper_prefixes(state_dict: dict) -> dict:
-    out = {}
-    for k, v in state_dict.items():
-        k = k.replace("_fsdp_wrapped_module.", "").replace("_orig_mod.", "")
-        out[k] = v
+    """Backward-compatible wrapper around the shared checkpoint helper."""
+    return strip_wrapper_prefixes(state_dict)
+
+
+def _fold_lora_weights(sd: dict, train_args: dict) -> dict:
+    """Merge LoRA-format weights into plain linear weights.
+
+    Checkpoints trained with --lora_rank store each wrapped linear as
+    X.base_layer.weight + X.lora_A.weight + X.lora_B.weight. The eval model is
+    a vanilla (non-LoRA) module, so fold W' = W + (B @ A) * (alpha/rank) and
+    rename to X.weight — otherwise load_state_dict(strict=False) silently skips
+    every decoder weight and the model scores with random layers.
+    """
+    bases = [
+        k[: -len(".base_layer.weight")]
+        for k in sd
+        if k.endswith(".base_layer.weight")
+    ]
+    out = prepare_inference_state_dict(sd, train_args)
+    if bases:
+        rank = int(train_args["lora_rank"])
+        scaling = float(train_args["lora_alpha"]) / rank
+        print(
+            f"[zip2zip-lm-eval] folded LoRA into {len(bases)} linear layers "
+            f"(scaling={scaling:g})"
+        )
     return out
 
 
-def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.dtype):
+def _load_zip2zip_checkpoint(
+    ckpt_dir: str,
+    device: torch.device,
+    dtype: torch.dtype,
+    eval_max_subtokens: int | None = None,
+):
     """Load a checkpoint produced by zip2zip_core.train.
 
-    Reads meta.pt (if present) to recover the training arguments and rebuilds
-    the matching model config; loads model.pt non-strictly so older B/C/recon
-    experiment checkpoints still load.
+    Requires meta.pt to recover the training arguments and rebuilds
+    the matching model config; strictly loads normalized model weights so an
+    incomplete or structurally mismatched checkpoint cannot score silently.
     """
     meta_path = os.path.join(ckpt_dir, "meta.pt")
-    train_args: dict = {}
-    if os.path.exists(meta_path):
-        meta = torch.load(meta_path, map_location="cpu", weights_only=False)
-        train_args = meta.get("args", {}) or {}
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(
+            f"required checkpoint metadata is missing: {meta_path}; evaluation "
+            "cannot safely restore behavior-only model settings"
+        )
+    meta = torch.load(meta_path, map_location="cpu", weights_only=False)
+    if not isinstance(meta, dict):
+        raise ValueError(f"checkpoint metadata {meta_path} must be a dictionary")
+    train_args = meta.get("args")
+    if not isinstance(train_args, dict) or not train_args:
+        raise ValueError(
+            f"checkpoint args in {meta_path} must be a non-empty dictionary"
+        )
 
     cfg_key = train_args.get("model_config", "1B")
     cfg = zip2zip_llama_configs[cfg_key]
+    sd = torch.load(
+        os.path.join(ckpt_dir, "model.pt"),
+        map_location=str(device),
+        weights_only=True,
+    )
+    sd = _strip_wrapper_prefixes(sd)
+    sd = _fold_lora_weights(sd, train_args)
 
     overrides: dict = {}
     for key in (
@@ -91,22 +148,89 @@ def _load_zip2zip_checkpoint(ckpt_dir: str, device: torch.device, dtype: torch.d
         v = train_args.get(key)
         if v is not None:
             overrides[key] = v
+    # Architecture flag with inverted polarity: the checkpoint records the arg
+    # --untied_hyper_encoder; the config field is tie_hyper_encoder. Rebuild the
+    # untied model structurally so the second encoder's weights have a home
+    # (miss this and the model is tied while the checkpoint is untied).
+    if train_args.get("untied_hyper_encoder"):
+        overrides["tie_hyper_encoder"] = False
+        print("[zip2zip-lm-eval] untied hyper-encoder: building separate output encoder")
+    if train_args.get("share_hyper_encoder_weights"):
+        overrides["share_hyper_encoder_weights"] = True
+        print("[zip2zip-lm-eval] shared hyper-encoder weights: no hyper_output module")
+    if train_args.get("base_token_positions"):
+        # Behavior flag, no weights: compressed-mode evals must position tokens
+        # in base space exactly as trained; base-mode evals are unaffected
+        # (uncompressed stream, positions == arange either way).
+        overrides["base_token_positions"] = True
+        print("[zip2zip-lm-eval] base-token RoPE positions: enabled from meta.pt")
+    if train_args.get("two_axis_rope"):
+        overrides["two_axis_rope"] = True
+        print("[zip2zip-lm-eval] two-axis RoPE: enabled from meta.pt")
+    if train_args.get("gated_compressed_rope"):
+        overrides["gated_compressed_rope"] = True
+        if train_args.get("gated_rope_start_layer") is not None:
+            overrides["gated_rope_start_layer"] = int(
+                train_args["gated_rope_start_layer"]
+            )
+        head_dim = (
+            getattr(cfg.layer.attention, "head_dim", None)
+            or cfg.dim // cfg.layer.attention.n_heads
+        )
+        overrides["gated_rope_start_pair"] = resolve_gated_rope_start_pair(
+            train_args,
+            sd,
+            n_complex_pairs=head_dim // 2,
+            default=cfg.gated_rope_start_pair,
+        )
+        print(
+            "[zip2zip-lm-eval] gated compressed-coordinate RoPE: enabled "
+            f"from layer {overrides.get('gated_rope_start_layer', cfg.gated_rope_start_layer)}, "
+            f"pair {overrides.get('gated_rope_start_pair', cfg.gated_rope_start_pair)} "
+            "from meta.pt"
+        )
     if overrides:
         cfg = dataclasses.replace(cfg, **overrides)
+    checkpoint_max_subtokens = cfg.max_subtokens
+    if eval_max_subtokens is not None:
+        if eval_max_subtokens <= 0:
+            raise ValueError(
+                f"eval_max_subtokens must be positive, got {eval_max_subtokens}"
+            )
+        if eval_max_subtokens != checkpoint_max_subtokens:
+            if cfg.hyper_encoder_type not in ("hierarchical", "fast_hierarchical"):
+                raise ValueError(
+                    "eval_max_subtokens can only change checkpoint max_subtokens "
+                    "for hierarchical encoders. Flat hyper-encoders have "
+                    "length-shaped positional embeddings, so this override would "
+                    "not load the checkpoint safely."
+                )
+            cfg = dataclasses.replace(cfg, max_subtokens=eval_max_subtokens)
+            print(
+                "[zip2zip-lm-eval] eval max_subtokens override: "
+                f"checkpoint={checkpoint_max_subtokens} eval={eval_max_subtokens}"
+            )
 
-    model = Zip2ZipLlama3Model(cfg).to(device=device, dtype=dtype)
+    model = Zip2ZipLlama3Model(cfg)
+    if not restore_encoder_residual(model, train_args):
+        # Behavior-only flag: there is no state-dict key that can restore it.
+        # Missing this silently evaluates a no-residual checkpoint with the
+        # residual enabled.
+        print("[zip2zip-lm-eval] hyper-encoder residual: disabled from meta.pt")
+    model = model.to(device=device)
+    if dtype is not None and dtype != torch.float32:
+        # Cast parameters and real-valued buffers ONLY. A blanket .to(dtype)
+        # also converts the complex64 RoPE cache (freqs_cis and rope.cache) to
+        # a real dtype, silently discarding the imaginary part — which destroys
+        # position encoding and caps any checkpoint at ~5 nats/token no matter
+        # how good its weights are (the "Casting complex values to real
+        # discards the imaginary part" UserWarning in earlier eval logs).
+        model._apply(lambda t: t.to(dtype) if t.is_floating_point() else t)
 
-    sd = torch.load(
-        os.path.join(ckpt_dir, "model.pt"),
-        map_location=str(device),
-        weights_only=True,
-    )
-    sd = _strip_wrapper_prefixes(sd)
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    if missing:
-        print(f"[zip2zip-lm-eval] missing keys ({len(missing)}): {missing[:5]}")
-    if unexpected:
-        print(f"[zip2zip-lm-eval] unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+    # Canonical training checkpoints are complete after wrapper normalization and
+    # LoRA folding.  A permissive load can otherwise evaluate random decoder or
+    # hyper-encoder weights while merely printing a warning.
+    model.load_state_dict(sd, strict=True)
 
     model.eval()
     return model, cfg, train_args
@@ -126,6 +250,12 @@ class Zip2ZipLM(LM):
         eval_mode: str = "compressed",
         batch_size: int | str = 1,
         hyper_causal_mask: bool = True,
+        online_codebook_mask: bool | None = None,
+        disable_digit_ids: bool = False,
+        disable_mathsym_ids: bool = False,
+        eval_max_subtokens: int | None = None,
+        trim_stop_strings: bool = True,
+        multi_view: bool = True,
     ):
         super().__init__()
         if not torch.cuda.is_available() and device.startswith("cuda"):
@@ -144,25 +274,167 @@ class Zip2ZipLM(LM):
             raise ValueError(f"eval_mode must be 'compressed' or 'base', got {eval_mode!r}")
 
         self.model, self.cfg, self.train_args = _load_zip2zip_checkpoint(
-            pretrained, self._device, self._dtype
+            pretrained, self._device, self._dtype, eval_max_subtokens=eval_max_subtokens
         )
+        self.checkpoint_max_subtokens = int(
+            (self.train_args or {}).get("max_subtokens", self.cfg.max_subtokens)
+        )
+        self.eval_max_subtokens = int(self.cfg.max_subtokens)
+        if self.cfg.max_codebook_size == 0 and eval_mode == "compressed":
+            # With max_codebook_size=0 the compressor is an exact identity, so
+            # compressed scoring equals base scoring numerically — but slower
+            # and mislabeled in the results JSON. Control checkpoints are
+            # base-mode-only: switch automatically.
+            print("[zip2zip-lm-eval] checkpoint was trained with "
+                  "max_codebook_size=0 (uncompressed control) — auto-switching "
+                  "eval_mode to 'base'.")
+            eval_mode = "base"
+        # The harness/launchers default the tokenizer to Llama-3. If the
+        # checkpoint's meta.pt recorded the training tokenizer, prefer it over
+        # that default so a forgotten TOKENIZER env var cannot silently
+        # evaluate e.g. a Phi checkpoint with Llama special-token rules.
+        meta_tok = (self.train_args or {}).get("tokenizer")
+        if meta_tok and tokenizer == _DEFAULT_TOKENIZER and meta_tok != tokenizer:
+            print(f"[zip2zip-lm-eval] tokenizer left at the Llama default but "
+                  f"meta.pt records {meta_tok!r} — using the checkpoint's tokenizer")
+            tokenizer = meta_tok
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+        if len(self.tokenizer) > self.cfg.vocab_size:
+            raise ValueError(
+                f"tokenizer {tokenizer!r} has {len(self.tokenizer)} tokens but the "
+                f"model vocab is {self.cfg.vocab_size}: wrong tokenizer for this "
+                f"checkpoint. Pass the training tokenizer"
+                + (f" ({meta_tok!r} per meta.pt)." if meta_tok else ".")
+            )
+        if meta_tok and meta_tok != tokenizer:
+            print(f"[zip2zip-lm-eval] WARNING: eval tokenizer {tokenizer!r} != "
+                  f"training tokenizer {meta_tok!r} (meta.pt)")
         disabled_ids = _DISABLED_IDS_BY_TOKENIZER.get(tokenizer)
         if disabled_ids is None:
-            disabled_ids = [
-                i for i in (self.tokenizer.all_special_ids or []) if i < self.cfg.vocab_size
-            ]
+            # Must mirror train.py's derivation (all_special_ids | added vocab):
+            # for Phi-3.5, all_special_ids alone is {unk,bos,eos} and misses the
+            # chat tokens <|user|>/<|assistant|>/<|end|> (32001-32010), which the
+            # compressor would then merge into hyper-tokens the model never saw
+            # in training — collapsing every chat-templated eval. Sourced from
+            # zip2zip_core.disabled_ids so train/eval/export can't drift apart.
+            disabled_ids = sorted(base_disabled_ids(self.tokenizer, self.cfg.vocab_size))
+        if (
+            eval_mode == "compressed"
+            and (self.train_args or {}).get("disable_digit_ids")
+            and not disable_digit_ids
+        ):
+            # Canonical since the digitsafe run validated: eval follows the
+            # checkpoint's training distribution automatically. Irrelevant in
+            # base mode, where the compressor is never invoked.
+            print("[zip2zip-lm-eval] checkpoint was trained with digit-protected "
+                  "LZW (meta.pt) — auto-enabling digit protection for this eval.")
+            disable_digit_ids = True
+        if disable_digit_ids and not (self.train_args or {}).get("disable_digit_ids"):
+            print("[zip2zip-lm-eval] note: digit-protected eval of a checkpoint "
+                  "trained WITHOUT digit protection — fine as a diagnostic, but the "
+                  "numbers are not comparable to this checkpoint's as-trained evals.")
+        if disable_digit_ids:
+            # Diagnostic: keep digits out of LZW merges so multi-digit numbers
+            # stay digit-by-digit base tokens instead of composite hypertokens.
+            digit_id_set = digit_ids(self.tokenizer, self.cfg.vocab_size)
+            print(f"[zip2zip-lm-eval] digit ids disabled for LZW "
+                  f"({len(digit_id_set)}): {sorted(digit_id_set)}")
+            disabled_ids = sorted(set(disabled_ids) | digit_id_set)
+        self.disable_digit_ids = bool(disable_digit_ids)
+        if disable_mathsym_ids:
+            # Diagnostic (triage for extending the protected set beyond digits):
+            # keep math operators/symbols out of LZW merges. "." is deliberately
+            # absent — decimals are already protected transitively when digits
+            # are disabled (a merge needs an adjacent pair).
+            sym_pieces = set("=+-*/%$^<>") | {f"▁{c}" for c in "=+-*/%$^<>"}
+            sym_ids = sorted(
+                i for piece, i in self.tokenizer.get_vocab().items()
+                if piece in sym_pieces and 0 <= i < self.cfg.vocab_size
+            )
+            print(f"[zip2zip-lm-eval] math-symbol ids disabled for LZW "
+                  f"({len(sym_ids)}): {sym_ids}")
+            disabled_ids = sorted(set(disabled_ids) | set(sym_ids))
+        self.disable_mathsym_ids = bool(disable_mathsym_ids)
         self._disabled_ids = disabled_ids
+        print(f"[zip2zip-lm-eval] disabled_ids ({len(disabled_ids)}): {disabled_ids[:16]}"
+              f"{'...' if len(disabled_ids) > 16 else ''}")
         self._max_length = int(max_length)
         self.eval_mode = eval_mode
         self._batch_size = int(batch_size)
         self.hyper_causal_mask = bool(hyper_causal_mask)
+        self.trim_stop_strings = bool(trim_stop_strings)
+        # What the CHECKPOINT was trained with (provenance, never overridden).
+        self.online_codebook_mask = bool(
+            (self.train_args or {}).get("online_codebook_mask")
+        )
+        # What THIS eval scores with. None = follow the checkpoint (the default,
+        # so a v0.6.5 model is scored in its own regime). Setting it explicitly
+        # is for cross-version comparison: v0.1-v0.6.4 were all scored with the
+        # legacy k<=t mask, so reading a v0.6.5 number against that table needs
+        # online_codebook_mask=False. The two flags stay separate on purpose —
+        # the results JSON reports both, so a comparison can never silently mix
+        # regimes.
+        self.online_codebook_mask_requested = (
+            self.online_codebook_mask
+            if online_codebook_mask is None
+            else bool(online_codebook_mask)
+        )
+        if self.online_codebook_mask_requested and not self.online_codebook_mask:
+            raise ValueError(
+                "online_codebook_mask=True was requested but this checkpoint was "
+                "not trained with it (meta.pt says online_codebook_mask=False); "
+                "scoring it with the exact mask would not match any training "
+                "regime. Drop the override."
+            )
+        self.online_codebook_mask_active = bool(
+            self.online_codebook_mask_requested
+            and self.eval_mode == "compressed"
+            and self.hyper_causal_mask
+        )
+        if self.online_codebook_mask:
+            if self.online_codebook_mask_active:
+                state = "active"
+            elif not self.online_codebook_mask_requested:
+                state = "OVERRIDDEN OFF — scoring with the legacy k<=t mask"
+            else:
+                state = "inactive"
+            print(
+                "[zip2zip-lm-eval] decoder-time online codebook mask: "
+                f"enabled from meta.pt ({state} in this eval)"
+            )
+
+        # Generation must stop on every eos the base model declares, not just
+        # tokenizer.eos_token_id: Phi-3.5's generation_config lists
+        # [<|end|>, <|assistant|>, <|endoftext|>] and chat turns end with <|end|>.
+        stop_ids = {self.eot_token_id}
+        try:
+            from transformers import GenerationConfig
+            gen_cfg = GenerationConfig.from_pretrained(tokenizer)
+            eos = gen_cfg.eos_token_id
+            if eos is not None:
+                stop_ids.update(eos if isinstance(eos, (list, tuple)) else [eos])
+        except Exception:
+            pass
+        self._stop_token_ids = {i for i in stop_ids if i is not None}
+        print(f"[zip2zip-lm-eval] generation stop token ids: {sorted(self._stop_token_ids)}")
 
         # Aggregate compression counters over the whole run, read by callers
         # (e.g. scripts/eval_harness.py) after simple_evaluate returns.
         # in_*: full (context + continuation) sequences fed for scoring.
         # gen_*: tokens emitted by generate_until.
         self.compression_stats = {"in_comp": 0, "in_base": 0, "gen_comp": 0, "gen_base": 0}
+        # Multi-view (segmentation-marginalized) perplexity, accumulated per
+        # rolling-perplexity task and read back via multi_view_summary().
+        # On by default; strict scores returned to lm-eval are unaffected.
+        self.multi_view = bool(multi_view)
+        self._multi_view_accum = MultiViewAccumulator()
+        if self.online_codebook_mask_active:
+            self.compression_stats.update(
+                online_skipped_targets=0,
+                online_replay_requests=0,
+                online_replay_tokens=0,
+                online_replay_seconds=0.0,
+            )
 
         self._compressor_kwargs = dict(
             initial_vocab_size=self.cfg.vocab_size,
@@ -192,6 +464,12 @@ class Zip2ZipLM(LM):
                 kwargs[int_key] = int(kwargs[int_key])
         if "hyper_causal_mask" in kwargs:
             kwargs["hyper_causal_mask"] = kwargs["hyper_causal_mask"].lower() in ("1", "true", "yes")
+        if "online_codebook_mask" in kwargs:
+            kwargs["online_codebook_mask"] = kwargs["online_codebook_mask"].lower() in ("1", "true", "yes")
+        if "trim_stop_strings" in kwargs:
+            kwargs["trim_stop_strings"] = kwargs["trim_stop_strings"].lower() in ("1", "true", "yes")
+        if "multi_view" in kwargs:
+            kwargs["multi_view"] = kwargs["multi_view"].lower() in ("1", "true", "yes")
         if additional_config:
             for k in ("batch_size", "device"):
                 if k not in kwargs and additional_config.get(k) is not None:
@@ -234,6 +512,10 @@ class Zip2ZipLM(LM):
             continue_final_message=not add_generation_prompt,
         )
 
+    @property
+    def tokenizer_name(self) -> str:
+        return self.tokenizer.name_or_path.replace("/", "__")
+
     # ───────────────────────── codebook helpers ───────────────────────────
 
     def _codebook_to_tensor(self, codebook) -> torch.LongTensor:
@@ -263,22 +545,35 @@ class Zip2ZipLM(LM):
 
     @torch.no_grad()
     def _score_compressed(
-        self, full_ids: List[int], cont_start_base: int
-    ) -> Tuple[float, bool, int, int]:
+        self,
+        full_ids: List[int],
+        cont_start_base: int,
+        *,
+        reject_unavailable_targets: bool = False,
+        compute_multi_view: bool = False,
+    ) -> Tuple[float, bool, int, int, float, int]:
         """Compress full_ids, run the model, sum logprobs of compressed tokens
         whose base span starts at or after `cont_start_base`.
 
-        Returns (logprob_sum, is_greedy, n_compressed_scored, n_base_scored).
+        Returns (logprob_sum, is_greedy, n_compressed_scored, n_base_scored,
+        multi_view_logprob_sum, n_hyper_scored). With compute_multi_view (only
+        the rolling-perplexity path asks for it, and only when self.multi_view
+        is on), the multi-view sum scores the same positions but, at
+        hypertoken targets, marginalizes over every token whose expansion is
+        a prefix of the target's (the first-token bound; see
+        zip2zip_core.multi_view). It never affects the strict sum or
+        is_greedy, and degenerates to the strict sum when not computed or
+        when no hypertoken was scored.
         """
         if len(full_ids) < 2:
-            return 0.0, True, 0, 0
+            return 0.0, True, 0, 0, 0.0, 0
 
         compressor = LZWCompressor(**self._compressor_kwargs)
         compressed, _, codebook = compressor.encode(
             full_ids, padding="do_not_pad", truncation=False
         )
         if len(compressed) < 2:
-            return 0.0, True, 0, 0
+            return 0.0, True, 0, 0, 0.0, 0
 
         self.compression_stats["in_base"] += len(full_ids)
         self.compression_stats["in_comp"] += len(compressed)
@@ -296,35 +591,97 @@ class Zip2ZipLM(LM):
 
         x = torch.tensor(compressed[:-1], dtype=torch.long, device=self._device).unsqueeze(0)
         cb = self._codebook_to_tensor(codebook).to(self._device).unsqueeze(0)
+        codebook_counts = None
+        unavailable = None
+        if self.online_codebook_mask_active:
+            replay_start = time.perf_counter()
+            counts_cpu = online_codebook_counts(
+                compressed[:-1], codebook, self._compressor_kwargs
+            )
+            self.compression_stats["online_replay_seconds"] += (
+                time.perf_counter() - replay_start
+            )
+            self.compression_stats["online_replay_requests"] += 1
+            self.compression_stats["online_replay_tokens"] += len(compressed) - 1
+            targets_cpu = torch.tensor(compressed[1:], dtype=torch.long)
+            unavailable = online_unavailable_targets(
+                targets_cpu, counts_cpu, V, cb.shape[1]
+            ).tolist()
+            codebook_counts = counts_cpu.to(self._device).unsqueeze(0)
 
         with torch.autocast(device_type=self._device.type, dtype=self._dtype):
-            out = self.model(x, codebook=cb, hyper_causal_mask=self.hyper_causal_mask)
+            if codebook_counts is None:
+                # Preserve the historical scorer exactly for v0.1-v0.6.4 and
+                # for explicit --no_hyper_causal_mask diagnostics.
+                out = self.model(
+                    x, codebook=cb, hyper_causal_mask=self.hyper_causal_mask
+                )
+            else:
+                out = self.model(
+                    x,
+                    codebook=cb,
+                    hyper_causal_mask=self.hyper_causal_mask,
+                    codebook_counts=codebook_counts,
+                )
         logits = out[0] if isinstance(out, tuple) else out
         log_probs = F.log_softmax(logits[0].float(), dim=-1)
 
+        # Ordered so the MC/generation paths (compute_multi_view=False) never
+        # even read self.multi_view and pay zero multi-view overhead.
+        mv_index = (
+            build_expansion_index(cb_dict)
+            if compute_multi_view and self.multi_view
+            else None
+        )
+
         total = 0.0
+        mv_total = 0.0
         is_greedy = True
         n_comp = 0
         n_base = 0
+        n_hyper = 0
         for t in range(len(compressed) - 1):
             target = compressed[t + 1]
             bstart, bend = spans[t + 1]
             if bstart < cont_start_base:
                 continue
-            total += log_probs[t, target].item()
+            if unavailable is not None and unavailable[t]:
+                self.compression_stats["online_skipped_targets"] += 1
+                if reject_unavailable_targets:
+                    raise RuntimeError(
+                        "online codebook target is unavailable inside a "
+                        "loglikelihood continuation; skipping it would bias "
+                        "the request score and is_greedy result "
+                        f"(compressed_position={t + 1}, target_id={target}). "
+                        "The evaluation was stopped instead."
+                    )
+                continue
+            lp_target = log_probs[t, target].item()
+            total += lp_target
+            if mv_index is None or target < V:
+                # Base-token targets have a single view; multi-view == strict.
+                mv_total += lp_target
+            else:
+                cands = multi_view_candidates(target, cb_dict, mv_index, V)
+                mv_total += torch.logsumexp(log_probs[t, cands], dim=0).item()
+                n_hyper += 1
             if int(log_probs[t].argmax().item()) != target:
                 is_greedy = False
             n_comp += 1
             n_base += bend - bstart
-        return total, is_greedy, n_comp, n_base
+        return total, is_greedy, n_comp, n_base, mv_total, n_hyper
 
     @torch.no_grad()
     def _score_base(
         self, full_ids: List[int], cont_start_base: int
-    ) -> Tuple[float, bool, int, int]:
-        """Vanilla LM scoring: feed base tokens, no codebook, base-vocab logits only."""
+    ) -> Tuple[float, bool, int, int, float, int]:
+        """Vanilla LM scoring: feed base tokens, no codebook, base-vocab logits only.
+
+        Base tokens have a single view, so the multi-view sum equals the
+        strict sum by definition (returned for a uniform _score signature).
+        """
         if len(full_ids) < 2:
-            return 0.0, True, 0, 0
+            return 0.0, True, 0, 0, 0.0, 0
         self.compression_stats["in_base"] += len(full_ids)
         self.compression_stats["in_comp"] += len(full_ids)
         x = torch.tensor(full_ids[:-1], dtype=torch.long, device=self._device).unsqueeze(0)
@@ -345,12 +702,24 @@ class Zip2ZipLM(LM):
             if int(log_probs[t].argmax().item()) != target:
                 is_greedy = False
             n += 1
-        return total, is_greedy, n, n
+        return total, is_greedy, n, n, total, 0
 
-    def _score(self, full_ids: List[int], cont_start_base: int):
+    def _score(
+        self,
+        full_ids: List[int],
+        cont_start_base: int,
+        *,
+        reject_unavailable_targets: bool = False,
+        compute_multi_view: bool = False,
+    ):
         if self.eval_mode == "base":
             return self._score_base(full_ids, cont_start_base)
-        return self._score_compressed(full_ids, cont_start_base)
+        return self._score_compressed(
+            full_ids,
+            cont_start_base,
+            reject_unavailable_targets=reject_unavailable_targets,
+            compute_multi_view=compute_multi_view,
+        )
 
     def compression_summary(self) -> dict:
         """Raw counters plus derived ratios (base tokens per compressed token,
@@ -361,7 +730,29 @@ class Zip2ZipLM(LM):
             s["input_compression_ratio"] = s["in_base"] / s["in_comp"]
         if s["gen_comp"]:
             s["gen_compression_ratio"] = s["gen_base"] / s["gen_comp"]
+        if s.get("online_replay_requests"):
+            s["online_replay_ms_per_request"] = (
+                1000 * s["online_replay_seconds"]
+                / s["online_replay_requests"]
+            )
+        if s.get("online_replay_tokens"):
+            s["online_replay_us_per_token"] = (
+                1_000_000 * s["online_replay_seconds"]
+                / s["online_replay_tokens"]
+            )
         return s
+
+    def multi_view_summary(self) -> dict:
+        """Per-task strict/multi-view loglikelihood sums from the rolling-
+        perplexity requests. Empty when multi_view is off or no
+        loglikelihood_rolling task ran. Callers turn the sums into metrics
+        with zip2zip_core.multi_view.derive_multi_view_metrics, which rescales
+        the harness-reported strict metrics so the denominator basis (bytes,
+        words, whatever the task counts) cancels exactly.
+        """
+        if not self.multi_view:
+            return {}
+        return self._multi_view_accum.summary()
 
     # ──────────────────────── lm-eval interface ───────────────────────────
 
@@ -397,7 +788,11 @@ class Zip2ZipLM(LM):
             else:
                 cont_start_base = len(ctx_ids)
 
-            lp, greedy, _, _ = self._score(full_ids, cont_start_base)
+            lp, greedy, _, _, _, _ = self._score(
+                full_ids,
+                cont_start_base,
+                reject_unavailable_targets=True,
+            )
             out.append((lp, greedy))
         return out
 
@@ -406,11 +801,17 @@ class Zip2ZipLM(LM):
         out: List[float] = []
         for req in tqdm(requests, desc="loglikelihood_rolling", disable=len(requests) < 4):
             text = req.args[0]
+            task_name = getattr(req, "task_name", None)
             ids = self.tok_encode(text)
             if len(ids) < 2:
+                if self.multi_view:
+                    self._multi_view_accum.add_document(task_name, 0.0, 0.0, 0, 0)
                 out.append(0.0)
                 continue
             total = 0.0
+            mv_total = 0.0
+            n_targets = 0
+            n_hyper = 0
             for prefix_tokens, pred_tokens in map(
                 make_disjoint_window,
                 get_rolling_token_windows(
@@ -423,8 +824,19 @@ class Zip2ZipLM(LM):
                 full_ids = list(prefix_tokens) + list(pred_tokens)
                 if len(full_ids) < 2:
                     continue
-                lp, _, _, _ = self._score(full_ids, cont_start_base=len(prefix_tokens))
+                lp, _, n_comp, _, mv_lp, nh = self._score(
+                    full_ids,
+                    cont_start_base=len(prefix_tokens),
+                    compute_multi_view=True,
+                )
                 total += lp
+                mv_total += mv_lp
+                n_targets += n_comp
+                n_hyper += nh
+            if self.multi_view:
+                self._multi_view_accum.add_document(
+                    task_name, total, mv_total, n_hyper, n_targets
+                )
             out.append(total)
         return out
 
@@ -481,6 +893,25 @@ class Zip2ZipLM(LM):
         idx = torch.multinomial(probs, num_samples=1)
         return int(idx.item())
 
+    def _trim_stops(self, text: str, until: List[str]) -> str:
+        """Cut the decoded continuation at the first stop-string occurrence.
+
+        The generation loops only break AFTER a stop string has landed in the
+        decoded text (and a hyper-token expansion can overshoot it by up to
+        max_subtokens-1 base tokens), so the raw decode still carries the stop
+        string and whatever followed it. lm-eval's contract is that the
+        continuation ends before the stop. Regex-extracted tasks (gsm8k) never
+        noticed the tail; text-scored tasks (triviaqa exact_match, code pass@1)
+        need the cut. trim_stop_strings=False restores the raw return of all
+        evals before 2026-08, for bit-exact legacy comparisons.
+        """
+        if not self.trim_stop_strings:
+            return text
+        for term in until:
+            if term:
+                text = text.split(term)[0]
+        return text
+
     @torch.no_grad()
     def _generate_base(
         self,
@@ -493,7 +924,6 @@ class Zip2ZipLM(LM):
         top_k: int,
     ) -> str:
         """Vanilla LM generation: feed base tokens, no codebook, base-vocab logits."""
-        eos = self.eot_token_id
         max_ctx = max(1, self._max_length - max_gen_toks)
         if len(ctx_ids) > max_ctx:
             ctx_ids = ctx_ids[-max_ctx:]
@@ -507,7 +937,7 @@ class Zip2ZipLM(LM):
             logits = out[0] if isinstance(out, tuple) else out
             last = logits[0, -1, : self.cfg.vocab_size].float()
             tok = self._sample_next(last, do_sample, temperature, top_p, top_k)
-            if tok == eos:
+            if tok in self._stop_token_ids:
                 break
             gen_ids.append(tok)
             seq.append(tok)
@@ -519,7 +949,7 @@ class Zip2ZipLM(LM):
                 break
         self.compression_stats["gen_comp"] += len(gen_ids)
         self.compression_stats["gen_base"] += len(gen_ids)
-        return self.tok_decode(gen_ids)
+        return self._trim_stops(self.tok_decode(gen_ids), until)
 
     @torch.no_grad()
     def _generate_compressed(
@@ -541,7 +971,6 @@ class Zip2ZipLM(LM):
         """
         cfg = self.cfg
         V = cfg.vocab_size
-        eos = self.eot_token_id
         max_ctx = max(1, self._max_length - max_gen_toks)
 
         compressor = LZWCompressor(**self._compressor_kwargs)
@@ -606,8 +1035,9 @@ class Zip2ZipLM(LM):
                     # Model produced an unused hyper slot; treat as stop.
                     break
 
-            if eos in expansion:
-                cut = expansion.index(eos)
+            stop_at = [i for i, t in enumerate(expansion) if t in self._stop_token_ids]
+            if stop_at:
+                cut = stop_at[0]
                 gen_base_ids.extend(expansion[:cut])
                 if cut > 0:
                     n_gen_comp += 1
@@ -648,7 +1078,7 @@ class Zip2ZipLM(LM):
 
         self.compression_stats["gen_comp"] += n_gen_comp
         self.compression_stats["gen_base"] += len(gen_base_ids)
-        return self.tok_decode(gen_base_ids)
+        return self._trim_stops(self.tok_decode(gen_base_ids), until)
 
     def generate_until(self, requests) -> List[str]:
         out: List[str] = []

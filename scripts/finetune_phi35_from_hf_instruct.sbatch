@@ -24,10 +24,16 @@ set -euo pipefail
 #   - --init_from_hf microsoft/Phi-3.5-mini-instruct  (Phi-3 fused qkv/gate_up
 #     are auto-split to Llama layout in train.load_hf_pretrained)
 #   - --freeze_decoder --lora_rank 32 --lora_alpha 32  (matches adapter_config)
-#   - max_subtokens=3, active codebook=2048, encoder dim 3072 / 2 layers / 32 heads
+#   - max_subtokens=4, active codebook=2048, encoder dim 3072 / 2 layers / 32 heads
 #     (≈ released transformer encoder; zip2zip-core uses a single encoder, so it
 #      is NOT bit-identical to released's separate in/out encoders — accepted)
 #   - LR 3e-4 -> 1e-5 cosine; data = Phi-tokenized zip2zip-1B SFT shards
+#
+# NOTE: the released run (ozz-main reproducibility/phi_3.5_4b_train_cfg.yaml +
+# HF zip2zip_config.json) actually used max_subtokens=4, seq 2048, 32,768
+# tokens/step, 8000 steps (~262M tok), warmup 800, AdamW beta2 0.999 / wd 0.01.
+# This script keeps its original seq-4096 / 1B-pass defaults for CSCS
+# continuity; scripts/finetune_phi35_rcp.sh carries the faithful defaults.
 #
 # Target reference (released zip2zip_config.json / adapter_config.json):
 #   initial_vocab_size 32011 / vocab 32064 — zip2zip-core keeps 32064 (its hyper
@@ -54,7 +60,7 @@ OUTPUT_DIR=${OUTPUT_DIR:-${OUTPUT_BASE}/${RUN_NAME}}
 INIT_FROM_HF=${INIT_FROM_HF:-microsoft/Phi-3.5-mini-instruct}
 TOKENIZER=${TOKENIZER:-microsoft/Phi-3.5-mini-instruct}
 MODEL_CONFIG=${MODEL_CONFIG:-Phi3.5-mini}
-MAX_SUBTOKENS=${MAX_SUBTOKENS:-3}
+MAX_SUBTOKENS=${MAX_SUBTOKENS:-4}   # released model used 4 (was wrongly 3 here)
 MAX_ACTIVE_CODEBOOK_SIZE=${MAX_ACTIVE_CODEBOOK_SIZE:-2048}
 
 # token-budget training (released used ~260M tok; default to a full 1B pass and
@@ -164,7 +170,7 @@ if [ -n "$LORA_RANK" ]; then
 fi
 
 NO_ENCODER_RESIDUAL_FLAG=""
-if [ -n "$NO_ENCODER_RESIDUAL" ]; then
+if [ -n "$NO_ENCODER_RESIDUAL" ] && [ "$NO_ENCODER_RESIDUAL" != "0" ]; then
     NO_ENCODER_RESIDUAL_FLAG="--no_encoder_residual"
 fi
 

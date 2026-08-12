@@ -115,7 +115,7 @@ if [ -n "$MAX_TOKENS" ]; then
 fi
 
 NO_ENCODER_RESIDUAL_FLAG=""
-if [ -n "$NO_ENCODER_RESIDUAL" ]; then
+if [ -n "$NO_ENCODER_RESIDUAL" ] && [ "$NO_ENCODER_RESIDUAL" != "0" ]; then
     NO_ENCODER_RESIDUAL_FLAG="--no_encoder_residual"
 fi
 

@@ -20,6 +20,14 @@ def write_model_card(path: str, repo_id: str, step: int, train_args: dict):
     seq_len = train_args.get("seq_len", "?")
     lr = train_args.get("lr", "?")
     max_tokens = train_args.get("max_tokens", "?")
+    gated_rope = bool(train_args.get("gated_compressed_rope", False))
+    gated_rope_start = train_args.get("gated_rope_start_layer", 0)
+    gated_rope_pair = train_args.get("gated_rope_start_pair")
+    if gated_rope_pair is None:
+        # Pre-suffix gated checkpoints covered every pair and did not record
+        # this field.  Keep generated cards truthful for that legacy format.
+        gated_rope_pair = 0
+    base_replay = train_args.get("base_view_replay_prob", 0.0)
 
     lines = [
         "---",
@@ -46,22 +54,42 @@ def write_model_card(path: str, repo_id: str, step: int, train_args: dict):
         f"| seq_len | {seq_len} |",
         f"| lr | {lr} |",
         f"| max_tokens | {max_tokens} |",
+        f"| gated_compressed_rope | {gated_rope} |",
+        f"| gated_rope_start_layer | {gated_rope_start} |",
+        f"| gated_rope_start_pair | {gated_rope_pair} |",
+        f"| base_view_replay_prob | {base_replay} |",
         f"| step | {step} |",
         f"| data | `{os.path.basename(str(data_dir))}` |",
         "",
         "## Usage",
         "",
-        "This is a **training checkpoint** (torchtitan format). To use for inference,",
-        "export to HuggingFace format first:",
-        "",
-        "```bash",
-        "python scripts/zip2zip_hf/export_to_zip2zip.py \\",
-        f"    --ckpt_dir <local_path>/step_{step} \\",
-        "    --output_dir <export_dir> \\",
-        f"    --base_model {init_from} \\",
-        f"    --model_config {model_config}",
-        "```",
+        "This is a **training checkpoint** (torchtitan format).",
         "",
     ]
+    if gated_rope:
+        lines.extend(
+            [
+                "This checkpoint uses gated compressed-coordinate RoPE, which "
+                "the external HuggingFace runtime does not implement. Use "
+                "`scripts/inference.py` or the in-core evaluation adapter; "
+                "export is intentionally refused.",
+                "",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "To use for inference, export to HuggingFace format first:",
+                "",
+                "```bash",
+                "python scripts/zip2zip_hf/export_to_zip2zip.py \\",
+                f"    --ckpt_dir <local_path>/step_{step} \\",
+                "    --output_dir <export_dir> \\",
+                f"    --base_model {init_from} \\",
+                f"    --model_config {model_config}",
+                "```",
+                "",
+            ]
+        )
     with open(path, "w") as f:
         f.write("\n".join(lines))

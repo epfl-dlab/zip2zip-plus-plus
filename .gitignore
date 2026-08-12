@@ -12,4 +12,5 @@ wandb
 *.out
 *.vscode/
 outputs/
+plots/
 .DS_Store

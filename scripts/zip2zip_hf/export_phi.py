@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,18 +36,16 @@ sys.path.insert(0, os.path.join(_ROOT, "ext", "torchtitan"))
 import torch
 
 from zip2zip_core.configs import zip2zip_llama_configs
+from zip2zip_core.disabled_ids import compute_disabled_ids
 from zip2zip_core.export import (
-    _split_state_dict, _infer_encoder_config, _merge_lora_weights, _lora_scaling_from_meta,
+    _split_state_dict, _infer_encoder_config, _prepare_export_state_dict,
+    _disable_digit_ids_from_meta, _resolve_encoder_n_heads,
+    _encoder_residual_from_meta, _validate_hf_decoder_state_dict,
+    refuse_base_token_positions,
 )
 
 PHI_TOKENIZER = "microsoft/Phi-3.5-mini-instruct"
 MODEL_CONFIG = "Phi3.5-mini"
-
-
-def _phi_disabled_ids(tok, vocab_size: int) -> list[int]:
-    special = set(tok.all_special_ids or [])
-    added = set(tok.get_added_vocab().values())
-    return sorted(i for i in (special | added) if 0 <= i < vocab_size)
 
 
 def _fuse_llama_to_phi3(hf_llama_sd: dict, n_layers: int) -> dict:
@@ -79,6 +78,15 @@ def main():
     p.add_argument("--ckpt_dir", required=True)
     p.add_argument("--output_dir", required=True)
     p.add_argument("--max_codebook_size", type=int, default=4096)
+    p.add_argument("--encoder_n_heads", type=int, default=None,
+                   help="Number of encoder attention heads. Default: resolved from "
+                        "meta.pt's train args, falling back to hidden_size // 64 "
+                        "only if meta.pt is missing or lacks encoder_n_heads.")
+    p.add_argument("--disable_digit_ids", action="store_true", default=None,
+                   help="Digits were protected from LZW merges during training. "
+                        "Default: auto-detected from meta.pt's --disable_digit_ids.")
+    p.add_argument("--no_disable_digit_ids", dest="disable_digit_ids", action="store_false",
+                   help="Force digit protection off even if meta.pt recorded it on.")
     args = p.parse_args()
 
     from transformers import AutoTokenizer, Phi3Config
@@ -91,31 +99,46 @@ def main():
     n_layers = cfg.n_layers
     vocab_size = cfg.vocab_size
     tok = AutoTokenizer.from_pretrained(PHI_TOKENIZER)
-    disabled_ids = _phi_disabled_ids(tok, vocab_size)
+
+    disable_digit_ids = args.disable_digit_ids
+    if disable_digit_ids is None:
+        disable_digit_ids = _disable_digit_ids_from_meta(args.ckpt_dir)
+        if disable_digit_ids:
+            print("  checkpoint was trained with digit-protected LZW (meta.pt) "
+                  "— auto-enabling digit protection for export")
+    disabled_ids = compute_disabled_ids(tok, vocab_size, disable_digit_ids=disable_digit_ids)
     print(f"Phi3 export: vocab={vocab_size}, layers={n_layers}, "
-          f"heads={attn.n_heads}/{attn.n_kv_heads}, disabled_ids={disabled_ids}")
+          f"heads={attn.n_heads}/{attn.n_kv_heads}, disable_digit_ids={disable_digit_ids}, "
+          f"disabled_ids={disabled_ids}")
 
     # ---- load + split checkpoint ----
+    refuse_base_token_positions(args.ckpt_dir)
     model_pt = os.path.join(args.ckpt_dir, "model.pt")
     print(f"Loading {model_pt} ...")
     sd = torch.load(model_pt, map_location="cpu", weights_only=True)
-    sd = _merge_lora_weights(sd, _lora_scaling_from_meta(args.ckpt_dir))
-    decoder_sd, encoder_sd = _split_state_dict(sd)
+    sd = _prepare_export_state_dict(sd, args.ckpt_dir)
+    decoder_sd, encoder_sd, output_encoder_sd = _split_state_dict(sd)
+    untied = bool(output_encoder_sd)
     enc_info = _infer_encoder_config(sd)
 
     # ---- decoder -> HF-Llama (correct RoPE permute) -> fuse to Phi3 ----
     print("Converting decoder -> HF-Llama -> fused Phi3 ...")
     adapter = Llama3StateDictAdapter(cfg, None)   # cfg has .layer.attention.n_heads/.dim
     hf_llama_sd = adapter.to_hf(decoder_sd)
+    _validate_hf_decoder_state_dict(hf_llama_sd, n_layers)
     phi3_sd = _fuse_llama_to_phi3(hf_llama_sd, n_layers)
     save_file({k: v.contiguous().clone() for k, v in phi3_sd.items()},
               os.path.join(args.output_dir, "model.safetensors"))
     print(f"  saved model.safetensors ({len(phi3_sd)} tensors, Phi3ForCausalLM)")
 
-    # ---- encoder -> encoders.safetensors (input_encoder.*, tie_encoders=True) ----
+    # ---- encoder -> encoders.safetensors (input_encoder.* always; output_encoder.* when untied) ----
     enc_prefixed = {f"input_encoder.{k}": v.contiguous() for k, v in encoder_sd.items()}
+    if untied:
+        enc_prefixed.update(
+            {f"output_encoder.{k}": v.contiguous() for k, v in output_encoder_sd.items()}
+        )
     save_file(enc_prefixed, os.path.join(args.output_dir, "encoders.safetensors"))
-    print(f"  saved encoders.safetensors ({len(enc_prefixed)} tensors)")
+    print(f"  saved encoders.safetensors ({len(enc_prefixed)} tensors, tie_encoders={not untied})")
 
     # ---- Phi3 config.json ----
     phi3_config = Phi3Config(
@@ -151,7 +174,8 @@ def main():
     print("  saved Phi tokenizer")
 
     # ---- zip2zip_config.json (self-contained base + training-time compression) ----
-    n_heads = enc_info["hidden_size"] // 64
+    n_heads = _resolve_encoder_n_heads(args.ckpt_dir, enc_info["hidden_size"], args.encoder_n_heads)
+    residual = _encoder_residual_from_meta(args.ckpt_dir)
     z = {
         "base_model_name_or_path": os.path.abspath(args.output_dir),
         "encoder_type": "res_latent_attn",
@@ -162,8 +186,8 @@ def main():
             "intermediate_size": enc_info["intermediate_size"],
             "num_heads": n_heads,
             "causal": False,
-            "residual": True,
-            "tie_encoders": True,
+            "residual": residual,
+            "tie_encoders": not untied,
             "position_encoding": None,
         },
         "compression": {
@@ -176,7 +200,14 @@ def main():
     with open(os.path.join(args.output_dir, "zip2zip_config.json"), "w") as f:
         json.dump(z, f, indent=2)
     print(f"  wrote zip2zip_config.json (initial_vocab_size={vocab_size}, "
-          f"max_subtokens={enc_info['max_subtokens']})")
+          f"max_subtokens={enc_info['max_subtokens']}, residual={residual})")
+
+    # Carry meta.pt along so check_export_consistency.py has train_args to
+    # compare against -- without this it silently "passes" with nothing checked.
+    meta_src = os.path.join(args.ckpt_dir, "meta.pt")
+    if os.path.exists(meta_src):
+        shutil.copy(meta_src, os.path.join(args.output_dir, "meta.pt"))
+        print("  copied meta.pt (for check_export_consistency.py)")
 
     print("\nDone. Self-contained Phi3 zip2zip dir:", os.path.abspath(args.output_dir))
     print("Load with:  Zip2ZipModel.from_pretrained('%s')" % os.path.abspath(args.output_dir))

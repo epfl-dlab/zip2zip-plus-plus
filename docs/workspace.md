@@ -27,6 +27,91 @@ HF_ORG = "epfl-dlab"
 - Filter by tag `eval` to see only evaluation runs
 - Use the `hf_url` summary field to jump to the model on HF Hub
 
+### Workspace sections
+
+A finetune+eval pipeline run logs ~124 metric keys from four writers, so the
+default workspace is a wall of alphabetically grouped panels. Nothing here
+renames or drops a metric: legacy keys stay comparable across the whole v0.6.x
+history. The cleanup is split by what W&B actually scopes per run:
+
+- **Duplicate panels are suppressed at log time**, so every pipeline run comes
+  out deduplicated on its own. `define_metric(..., hidden=True)` hides a metric's
+  auto-panel while keeping its values in the run:
+  [`train.py`](../src/zip2zip_core/train.py) for `compressed/backward_loss`, and
+  [`eval_harness.py`](../scripts/eval_harness.py) for lm-eval's unprefixed
+  `<task>/*` keys — the latter only when `--resume_wandb_id` is set, i.e. on the
+  pipeline path where `final/*` already carries the same numbers. A standalone
+  `eval_ckpt_rcp.sh` run keeps them visible, being the only copy there.
+- **Sections, order and open/collapsed state are project-scoped**: a run cannot
+  ship its own panel layout. `scripts/wandb_workspace_view.py` defines them as
+  code, and pipeline phase 4 refreshes the project's shared saved view
+  ([z2z clean](https://wandb.ai/epfl-dlab/zip2zip-core?nw=ajtwww7qjwp), the
+  `VIEW_URL` constant in that file). `WANDB_VIEW=0` skips it; a failure there
+  never fails the pipeline. The eval venv installs `wandb-workspaces` for it on
+  W&B runs, on its own non-fatal pip line — a cosmetic dependency must not be
+  able to abort a pipeline on its way to the evals.
+
+One view serves the whole team, so nobody needs per-user setup: whoever runs the
+pipeline brings it up to date, and the content is fully determined by the script,
+so concurrent refreshes cannot conflict. Two consequences worth knowing:
+
+- **Manual panel edits to that view are reverted by the next pipeline run.** For a
+  personal arrangement, use the UI's "Save as new view", or point
+  `WANDB_VIEW_URL` at your own view.
+- A view belongs to one entity/project. `--view-url` is rejected when it names a
+  different project than the run logged to, because `from_url` takes its target
+  from the URL — otherwise a `WANDB_PROJECT=llaza` run would rewrite the
+  `zip2zip-core` view.
+
+To create a separate view from scratch (prints the new URL):
+
+```bash
+python scripts/wandb_workspace_view.py --apply --view-url ''
+```
+
+```bash
+python scripts/wandb_workspace_view.py                       # print the layout
+python scripts/wandb_workspace_view.py --verify epfl-dlab/zip2zip-core/<run_id>
+python scripts/wandb_workspace_view.py --apply --view-name "z2z clean"
+```
+
+`--verify` reports keys a run logs that no panel covers. `tests/test_wandb_view.py`
+enforces the same coverage statically against `train.py`, so adding a metric
+without a panel fails a test instead of quietly vanishing from the workspace.
+
+Who writes what, and why the sections are split that way:
+
+| Keys | Writer | Section |
+|---|---|---|
+| no prefix (`loss`, `acc`, `compression`, `lr`, ...) | `train.py:2236` | legacy training sections (3, 5, 7, 8, 9) |
+| `compressed/*` | `train.py:2257` | corrected training sections (4, 6, 7, 8) |
+| `objective/backward_loss` | `train.py:2256` | section 3 — the loss actually optimised |
+| `base_view/*`, `rope_gate*` | `train.py:2336`, `:2369` | section 11-12, only with replay / gated RoPE |
+| `smoke/*`, `final/*` | `log_results_to_wandb.py --prefix` | sections 1-2, on their own `*/step` x-axis |
+| `subset_ppl/*` | `log_results_to_wandb.py --prefix` (from `eval_ckpt_rcp.sh PRESET=perplexity_subset`) | section 2b, own `subset_ppl/step` x-axis — pinned 1k-doc subsets, never comparable with `final/*` |
+| `<task>/<metric>`, `evaluation/*`, tables | lm-eval's `WandbLogger`, `eval_harness.py:305` | section 15 |
+| `eval/*_compression_ratio` | `eval_harness.py:311` | section 10 |
+
+Legacy and corrected metrics are deliberately kept in different sections, never
+overlaid in one panel: they use different denominators and are not comparable
+(see the metric rules in `CLAUDE.md` and `docs/finetuning.md`).
+
+Two duplications are known, and both are suppressed at log time:
+
+- `compressed/backward_loss` is byte-for-byte the bare `backward_loss` (both read
+  `compat_backward_loss`); its panel is hidden and it has no panel in the layout.
+  `objective/backward_loss` is kept, being the only one that differs once
+  base-view replay is on.
+- pipeline phase 3 logs the final numbers twice: unprefixed by lm-eval and under
+  `final/` by `log_results_to_wandb.py`. The unprefixed copies keep an explicit
+  collapsed section, because they are the *only* keys a standalone
+  `eval_ckpt_rcp.sh` run writes — hidden metrics still plot in a panel that names
+  them, they just get no auto-panel.
+
+One trap the view labels explicitly: `final/eval/*_compression_ratio` is written
+twice at the same `final/step`, once from the MC JSON and once from the wikitext
+JSON. The unprefixed `eval/*` is MC-only.
+
 ## HuggingFace Hub
 
 Models and checkpoints are hosted under the [`epfl-dlab`](https://huggingface.co/epfl-dlab) organization.

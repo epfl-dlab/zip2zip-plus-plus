@@ -121,6 +121,27 @@ def main():
             )
             return
 
+        # export() only knows the generic HF-Llama layout (Llama3StateDictAdapter,
+        # separate q/k/v + gate/up projections). Phi3ForCausalLM stores FUSED
+        # qkv_proj/gate_up_proj -- exporting a Phi checkpoint through this path
+        # produces a model.safetensors with the wrong key layout for the
+        # base_model_name_or_path it declares, which Zip2ZipModel.from_pretrained
+        # then silently fails to load (or loads with random decoder weights).
+        # scripts/zip2zip_hf/export_phi.py does the required q/k/v and gate/up
+        # fusion; run it by hand first, then re-run this script with the
+        # already-exported directory (--branch hf, --no_export is implied since
+        # is_exported will be true) to just upload it.
+        if "phi" in str(model_config).lower() or "phi" in str(base_model).lower():
+            raise ValueError(
+                f"Refusing to auto-export what looks like a Phi checkpoint "
+                f"(model_config={model_config!r}, base_model={base_model!r}) — "
+                "export() does not fuse qkv_proj/gate_up_proj the way Phi3ForCausalLM "
+                "requires. Run scripts/zip2zip_hf/export_phi.py --ckpt_dir ... "
+                "--output_dir ... yourself first, then re-run this script pointed "
+                "at that output_dir (it will be auto-detected as already-exported "
+                "and just uploaded, not re-exported)."
+            )
+
         with tempfile.TemporaryDirectory(prefix="zip2zip_export_") as export_dir:
             print(f"\n{'='*60}")
             print(f"Auto-exporting to HF format...")

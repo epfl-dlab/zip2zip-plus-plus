@@ -6,11 +6,16 @@ matches a from-scratch Phi3.5-mini model trained on Phi-tokenized data.
 
 Dataset has 'text' column with mixed formats:
 - HuggingFaceH4/ultrachat_200k: Zephyr chat format (<|user|>/<|end|>/<|assistant|>)
+- AI-MO/NuminaMath-1.5: packed "problem\n\nsolution" pairs joined by single "\n",
+  no chat tags, ~1-5 problems per doc
 - Other sources: plain text
 
 Processing:
 - Chat examples (ultrachat): parse Zephyr → re-apply apply_chat_template (Phi-3.5 format)
   Loss mask = 1 only on assistant turns (including the trailing <|end|>)
+- Math (NuminaMath): split at ground-truth problem boundaries (exact match against
+  the original AI-MO/NuminaMath-1.5 problems) → multi-turn Phi-3.5 chat, same loss
+  masking as ultrachat. Docs that cannot be fully segmented stay plain text.
 - Plain text: tokenize as-is, loss mask = 1 on all tokens
 """
 
@@ -23,7 +28,7 @@ import numpy as np
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-OUTPUT_DIR = "/capstor/store/cscs/swissai/a0101/mxx/zip2zip-data/phi-1B-sft-8shards"
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/capstor/store/cscs/swissai/a0101/mxx/zip2zip-data/phi-1B-sft-8shards")
 TOKENS_PER_SHARD = 125_000_000
 TOKENIZE_BATCH_SIZE = 5_000
 TOKENIZE_NUM_PROC = 8
@@ -44,8 +49,15 @@ TURN_END = "<|end|>"
 # Sources that have chat format in Zephyr style
 CHAT_SOURCES = {"HuggingFaceH4/ultrachat_200k"}
 
-tokenizer = AutoTokenizer.from_pretrained(BASE_TOKENIZER_NAME)
-chat_tokenizer = AutoTokenizer.from_pretrained(CHAT_TOKENIZER_NAME)
+# Math source: packed plain-text "problem\n\nsolution" pairs, re-rendered as chat.
+# Revision pinned so the problem index always matches the packed docs.
+MATH_SOURCE = "AI-MO/NuminaMath-1.5"
+MATH_SOURCE_REVISION = "1b05109f9e5c1ad06c0663519502416c30b300f8"
+MATH_PROBLEM_PREFIX = 80
+
+user_cache = os.environ.get("USER_HF_CACHE", None)
+tokenizer = AutoTokenizer.from_pretrained(BASE_TOKENIZER_NAME, cache_dir=user_cache)
+chat_tokenizer = AutoTokenizer.from_pretrained(CHAT_TOKENIZER_NAME, cache_dir=user_cache)
 
 
 def parse_zephyr_to_messages(text):
@@ -69,6 +81,91 @@ def parse_zephyr_to_messages(text):
     return messages
 
 
+math_problem_index = None
+
+
+def init_math_problem_index():
+    """Build {80-char prefix -> [full problem texts]} from AI-MO/NuminaMath-1.5.
+
+    Packed math docs are "problem\n\nsolution" pairs joined by a single "\n".
+    Both separators also occur inside solutions, so the only reliable split
+    points are exact matches of the original problem texts (verified 2026-07-15
+    on 1000 sampled docs: 92.2% segment fully, 0 false boundaries in a strict
+    solution-level check, 0.6% end in a truncated last solution).
+    """
+    global math_problem_index
+    if math_problem_index is not None:
+        return math_problem_index
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi, hf_hub_download
+
+    files = sorted(
+        f for f in HfApi().list_repo_files(
+            MATH_SOURCE, repo_type="dataset", revision=MATH_SOURCE_REVISION
+        )
+        if f.startswith("data/") and f.endswith(".parquet")
+    )
+    index = {}
+    n_problems = 0
+    for rf in files:
+        local = hf_hub_download(
+            MATH_SOURCE, rf, repo_type="dataset",
+            revision=MATH_SOURCE_REVISION, cache_dir=user_cache,
+        )
+        for p in pq.read_table(local, columns=["problem"])["problem"].to_pylist():
+            if not p or not p.strip():
+                continue
+            n_problems += 1
+            index.setdefault(p[:MATH_PROBLEM_PREFIX], []).append(p)
+    for key, cands in index.items():
+        if len(cands) > 1:
+            index[key] = list(dict.fromkeys(cands))
+    print(f"Math problem index: {n_problems:,} problems, {len(index):,} prefixes")
+    math_problem_index = index
+    return index
+
+
+def split_math_doc(text):
+    """Split a packed NuminaMath doc into [(problem, solution), ...].
+
+    A boundary is position 0, or a position right after "\n" where a known
+    problem text matches exactly and is followed by "\n\n". Solutions are taken
+    verbatim from the doc (packed solutions may differ from the originals).
+    Returns None when the doc cannot be fully segmented from position 0.
+    """
+    index = math_problem_index if math_problem_index is not None else init_math_problem_index()
+    starts = [0] + [i + 1 for i, ch in enumerate(text) if ch == "\n"]
+    bounds = []  # (position, matched problem)
+    prev_end = 0
+    for pos in starts:
+        if pos < prev_end:  # inside the previous problem's own text
+            continue
+        cands = index.get(text[pos:pos + MATH_PROBLEM_PREFIX])
+        if not cands:
+            continue
+        best = None
+        for p in cands:
+            if text.startswith(p, pos) and text.startswith("\n\n", pos + len(p)):
+                if best is None or len(p) > len(best):
+                    best = p
+        if best is None:
+            continue
+        bounds.append((pos, best))
+        prev_end = pos + len(best) + 2
+    if not bounds or bounds[0][0] != 0:
+        return None
+    pairs = []
+    for j, (pos, problem) in enumerate(bounds):
+        sol_start = pos + len(problem) + 2
+        sol_end = bounds[j + 1][0] - 1 if j + 1 < len(bounds) else len(text)
+        problem = problem.strip()
+        solution = text[sol_start:sol_end].strip()
+        if not problem or not solution:
+            return None
+        pairs.append((problem, solution))
+    return pairs
+
+
 def convert_to_chatml(sample):
     """Convert text to ChatML format. Returns {'text': ..., 'is_chat': bool}."""
     source = sample.get('source', '')
@@ -85,6 +182,18 @@ def convert_to_chatml(sample):
                 return {'text': phi_fmt, 'is_chat': True}
         except Exception:
             pass
+
+    if source == MATH_SOURCE:
+        pairs = split_math_doc(text)
+        if pairs:
+            messages = []
+            for problem, solution in pairs:
+                messages.append({'role': 'user', 'content': problem})
+                messages.append({'role': 'assistant', 'content': solution})
+            phi_fmt = chat_tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+            return {'text': phi_fmt, 'is_chat': True}
 
     return {'text': text, 'is_chat': False}
 
@@ -137,7 +246,15 @@ def maybe_add_boundary_tokens(tokens, mask):
     if ADD_EOS and tokenizer.eos_token_id is not None:
         if not tokens or tokens[-1] != tokenizer.eos_token_id:
             tokens = tokens + [tokenizer.eos_token_id]
-            mask = mask + [0]
+            # EOS must be IN the loss (mask=1): with mask=0 the model gets no
+            # gradient to ever emit end-of-text after a completed plain-text
+            # document, so at inference it runs past its answer into a
+            # fabricated next document (observed on GSM8K: the step_8000 repro
+            # answers correctly, then generates a new invented math problem
+            # whose numbers poison lm-eval's flexible-extract scoring).
+            # Chat docs already learn stopping via <|end|> in the assistant
+            # span; this fixes plain-text (NuminaMath/fineweb/stack) docs.
+            mask = mask + [1]
     return tokens, mask
 
 
@@ -245,25 +362,48 @@ def save_token_shards(tokenized_dataset):
 
 # ---- main ----
 
-print("Loading epfl-dlab/zip2zip-1B (train split)...")
-ds = load_dataset("epfl-dlab/zip2zip-1B", split="train")
-print(ds)
+def main():
+    print("Loading epfl-dlab/zip2zip-1B (train split)...")
+    ds = load_dataset("epfl-dlab/zip2zip-1B", split="train")
+    print(ds)
 
-# Check chat stats
-n_chat = sum(1 for s in ds['source'] if s in CHAT_SOURCES)
-print(f"Chat examples (ultrachat): {n_chat} / {len(ds)}")
+    # Check chat stats
+    n_chat = sum(1 for s in ds['source'] if s in CHAT_SOURCES)
+    print(f"Chat examples (ultrachat): {n_chat} / {len(ds)}")
 
-print("Converting Zephyr chat → Phi-3.5 ChatML, plain text passthrough...")
-ds = ds.map(
-    convert_to_chatml,
-    batched=False,
-    num_proc=TOKENIZE_NUM_PROC,
-    remove_columns=[c for c in ds.column_names if c not in ('text', 'is_chat', 'source')],
-)
+    # Built before ds.map so forked workers inherit it (workers on spawn
+    # platforms rebuild it lazily from the shared HF cache).
+    print("Building NuminaMath problem index for math doc splitting...")
+    init_math_problem_index()
 
-print("Tokenizing...")
-tokenized = tokenize_dataset(ds)
-print(tokenized)
+    print("Converting chat + math → Phi-3.5 ChatML, plain text passthrough...")
+    ds = ds.map(
+        convert_to_chatml,
+        batched=False,
+        num_proc=TOKENIZE_NUM_PROC,
+        remove_columns=[c for c in ds.column_names if c not in ('text', 'is_chat', 'source')],
+    )
 
-print("Saving shards...")
-save_token_shards(tokenized)
+    n_math = sum(1 for s in ds['source'] if s == MATH_SOURCE)
+    n_math_chat = sum(
+        1 for s, c in zip(ds['source'], ds['is_chat']) if s == MATH_SOURCE and c
+    )
+    rate = n_math_chat / max(n_math, 1)
+    print(f"Math docs chat-formatted: {n_math_chat:,} / {n_math:,} ({100*rate:.1f}%) "
+          f"— ~92% expected, rest stay plain text")
+    if rate < 0.85:
+        raise RuntimeError(
+            f"Math chat-format rate {rate:.3f} < 0.85 — problem index missing or "
+            f"revision mismatch; refusing to tokenize"
+        )
+
+    print("Tokenizing...")
+    tokenized = tokenize_dataset(ds)
+    print(tokenized)
+
+    print("Saving shards...")
+    save_token_shards(tokenized)
+
+
+if __name__ == "__main__":
+    main()

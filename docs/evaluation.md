@@ -71,16 +71,81 @@ override preset values.
 
 | Preset | Use case |
 |--------|----------|
-| `default` | Full MC + generation benchmarks, 2-shot, chat template (matches paper Table 3) |
+| `default` | Full MC + generation benchmarks, 2-shot, chat template (paper Table 3 set + triviaqa) |
 | `perplexity` | Byte-level PPL on wikitext/pile/mc4/dc4, 1024-token rolling window |
 | `default_base` | Same as `default` but no chat template (from-scratch/non-instruct models) |
 | `smoke` | 20 samples/task, no W&B — quick sanity check |
 
 `TASKS=...` env var (or `--tasks`) restricts a preset to one task without editing the YAML.
 
+### Repeated-window Wikitext stress tests
+
+`zip2zip_wikitext_repeat4` and `zip2zip_wikitext_repeat8` are opt-in
+merge-size-transfer stress tests. They are not part of any default preset or
+pipeline, and the standard Wikitext task is unchanged.
+
+The local corpora are built with the
+`microsoft/Phi-3.5-mini-instruct` tokenizer. They are suitable for Zip2Zip
+checkpoints that use that exact tokenizer; forced evaluation at a merge size
+not seen during training is supported only by hierarchical hyper-encoders.
+Other tokenizers need their own rebuilt corpus because token-aware block
+boundaries, single-window guarantees, and LZW compression patterns change.
+
+Prepare the local JSONL files once from the repository root:
+
+```bash
+uv sync --extra eval
+uv run python scripts/build_repeated_wikitext.py --repeat_n 4
+uv run python scripts/build_repeated_wikitext.py --repeat_n 8
+```
+
+By default the builder writes outside the Git repository:
+
+```text
+../datasets/wikitext-repeat4-phi35/{test.jsonl,manifest.json}
+../datasets/wikitext-repeat8-phi35/{test.jsonl,manifest.json}
+```
+
+The default build location is resolved from the script rather than the current
+working directory. The task YAMLs use the paths above, so run evaluation from
+the repository root. Existing data is never overwritten implicitly; rebuild
+explicitly with `--overwrite`.
+
+Run one task by overriding the task list of the 1,024-token perplexity preset:
+
+```bash
+uv run python scripts/eval_harness.py \
+  --ckpt_dir /path/to/checkpoint \
+  --tokenizer microsoft/Phi-3.5-mini-instruct \
+  --preset perplexity \
+  --tasks zip2zip_wikitext_repeat8 \
+  --eval_max_subtokens 4 \
+  --resume_wandb_id none
+```
+
+For the merge-size transfer comparison, run these three settings:
+
+| Train max_subtokens | Eval max_subtokens | Role |
+|---:|---:|---|
+| 3 | 3 | Native ms3 checkpoint |
+| 3 | 4 | Forced-transfer evaluation of the ms3 checkpoint |
+| 4 | 4 | Native ms4 baseline |
+
+The `3 -> 4` and `4 -> 4` rows should have identical input compression:
+compression depends on the text, tokenizer, and eval-time LZW settings, not on
+model weights. Compare perplexity only within the same repeated corpus; later
+copies are intentionally easier to predict, so repeat-4/repeat-8 absolute PPL
+is not directly comparable to standard Wikitext PPL.
+
+> **Future packaging TODO:** if these stress tests become stable public
+> benchmarks, consider publishing versioned corpus artifacts. Supporting
+> non-Phi tokenizers will require either one token-aware build per tokenizer or
+> a redesigned evaluation that constructs tokenizer-specific windows at run
+> time.
+
 ## RCP cluster wrappers (Run:AI)
 
-Three `runai submit`-ready wrappers, all under `scripts/`, sharing the `SCRATCH` env var
+Three `runai submit`-ready wrappers, all under `scripts/`, sharing the `Z2Z_SCRATCH` env var
 (default `/dlabscratch1/gentilin`, override per-user) for cache/log/output paths:
 
 - **`eval_ckpt_rcp.sh`** — evaluates a zip2zip *training checkpoint* (`model.pt` + `meta.pt`)
@@ -93,8 +158,14 @@ Three `runai submit`-ready wrappers, all under `scripts/`, sharing the `SCRATCH`
   `microsoft/Phi-3.5-mini-instruct` to confirm task/fewshot settings match the paper's
   Table 3 "Base" row before trusting any zip2zip-adapter numbers.
 
-All three write JSON results + a `tee`'d log to `$SCRATCH/logs/eval`, with the model name
+All three write JSON results + a `tee`'d log to `$Z2Z_SCRATCH/logs/eval`, with the model name
 (and task name, if `TASKS` is set) baked into the output filename for traceability.
+Training-checkpoint evaluation requires the matching `meta.pt` and fails before
+scoring if it is absent; otherwise behavior-only RoPE settings could silently
+fall back to the wrong geometry.
+`eval_ckpt_rcp.sh` can additionally log to W&B (results, per-sample tables, compression
+ratios): set `WANDB=1` + `WANDB_NAME`/`WANDB_PROJECT`, and pass `WANDB_API_KEY` into the
+job env. Run names get an `eval-` prefix automatically.
 
 ## Compression ratio
 
@@ -107,6 +178,140 @@ regardless of model weights) and `gen_compression_ratio` (generated tokens only,
 dependent — relevant for generative tasks like GSM8K, where the model chooses whether to
 emit hypertokens). Both scripts print this next to accuracy and include it in the output
 JSON; no extra GPU runs are needed to backfill it for past-configured evals.
+
+## GSM8K for zip2zip models: which number to trust
+
+Models finetuned on the zip2zip-1B mix answer in NuminaMath style (`$\boxed{42}$`),
+never `#### 42`, so lm-eval's `strict-match` is a format lottery — ignore it. Use
+`flexible-extract` for reported numbers. If a model does not stop after its answer
+(models trained on pre-`b12efc0` data run into a fabricated next problem, whose
+numbers poison flexible-extract's last-number rule), the diagnostic task
+`gsm8k_boxed` (`scripts/lm_eval_tasks/`, run with `TASKS=gsm8k_boxed`) adds a
+`boxed-first` filter reading the *first* `\boxed{}`/`####` answer. Use it only to
+decompose "format/stopping artifact vs math ability" — never as the headline number,
+since it isn't comparable with anyone else's published GSM8K results.
+
+## TriviaQA and stop-string trimming
+
+`triviaqa` (built-in lm-eval task, 17,944 validation questions, closed-book) joined the
+`default`/`default_base`/`smoke` presets in 2026-08 as a second generative benchmark. It
+probes factual recall rather than reasoning, and its size makes 2-3pt deltas resolvable
+in a single run (SE ~0.4pt). Unlike GSM8K it is scored by `exact_match` of the whole
+generation against the alias list — no extraction regex — which is why the adapter now
+cuts generated text at the first stop-string occurrence (lm-eval's contract; the
+pre-2026-08 adapter returned the stop string and, in compressed mode, any hyper-token
+expansion overshoot behind it). The tail would systematically depress text-scored
+metrics. It was invisible to GSM8K's first-match filters (`strict-match`, `boxed-first`),
+but `flexible-extract` takes the LAST number, so a re-run of an old checkpoint can score
+a sample differently wherever the discarded tail happened to contain a match (digits are
+impossible in the overshoot of digit-protected checkpoints, but `[$.,]` runs still count)
+— treat trimmed vs untrimmed `flexible-extract` as a comparability boundary rather than
+assuming bit-equality. `--legacy_untrimmed_stops` (env: `LEGACY_UNTRIMMED_STOPS=1` for
+`eval_ckpt_rcp.sh`) restores the old per-request returns bit-exactly; reproducing a full
+pre-2026-08 results artifact also needs the old 7-task list pinned via `TASKS=...`, since
+the presets now include triviaqa and the run-global `eval/*_compression_ratio` aggregates
+absorb every task in the run. The results JSON records the effective setting as
+`trim_stop_strings` in `args`.
+
+## Eval-log health checks
+
+Grep every eval log before trusting its numbers (each line guards a past bug):
+
+```
+disabled_ids (14): [0, 1, 2, 32000, ...]   # chat specials protected from LZW merging
+folded LoRA into 224 linear layers          # decoder weights actually loaded
+# and the ABSENCE of:
+Casting complex values to real              # would mean RoPE destroyed at load
+```
+
+For digit-protected evals (`--disable_digit_ids` / `DISABLE_DIGIT_IDS=1`, matching
+checkpoints trained with the same flag — the canonical recipe since v0.4) the
+first line reads `disabled_ids (24)` instead, preceded by
+`digit ids disabled for LZW (10): [...]` — that pair is the expected health
+signature, not a bug. The adapter auto-enables digit protection when the
+checkpoint's meta.pt records it (and logs that it did), so a forgotten flag
+cannot silently evaluate a digitsafe checkpoint in the wrong distribution; the
+results JSON records the effective setting.
+
+For an untied-hyper-encoder checkpoint (`UNTIED_HYPER_ENCODER=1`, experimental)
+the adapter additionally logs `untied hyper-encoder: building separate output
+encoder` — same self-healing pattern: it rebuilds the untied model from the
+checkpoint's meta.pt and hard-fails if the `hyper_output.*` weights are missing,
+so an untied checkpoint can never be silently scored as tied.
+
+Two more meta.pt-driven lines, both behavior-only settings that no state-dict key
+could restore:
+
+- `base-token RoPE positions: enabled from meta.pt` — for a v0.6.2+ checkpoint
+  (`BASE_TOKEN_POSITIONS=1`). Expected on every compressed eval of such a
+  checkpoint; its absence means the eval positioned tokens by compressed index
+  instead of base index, i.e. a geometry the checkpoint never trained on. Base-mode
+  evals are unaffected either way (an uncompressed stream is `arange` regardless).
+- `two-axis RoPE: enabled from meta.pt` — additionally required for a v0.7
+  checkpoint. It confirms that even complex pairs use base-stream positions and
+  odd pairs use compressed-token positions in every decoder layer. The results
+  JSON records `base_token_positions` and `two_axis_rope`, and the pipeline
+  audits the latter when `RECIPE=v0.7`.
+- `gated compressed-coordinate RoPE: enabled ... from meta.pt` — required for a v0.7.1
+  checkpoint. It confirms that the learned compressed-coordinate delta was
+  restored and reports its first active decoder layer and frequency pair (0 and
+  32 for the named recipe). Results JSON records `gated_compressed_rope`,
+  `gated_rope_start_layer`, and `gated_rope_start_pair`; the pipeline audits all
+  three after every smoke, final, and WikiText evaluation.
+- `hyper-encoder residual: disabled from meta.pt` — for a checkpoint trained with
+  `NO_ENCODER_RESIDUAL=1` (an ablation; no production run uses it). This is the one
+  line that appears only in the *non-default* case, so its absence is normal and
+  healthy — do not grep for it expecting a hit. It exists because the residual is a
+  plain runtime attribute with no weight signature: before it was restored from
+  meta.pt, a no-residual checkpoint was silently scored *with* the residual, which
+  changes the composed hypertoken embedding by exactly the first-token term.
+  `scripts/inference.py` logs the same thing as `[inference] hyper-encoder
+  residual: disabled from meta.pt`.
+- `decoder-time online codebook mask: enabled from meta.pt (active in this
+  eval)` — for a v0.6.5 checkpoint in compressed mode. Teacher-forced scoring
+  replays the same incremental Rust decoder as generation and masks every
+  uninstalled row. The results JSON records both the checkpoint flag
+  (`online_codebook_mask`) and whether it was active in this evaluation
+  (`online_codebook_mask_active`); the pipeline audits both. Rare legal
+  unknown-next-row targets that the current generator cannot represent are
+  excluded only for rolling perplexity and counted as
+  `compression.online_skipped_targets`. Request-based `loglikelihood` scoring
+  (including MC) fails loudly if one occurs in the continuation: skipping a
+  negative term would bias the option score and could also corrupt
+  `is_greedy`.
+
+The v0.6.4 encoder zero-init (`ZERO_INIT_ENCODER_OUTPUT=1`) deliberately has **no**
+eval health line: it only changes the initial weights, which the checkpoint load
+overwrites, so it cannot affect eval. Its counterpart lives in the *training* log
+as `[encoder_zero_init] zeroed={...}`.
+
+GSM8K generation already used the incremental dictionary before v0.6.5, so its
+paired delta isolates the effect of training with the corrected vocabulary.
+Compressed MC and perplexity use teacher forcing: their v0.6.5 deltas combine
+the weight change with exact-mask renormalization. For rolling perplexity, the
+very rare excluded targets still contribute bytes to lm-eval's external
+denominator, so inspect and report `online_skipped_targets`. A successful MC
+evaluation has zero skipped continuation targets by construction; otherwise
+the adapter aborts before reporting a score.
+
+Exact decoder replay currently performs one Rust manager update per compressed
+input token from a Python loop. The results JSON records total task time as
+`eval_wall_seconds`, plus replay requests, tokens, total seconds, milliseconds
+per request, and microseconds per token under
+`compression.online_replay_*`. Before a full v0.6.5 evaluation, time one
+complete MC task and compare both wall-clock and these counters with the same
+task under the historical mask.
+
+Generation-mode runs should show `gen_compression_ratio ≈ 1.4` (a healthy model
+emits hyper-tokens; ~1.0 means it never does). Before any full eval of a new
+checkpoint, run the 15-minute sanity gate `scripts/diagnose_ckpt_rcp.sh` (train-style
+replay must land near the run's final W&B `loss`).
+
+## Backfilling W&B for runs executed with WANDB=0
+
+`scripts/log_results_to_wandb.py` uploads a results JSON (metrics, compression,
+eval args) as a W&B run, with `--notes` for the RCP log paths and `--log` to attach
+the printed per-task sample blocks as a table.
 
 ## Per-sample logging
 

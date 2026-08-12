@@ -1,0 +1,64 @@
+# GSM8K with a boxed-aware answer filter, for zip2zip models.
+#
+# Why: models finetuned on the zip2zip-1B mix answer in NuminaMath style
+# ("$\boxed{42}$"), never "#### 42", so lm-eval's strict-match is a format
+# lottery; and models that don't emit an end-of-text after the answer keep
+# generating a fabricated next problem, whose numbers poison flexible-extract
+# (it takes the LAST number in the output). The boxed-first filter reads the
+# FIRST \boxed{...} or "#### N" — the model's intended answer — and is immune
+# to both artifacts. Verified against the step_8000 repro and released-v0.1
+# sample generations (finds an answer 10/10 vs flexible's bleed-poisoned
+# extraction). strict/flexible are kept so one run reports all three.
+#
+# Identical prompts/generation settings to the stock gsm8k task, so accuracy
+# numbers differ only in answer extraction.
+tag:
+  - math_word_problems
+task: gsm8k_boxed
+dataset_path: gsm8k
+dataset_name: main
+output_type: generate_until
+training_split: train
+fewshot_split: train
+test_split: test
+doc_to_text: "Question: {{question}}\nAnswer:"
+doc_to_target: "{{answer}}"
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+    ignore_case: true
+    ignore_punctuation: false
+    regexes_to_ignore:
+      - ","
+      - "\\$"
+      - "(?s).*#### "
+      - "\\.$"
+generation_kwargs:
+  until:
+    - "Question:"
+    - "</s>"
+    - "<|im_end|>"
+  do_sample: false
+  temperature: 0.0
+repeats: 1
+num_fewshot: 5
+filter_list:
+  - name: "boxed-first"
+    filter:
+      - function: "regex"
+        regex_pattern: "\\\\boxed\\{[^0-9-]*(-?[0-9][0-9.,]*)|#### (-?[0-9][0-9.,]*)"
+      - function: "take_first"
+  - name: "strict-match"
+    filter:
+      - function: "regex"
+        regex_pattern: "#### (\\-?[0-9\\.\\,]+)"
+      - function: "take_first"
+  - name: "flexible-extract"
+    filter:
+      - function: "regex"
+        group_select: -1
+        regex_pattern: "(-?[$0-9.,]{2,})|(-?[0-9]+)"
+      - function: "take_first"
+metadata:
+  version: 1.0

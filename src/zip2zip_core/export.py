@@ -12,8 +12,17 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+from collections.abc import Mapping
 
 import torch
+
+from zip2zip_core.checkpoint import (
+    merge_lora_weights,
+    prepare_inference_state_dict,
+    strip_wrapper_prefixes,
+)
+from zip2zip_core.disabled_ids import compute_disabled_ids
 
 
 # ---------------------------------------------------------------------------
@@ -28,40 +37,136 @@ def _merge_lora_weights(sd: dict, scaling: float = 1.0) -> dict:
     `scaling` must match the training-time LoRA scaling (alpha / rank); see LoRALinear.forward.
     Non-LoRA checkpoints are returned unchanged.
     """
-    if not any("base_layer" in k for k in sd):
-        return sd
-
-    lora_suffixes = (".base_layer.weight", ".lora_A.weight", ".lora_B.weight")
-    merged = {}
-    for k, v in sd.items():
-        if k.endswith(".base_layer.weight"):
-            prefix = k[: -len(".base_layer.weight")]
-            lora_a = sd.get(f"{prefix}.lora_A.weight")
-            lora_b = sd.get(f"{prefix}.lora_B.weight")
-            if lora_a is not None and lora_b is not None:
-                merged[f"{prefix}.weight"] = v + scaling * (lora_b @ lora_a)
-            else:
-                merged[f"{prefix}.weight"] = v
-        elif not any(k.endswith(s) for s in lora_suffixes):
-            merged[k] = v
-    return merged
+    normalized = strip_wrapper_prefixes(sd)
+    return merge_lora_weights(normalized, scaling=scaling)
 
 
 def _lora_scaling_from_meta(ckpt_dir: str) -> float:
-    """Read LoRA scaling (alpha / rank) from the checkpoint's meta.pt, default 1.0.
-
-    Falls back to 1.0 when meta.pt is missing or the run was not LoRA (rank is None/0).
-    """
+    """Read LoRA scaling (alpha / rank) from the checkpoint's meta.pt."""
     meta_pt = os.path.join(ckpt_dir, "meta.pt")
     if not os.path.exists(meta_pt):
-        return 1.0
+        raise FileNotFoundError(
+            f"required checkpoint metadata is missing: {meta_pt}"
+        )
     meta = torch.load(meta_pt, map_location="cpu", weights_only=False)
     train_args = meta.get("args", {}) if isinstance(meta, dict) else {}
     rank = train_args.get("lora_rank")
     alpha = train_args.get("lora_alpha")
-    if rank and alpha:
+    if rank:
+        if not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+            raise ValueError(f"invalid lora_rank in {meta_pt}: {rank!r}")
+        if alpha is None:
+            raise ValueError(
+                f"LoRA checkpoint metadata {meta_pt} has lora_rank={rank} "
+                "but no lora_alpha"
+            )
         return float(alpha) / float(rank)
     return 1.0
+
+
+def _train_args_from_meta(ckpt_dir: str) -> Mapping[str, object]:
+    """Load the training arguments needed for strict checkpoint conversion."""
+    meta_pt = os.path.join(ckpt_dir, "meta.pt")
+    if not os.path.exists(meta_pt):
+        raise FileNotFoundError(
+            f"required checkpoint metadata is missing: {meta_pt}; export "
+            "cannot safely reconstruct behavior-only model settings"
+        )
+    meta = torch.load(meta_pt, map_location="cpu", weights_only=False)
+    if not isinstance(meta, dict):
+        raise ValueError(f"checkpoint metadata {meta_pt} must be a dictionary")
+    train_args = meta.get("args")
+    if not isinstance(train_args, Mapping) or not train_args:
+        raise ValueError(
+            f"checkpoint args in {meta_pt} must be a non-empty mapping"
+        )
+    return train_args
+
+
+def _prepare_export_state_dict(sd: dict, ckpt_dir: str) -> dict:
+    """Normalize wrappers and fold LoRA using mandatory checkpoint metadata."""
+    return prepare_inference_state_dict(sd, _train_args_from_meta(ckpt_dir))
+
+
+def _encoder_residual_from_meta(ckpt_dir: str) -> bool:
+    """Restore the encoder's behavior-only residual setting."""
+    return not bool(
+        _train_args_from_meta(ckpt_dir).get("no_encoder_residual", False)
+    )
+
+
+def refuse_base_token_positions(ckpt_dir: str) -> None:
+    """Hard-fail on exporting unsupported decoder RoPE position schemes.
+
+    The ext/zip2zip HF runtime assigns one RoPE position per compressed token;
+    a checkpoint trained with base-space or two-axis positions would load fine
+    and silently score with the wrong geometry. Export support is a separate task.
+    """
+    train_args = _train_args_from_meta(ckpt_dir)
+    if train_args and train_args.get("gated_compressed_rope"):
+        raise NotImplementedError(
+            "this checkpoint was trained with --gated_compressed_rope; the "
+            "ext/zip2zip HF runtime has no gated compressed-coordinate RoPE "
+            "path, so an export would silently compute wrong attention "
+            "geometry. Evaluate it through the in-core adapter instead."
+        )
+    if train_args and train_args.get("two_axis_rope"):
+        raise NotImplementedError(
+            "this checkpoint was trained with --two_axis_rope; the ext/zip2zip "
+            "HF runtime has no two-axis RoPE path, so an export would silently "
+            "compute wrong attention geometry. Evaluate it through the in-core "
+            "adapter instead."
+        )
+    if train_args and train_args.get("base_token_positions"):
+        raise NotImplementedError(
+            "this checkpoint was trained with --base_token_positions; the "
+            "ext/zip2zip HF runtime has no base-position path, so an export "
+            "would silently compute wrong attention geometry. Evaluate it "
+            "through the in-core adapter instead."
+        )
+
+
+def _disable_digit_ids_from_meta(ckpt_dir: str) -> bool:
+    """Read whether TRAINING protected digits from LZW merges (meta.pt's
+    --disable_digit_ids). Exported disabled_ids must match this or the export
+    silently merges digits the model never saw as hyper-tokens in training —
+    the same mismatch class as the chat-token bug, for digits instead."""
+    train_args = _train_args_from_meta(ckpt_dir)
+    return bool(train_args.get("disable_digit_ids"))
+
+
+def _resolve_encoder_n_heads(ckpt_dir: str, hidden_size: int, explicit: int | None) -> int:
+    """Determine the encoder head count that TRAINING actually used.
+
+    Priority:
+      1. `explicit` — the caller's --encoder_n_heads override
+      2. meta.pt train args (`encoder_n_heads`, the value train.py was invoked with)
+      3. hidden_size // 64 (legacy guess — last resort)
+
+    Guessing hidden_size // 64 unconditionally is WRONG whenever head_dim != 64.
+    E.g. Phi-3.5-mini trains the encoder with encoder_dim=3072, encoder_n_heads=32
+    -> head_dim=96, but //64 yields 48, so the exported encoder would reshape QKV
+    into 48x64 instead of 32x96 and compute a different attention at inference.
+    """
+    n_heads, source = None, None
+    if explicit is not None:
+        n_heads, source = explicit, "explicit --encoder_n_heads"
+    else:
+        train_args = _train_args_from_meta(ckpt_dir)
+        val = train_args.get("encoder_n_heads")
+        if isinstance(val, int) and val > 0:
+            n_heads, source = val, "meta.pt train args"
+        if n_heads is None:
+            n_heads, source = hidden_size // 64, "hidden_size // 64 (legacy fallback)"
+
+    if n_heads <= 0 or hidden_size % n_heads != 0:
+        raise ValueError(
+            f"Resolved encoder num_heads={n_heads} (from {source}) does not divide "
+            f"encoder hidden_size={hidden_size}. Pass a correct --encoder_n_heads or "
+            f"check meta.pt."
+        )
+    print(f"  encoder num_heads={n_heads} (head_dim={hidden_size // n_heads}, from {source})")
+    return n_heads
 
 
 def _infer_llama_heads(sd: dict) -> tuple[int, int]:
@@ -104,18 +209,24 @@ def _infer_encoder_config(sd: dict) -> dict:
     )
 
 
-def _split_state_dict(sd: dict) -> tuple[dict, dict]:
-    """Split into (decoder_sd, encoder_sd)."""
-    decoder, encoder = {}, {}
-    skip_prefixes = ("token_type_head.", "hyper_output.")
+def _split_state_dict(sd: dict) -> tuple[dict, dict, dict]:
+    """Split into (decoder_sd, input_encoder_sd, output_encoder_sd).
+
+    output_encoder_sd is non-empty only for untied checkpoints (hyper_output.*);
+    the caller writes output_encoder.* and sets tie_encoders=False accordingly,
+    matching the ext/zip2zip runtime which loads input_encoder.*/output_encoder.*.
+    """
+    decoder, input_enc, output_enc = {}, {}, {}
     for k, v in sd.items():
         if k.startswith("hyper_encoder."):
-            encoder[k[len("hyper_encoder."):]] = v
-        elif any(k.startswith(p) for p in skip_prefixes):
+            input_enc[k[len("hyper_encoder."):]] = v
+        elif k.startswith("hyper_output."):
+            output_enc[k[len("hyper_output."):]] = v
+        elif k.startswith("token_type_head."):
             pass  # not used by ext/zip2zip
         else:
             decoder[k] = v
-    return decoder, encoder
+    return decoder, input_enc, output_enc
 
 
 def _make_llama_config(model_config_name: str | None, sd: dict):
@@ -155,6 +266,47 @@ def _make_llama_config(model_config_name: str | None, sd: dict):
     return cfg
 
 
+def _validate_hf_decoder_state_dict(sd: dict, n_layers: int) -> None:
+    """Reject incomplete or architecture-mismatched decoder exports."""
+    if not isinstance(n_layers, int) or isinstance(n_layers, bool) or n_layers <= 0:
+        raise ValueError(f"decoder n_layers must be a positive integer, got {n_layers!r}")
+
+    expected = {
+        "model.embed_tokens.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+    }
+    per_layer = (
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "mlp.gate_proj.weight",
+        "mlp.up_proj.weight",
+        "mlp.down_proj.weight",
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+    )
+    for layer_id in range(n_layers):
+        expected.update(
+            f"model.layers.{layer_id}.{suffix}" for suffix in per_layer
+        )
+
+    actual = set(sd)
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"missing={missing[:8]}")
+        if unexpected:
+            details.append(f"unexpected={unexpected[:8]}")
+        raise ValueError(
+            "incomplete or architecture-mismatched decoder checkpoint: "
+            + "; ".join(details)
+        )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -167,7 +319,8 @@ def export(
     encoder_n_heads: int | None = None,
     max_codebook_size: int = 4096,
     disabled_ids: list[int] | None = None,
-    residual: bool = True,
+    disable_digit_ids: bool | None = None,
+    residual: bool | None = None,
     causal: bool = False,
 ):
     """Export a zip2zip-core checkpoint to ext/zip2zip HF format.
@@ -177,24 +330,36 @@ def export(
         output_dir: Destination directory for ext/zip2zip format
         base_model: HuggingFace base model name (e.g. meta-llama/Llama-3.2-1B-Instruct)
         model_config: zip2zip-core model config key (e.g. '1B'). Auto-detected if None.
-        encoder_n_heads: Number of encoder attention heads. Inferred as hidden_size // 64 if None.
+        encoder_n_heads: Number of encoder attention heads. Resolved from meta.pt train
+            args if None, falling back to hidden_size // 64 only as a last resort.
         max_codebook_size: Max codebook size (default 4096)
-        disabled_ids: Token IDs to disable for LZW. Loaded from tokenizer if None.
-        residual: Use residual connection in encoder (default True)
+        disabled_ids: Explicit token IDs to disable for LZW. If None (the normal
+            case), derived from the base_model tokenizer via
+            zip2zip_core.disabled_ids, honoring disable_digit_ids.
+        disable_digit_ids: Whether digits were protected from LZW merges during
+            training. If None, auto-detected from meta.pt's --disable_digit_ids
+            (self-healing, same pattern as lm_eval_adapter.py) — passing an
+            explicit disabled_ids list skips this entirely.
+        residual: Use residual connection in encoder. If None, restore the
+            checkpoint's behavior-only setting from meta.pt.
         causal: Use causal masking in encoder (default False)
     """
     os.makedirs(output_dir, exist_ok=True)
 
     # ---- Load checkpoint -----------------------------------------------
+    refuse_base_token_positions(ckpt_dir)
     model_pt = os.path.join(ckpt_dir, "model.pt")
     print(f"Loading {model_pt} ...")
     sd = torch.load(model_pt, map_location="cpu", weights_only=True)
-    lora_scaling = _lora_scaling_from_meta(ckpt_dir)
     if any("base_layer" in k for k in sd):
-        print(f"  Merging LoRA adapters with scaling=alpha/rank={lora_scaling:g}")
-    sd = _merge_lora_weights(sd, lora_scaling)
+        print("  Merging LoRA adapters with scaling=alpha/rank from meta.pt")
+    sd = _prepare_export_state_dict(sd, ckpt_dir)
+    if residual is None:
+        residual = _encoder_residual_from_meta(ckpt_dir)
+        print(f"  encoder residual={residual} (from meta.pt)")
 
-    decoder_sd, encoder_sd = _split_state_dict(sd)
+    decoder_sd, encoder_sd, output_encoder_sd = _split_state_dict(sd)
+    untied = bool(output_encoder_sd)
     enc_info = _infer_encoder_config(sd)
 
     vocab_size = sd["tok_embeddings.weight"].shape[0]
@@ -209,6 +374,7 @@ def export(
     from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
     adapter = Llama3StateDictAdapter(llama_cfg, None)
     hf_decoder_sd = adapter.to_hf(decoder_sd)
+    _validate_hf_decoder_state_dict(hf_decoder_sd, llama_cfg.n_layers)
 
     # ---- Save model.safetensors ----------------------------------------
     try:
@@ -225,20 +391,34 @@ def export(
     # ---- Save encoders.safetensors -------------------------------------
     encoders_out = os.path.join(output_dir, "encoders.safetensors")
     print(f"Saving {encoders_out} ...")
-    # Wrap as input_encoder.*; tie_encoders=True so no output_encoder needed
+    # input_encoder.* always; output_encoder.* only when untied (tie_encoders
+    # is then False and the ext runtime scores logits with the output encoder).
     enc_prefixed = {f"input_encoder.{k}": v.contiguous() for k, v in encoder_sd.items()}
+    if untied:
+        enc_prefixed.update(
+            {f"output_encoder.{k}": v.contiguous() for k, v in output_encoder_sd.items()}
+        )
+    print(f"  tie_encoders={not untied} (input_encoder + "
+          f"{'output_encoder' if untied else 'no output_encoder'})")
     save_file(enc_prefixed, encoders_out)
 
     # ---- Build zip2zip_config.json -------------------------------------
-    n_heads = encoder_n_heads or (enc_info["hidden_size"] // 64)
+    n_heads = _resolve_encoder_n_heads(ckpt_dir, enc_info["hidden_size"], encoder_n_heads)
 
     if disabled_ids is not None:
         initial_vocab_size = vocab_size
     else:
+        if disable_digit_ids is None:
+            disable_digit_ids = _disable_digit_ids_from_meta(ckpt_dir)
+            if disable_digit_ids:
+                print("  checkpoint was trained with digit-protected LZW (meta.pt) "
+                      "— auto-enabling digit protection for export")
         print(f"Loading tokenizer from {base_model} to compute disabled_ids ...")
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(base_model)
-        disabled_ids = list(tok.get_added_vocab().values())
+        disabled_ids = compute_disabled_ids(
+            tok, len(tok), disable_digit_ids=disable_digit_ids
+        )
         initial_vocab_size = len(tok)
         print(f"  initial_vocab_size={initial_vocab_size}, disabled_ids count={len(disabled_ids)}")
         print(f"Saving tokenizer to {output_dir} ...")
@@ -255,7 +435,7 @@ def export(
             "num_heads": n_heads,
             "causal": causal,
             "residual": residual,
-            "tie_encoders": True,
+            "tie_encoders": not untied,
             "position_encoding": None,
         },
         "compression": {
@@ -270,6 +450,13 @@ def export(
     print(f"Saving {config_out} ...")
     with open(config_out, "w") as f:
         json.dump(config, f, indent=2)
+
+    # Carry meta.pt along so check_export_consistency.py has train_args to
+    # compare against -- without this it silently "passes" with nothing checked.
+    meta_src = os.path.join(ckpt_dir, "meta.pt")
+    if os.path.exists(meta_src):
+        shutil.copy(meta_src, os.path.join(output_dir, "meta.pt"))
+        print(f"  copied meta.pt (for check_export_consistency.py)")
 
     print("\nDone. Output:")
     for fn in ("zip2zip_config.json", "model.safetensors", "encoders.safetensors"):

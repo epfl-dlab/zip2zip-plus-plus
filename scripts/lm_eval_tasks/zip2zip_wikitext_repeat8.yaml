@@ -1,0 +1,31 @@
+# Token-aware repeated-window WikiText stress test with eight repeated copies.
+#
+# This task is intentionally absent from every default preset and pipeline.
+# Build its local JSONL first (from the repository root):
+#
+#   python scripts/build_repeated_wikitext.py --repeat_n 8 \
+#     --output ../datasets/wikitext-repeat8-phi35/test.jsonl
+#
+# Every row is at most 1000 base tokens, so the existing 1024-token perplexity
+# preset scores it in one rolling window and one freshly initialized LZW state.
+task: zip2zip_wikitext_repeat8
+dataset_path: json
+dataset_kwargs:
+  data_files:
+    test: ../datasets/wikitext-repeat8-phi35/test.jsonl
+test_split: test
+output_type: loglikelihood_rolling
+doc_to_text: ""
+doc_to_target: !function utils.doc_to_target
+process_results: !function utils.repeated_wikitext_process_results
+should_decontaminate: false
+metric_list:
+  - metric: word_perplexity
+  - metric: byte_perplexity
+  - metric: bits_per_byte
+metadata:
+  version: 1.0
+  protocol: repeated_token_block
+  expected_tokenizer: microsoft/Phi-3.5-mini-instruct
+  repeat_n: 8
+  max_base_tokens_per_row: 1000

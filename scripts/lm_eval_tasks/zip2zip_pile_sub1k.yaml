@@ -1,0 +1,25 @@
+# Pinned 1000-document subset of zip2zip_pile, for a quick comparable
+# perplexity (~minutes instead of hours). The subset is FIXED: utils.py draws
+# a seeded sample from the pinned corpus size and verifies both the corpus
+# size and a sha256 of the drawn indices, so every run scores exactly the same
+# 1000 documents or fails loudly. Comparable across checkpoints under the
+# subset_ppl/ W&B section; NOT comparable with full-corpus zip2zip_pile
+# numbers under final/.
+task: zip2zip_pile_sub1k
+dataset_path: mit-han-lab/pile-val-backup
+test_split: validation
+process_docs: !function utils.subset_pile_sub1k
+output_type: loglikelihood_rolling
+doc_to_text: ""
+doc_to_target: !function utils.doc_to_target
+should_decontaminate: false
+metric_list:
+  - metric: word_perplexity
+  - metric: byte_perplexity
+  - metric: bits_per_byte
+metadata:
+  version: 1.0
+  parent_task: zip2zip_pile
+  subset_size: 1000
+  subset_seed: 1234
+  pinned_corpus_docs: 214670
