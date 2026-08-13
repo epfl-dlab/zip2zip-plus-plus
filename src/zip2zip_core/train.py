@@ -40,7 +40,13 @@ import torch.nn.functional as F
 
 from zip2zip_core.configs import zip2zip_llama_configs
 from zip2zip_core.checkpoint import strip_wrapper_prefixes
-from zip2zip_core.data import build_dataloader
+from zip2zip_core.data import (
+    DIRECTION_COMPRESS,
+    DIRECTION_DECOMPRESS,
+    TRANSDUCER_DIRECTIONS,
+    build_dataloader,
+    default_transducer_token_ids,
+)
 from zip2zip_core.model import rope_cache_len
 
 torch.set_float32_matmul_precision('high') 
@@ -111,6 +117,20 @@ _VIEW_METRIC_FIELDS = (
     "hyper_type_correct",
     "hyper_type_count",
     "micro_count",
+    # Transducer direction split. Zero for every lm-mode run (the dataloader
+    # emits no direction there), so nothing existing moves: the mixed loss/acc
+    # remain the primary, published-comparable numbers and the objective is
+    # unchanged. Denominators mirror the top-level metrics -- nll per BASE token,
+    # accuracy per target token -- so the split curves can be drawn on the same
+    # axes as `loss` and `acc`.
+    "dir_compress_nll_sum",
+    "dir_compress_base_count",
+    "dir_compress_valid_count",
+    "dir_compress_correct",
+    "dir_decompress_nll_sum",
+    "dir_decompress_base_count",
+    "dir_decompress_valid_count",
+    "dir_decompress_correct",
     # Historical per-rank-microbatch ratios. These preserve the established
     # top-level W&B weighting formula when replay is disabled (minor reduction
     # rounding can differ), and become compressed-only averages when replay is
@@ -170,6 +190,23 @@ def finalize_view_metric_sums(sums: dict[str, float]) -> dict[str, float]:
             if sums["valid_count"]
             else 0.0
         ),
+        # Per-direction transducer metrics. Same denominators as the top-level
+        # pair above, so the two curves are comparable to each other -- which the
+        # mixed number is not, since it blends the directions by target-token
+        # count. All zero outside mode=compress.
+        "compress_dir_loss": ratio("dir_compress_nll_sum", "dir_compress_base_count"),
+        "compress_dir_acc": ratio("dir_compress_correct", "dir_compress_valid_count"),
+        "decompress_dir_loss": ratio(
+            "dir_decompress_nll_sum", "dir_decompress_base_count"
+        ),
+        "decompress_dir_acc": ratio(
+            "dir_decompress_correct", "dir_decompress_valid_count"
+        ),
+        # Share of supervised tokens coming from the compression direction. Not a
+        # constant: it starts near 1/(1+compression_ratio) and drifts as the model
+        # learns to compress, which is exactly what makes the mixed curve awkward
+        # to read.
+        "compress_dir_token_share": ratio("dir_compress_valid_count", "valid_count"),
         "type_loss": ratio("type_nll_sum", "type_count"),
         "type_acc": ratio("type_correct", "type_count"),
         "base_type_acc": ratio("base_type_correct", "base_type_count"),
@@ -687,7 +724,15 @@ def validate_resume_args(resume_dir, args):
             # other two change what the objective is and what the codebook means.
             "lora_alpha", "hyper_causal_mask", "no_remap_codebook",
             "hyper_encoder_type", "encoder_dim", "encoder_n_layers",
-            "encoder_n_heads", "encoder_intermediate_size")
+            "encoder_n_heads", "encoder_intermediate_size",
+            # Swapping a transducer marker mid-lineage flips which half of the
+            # sequence carries the loss; the run continues with no error while
+            # learning a different task. Absent from a pre-Phi meta.pt means the
+            # lineage predates the args, and the loop below skips unknown keys.
+            # `direction` belongs here for the same reason and more bluntly: a
+            # resume that flips it continues a compression model on the
+            # decompression task with the step counter and LR schedule intact.
+            "compress_token_id", "decompress_token_id", "direction")
     if (
         float(prev.get("base_view_replay_prob", 0.0) or 0.0) > 0.0
         or float(getattr(args, "base_view_replay_prob", 0.0) or 0.0) > 0.0
@@ -718,6 +763,10 @@ def validate_resume_args(resume_dir, args):
         "no_encoder_residual": False,
         "token_type_loss_weight": 0.0,
         "online_codebook_mask": False,
+        # Every lineage that predates --direction was trained on the 50/50 mix,
+        # so absence means "both": resuming one of those as a single-direction
+        # run is caught instead of silently switching the task mid-lineage.
+        "direction": "both",
     }
     # Legacy metas record None for the encoder_* args (they predate the
     # effective-value resolution at startup): unknown is not a conflict there,
@@ -1109,6 +1158,24 @@ def main():
                         help="wandb resume mode. Use 'must' with --wandb_id to continue a previous run.")
     parser.add_argument("--mode", type=str, default="lm", choices=["lm", "compress"],
                         help="Training mode: 'lm' for language modeling, 'compress' for compression/decompression task")
+    parser.add_argument("--direction", type=str, default="both",
+                        choices=list(TRANSDUCER_DIRECTIONS),
+                        help="Which transducer direction a --mode compress run trains on. "
+                             "'compress' (base -> compressed) and 'decompress' "
+                             "(compressed -> base) train a SINGLE-direction model, so the "
+                             "run's loss is that direction's loss with nothing to "
+                             "disentangle. 'both' is the historical 50/50 mix that "
+                             "reproduces the published Llama sweep, and blends two tasks "
+                             "weighted by their differing target-token counts.")
+    parser.add_argument("--compress_token_id", type=int, default=None,
+                        help="Token id marking the compressed half of a --mode compress "
+                             "sequence. Default: the lowest unused reserved special-token "
+                             "slot of --tokenizer (128002 for Llama 3, 32002 for Phi-3.5), "
+                             "so the historical Llama runs are reproduced unchanged.")
+    parser.add_argument("--decompress_token_id", type=int, default=None,
+                        help="Token id marking the uncompressed half of a --mode compress "
+                             "sequence. Default: the second-lowest such slot (128003 for "
+                             "Llama 3, 32003 for Phi-3.5).")
     parser.add_argument("--no_remap_codebook", action="store_true",
                         help="Disable compact codebook remapping (ablation: use full codebook with original hyper IDs)")
     parser.add_argument("--hyper_causal_mask", action="store_true",
@@ -1165,6 +1232,14 @@ def main():
         # overlap the next compressed window (double exposure). Untested
         # combination: forbid it instead of silently changing semantics.
         parser.error("--lossless_windows is incompatible with --base_view_replay_prob")
+    if args.mode != "compress" and (
+        args.compress_token_id is not None or args.decompress_token_id is not None
+    ):
+        parser.error(
+            "--compress_token_id/--decompress_token_id require --mode compress"
+        )
+    if args.mode != "compress" and args.direction != "both":
+        parser.error("--direction requires --mode compress")
     try:
         base_view_replay_microsteps(
             1,
@@ -1220,6 +1295,24 @@ def main():
                "encoder_intermediate_size"):
         if getattr(args, _f) is None:
             setattr(args, _f, getattr(_cfg_defaults, _f))
+
+    # Same treatment for the transducer markers: resolve them here so meta.pt
+    # records concrete ids and validate_resume_args can compare them. Swapping a
+    # marker mid-lineage keeps training happily while redefining which half of
+    # the sequence the model is being asked to produce. The module defaults are
+    # Llama-3 slots and are out of range under Phi-3.5-mini, so derive the pair
+    # from --tokenizer unless the run pinned them explicitly.
+    if args.mode == "compress":
+        from transformers import AutoTokenizer as _AutoTokenizerForMarkers
+
+        _compress_default, _decompress_default = default_transducer_token_ids(
+            _AutoTokenizerForMarkers.from_pretrained(args.tokenizer),
+            _cfg_defaults.vocab_size,
+        )
+        if args.compress_token_id is None:
+            args.compress_token_id = _compress_default
+        if args.decompress_token_id is None:
+            args.decompress_token_id = _decompress_default
 
     # Initialize distributed. Generous timeout so the first step's torch.compile
     # (which can take minutes and skews across ranks at large scale) doesn't trip
@@ -1483,6 +1576,17 @@ def main():
               f"pad_token_id={config.pad_token_id} "
               f"disabled_ids={disabled_ids[:6]}{'...' if len(disabled_ids) > 6 else ''} "
               f"({len(disabled_ids)} ids)")
+        if args.mode == "compress":
+            _dir_desc = {
+                "both": "BOTH directions, 50/50 per sample (mixed objective)",
+                "compress": "compression ONLY (base -> compressed)",
+                "decompress": "decompression ONLY (compressed -> base)",
+            }[args.direction]
+            print(f"[data] transducer direction={args.direction}: {_dir_desc}")
+            print(f"[data] transducer markers: compress={args.compress_token_id} "
+                  f"({_dl_tok.convert_ids_to_tokens(args.compress_token_id)!r}) "
+                  f"decompress={args.decompress_token_id} "
+                  f"({_dl_tok.convert_ids_to_tokens(args.decompress_token_id)!r})")
 
     # Dataset and dataloader
     dataloader = build_dataloader(
@@ -1506,6 +1610,15 @@ def main():
         ),
         debug_samples=max(0, args.debug_first_steps * max(1, args.gradient_accumulation_steps)),
         lossless_windows=args.lossless_windows,
+        **(
+            {
+                "compress_token_id": args.compress_token_id,
+                "decompress_token_id": args.decompress_token_id,
+                "direction": args.direction,
+            }
+            if args.mode == "compress"
+            else {}
+        ),
     )
 
     # Reposition the data stream to match the checkpoint. Must happen here: the
@@ -1913,6 +2026,14 @@ def main():
             labels = (
                 input_dict["base_labels"] if use_base_view else labels
             ).to(device)
+            # Transducer direction per sample (compress mode only). Absent in lm
+            # mode, and meaningless for a base-view replay microbatch, which is
+            # an uncompressed CLM window rather than a transducer sample.
+            direction = input_dict.get("direction")
+            if direction is not None and not use_base_view:
+                direction = direction.to(device)
+            else:
+                direction = None
             _debug_rank_log(
                 debug_enabled,
                 rank,
@@ -2059,6 +2180,32 @@ def main():
                     view_sums["compat_relaxed_hyper_acc_sum"] += (
                         relaxed_n / hyper_n
                     )
+                if direction is not None:
+                    # Split the same raw counts by direction -- reporting only,
+                    # the backward pass above already happened on the mixed
+                    # objective. per_token_loss is zero at ignored positions, and
+                    # per_token_loss[valid_mask] lines up index-for-index with
+                    # valid_preds / valid_labels.
+                    valid_dirs = direction.repeat_interleave(labels.shape[1])[valid_mask]
+                    valid_loss = per_token_loss[valid_mask]
+                    for tag, want in (
+                        ("compress", DIRECTION_COMPRESS),
+                        ("decompress", DIRECTION_DECOMPRESS),
+                    ):
+                        sel = valid_dirs == want
+                        n_sel = int(sel.sum().item())
+                        if not n_sel:
+                            continue
+                        view_sums[f"dir_{tag}_nll_sum"] += float(
+                            valid_loss[sel].sum().item()
+                        )
+                        view_sums[f"dir_{tag}_valid_count"] += n_sel
+                        view_sums[f"dir_{tag}_base_count"] += int(
+                            n_base_tokens[direction == want].sum().item()
+                        )
+                        view_sums[f"dir_{tag}_correct"] += int(
+                            (valid_preds[sel] == valid_labels[sel]).sum().item()
+                        )
             if use_token_type_head:
                 with torch.no_grad():
                     type_preds = (valid_type_logits > 0).float()
@@ -2227,6 +2374,21 @@ def main():
                     f"compression={compressed_metrics['compat_compression_legacy']:.2f} | "
                     f"target_compression={compressed_metrics['compat_compression_target']:.2f} | "
                 )
+                # Report a direction only when this window actually contained it.
+                # A single-direction run would otherwise print a constant 0 for
+                # the other side, which reads as a perfect loss / zero accuracy
+                # rather than as "not trained on".
+                if args.mode == "compress":
+                    if compressed_sums["dir_compress_valid_count"]:
+                        log_msg += (
+                            f"c_loss={compressed_metrics['compress_dir_loss']:.4f} | "
+                            f"c_acc={compressed_metrics['compress_dir_acc']:.4f} | "
+                        )
+                    if compressed_sums["dir_decompress_valid_count"]:
+                        log_msg += (
+                            f"d_loss={compressed_metrics['decompress_dir_loss']:.4f} | "
+                            f"d_acc={compressed_metrics['decompress_dir_acc']:.4f} | "
+                        )
                 if use_token_type_head:
                     log_msg += (
                         f"type_loss={compressed_metrics['compat_type_loss']:.4f} | "
@@ -2359,6 +2521,40 @@ def main():
                             log_dict[f"compressed/{key}"] = compressed_metrics[
                                 key
                             ]
+                    if args.mode == "compress":
+                        # Additive namespace: the top-level `loss`/`acc` are
+                        # untouched. For a single-direction run these simply
+                        # restate them under a name that says which task it was,
+                        # which is what makes runs of the two directions safe to
+                        # put on one plot. Only directions actually present are
+                        # logged, so the absent side is a gap rather than a
+                        # constant-0 line.
+                        if compressed_sums["dir_compress_valid_count"]:
+                            log_dict.update(
+                                {
+                                    "direction/compress_loss": compressed_metrics[
+                                        "compress_dir_loss"
+                                    ],
+                                    "direction/compress_acc": compressed_metrics[
+                                        "compress_dir_acc"
+                                    ],
+                                }
+                            )
+                        if compressed_sums["dir_decompress_valid_count"]:
+                            log_dict.update(
+                                {
+                                    "direction/decompress_loss": compressed_metrics[
+                                        "decompress_dir_loss"
+                                    ],
+                                    "direction/decompress_acc": compressed_metrics[
+                                        "decompress_dir_acc"
+                                    ],
+                                }
+                            )
+                        if args.direction == "both":
+                            log_dict["direction/compress_token_share"] = (
+                                compressed_metrics["compress_dir_token_share"]
+                            )
                     if args.online_codebook_mask:
                         log_dict["online_skipped_targets"] = online_skipped_value
                         log_dict["online_skipped_target_rate"] = online_skip_rate
