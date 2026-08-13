@@ -125,6 +125,13 @@
 #                     a flag mismatch. Runs with different settings are not
 #                     step-comparable — compare on evals. Default off is
 #                     bit-identical to the historical stream.
+#                     MEASURED NEGATIVE 2026-08-13 (paired 8k vs v0.6.4,
+#                     W&B cf9cadi1 vs hh8tkfyg): GSM8K -8.2pt real (McNemar
+#                     p=1e-08), MC flat-to-down, wikitext ppl and generation
+#                     compression worse. The historical ratio>=2.0 skip acts
+#                     as an accidental quality filter — highly compressible
+#                     text is repetitive boilerplate that hurts instruction
+#                     following. KEEP OFF for real runs; diagnostic use only.
 #   FINAL_LIMIT=      per-task sample limit for the FINAL eval (default: full).
 #                     Only for pipeline rehearsals — never for real numbers.
 #   SEED=42           training seed forwarded to train.py.

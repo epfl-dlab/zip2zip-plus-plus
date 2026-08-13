@@ -1008,7 +1008,9 @@ def main():
              "tokens extend their raw input instead of being dropped. Default "
              "off = historical stream, bit-identical. Changes the data stream: "
              "runs with different settings of this flag are not "
-             "step-comparable.",
+             "step-comparable. Measured negative on the paired 8k v0.6.4 run "
+             "(2026-08-13): GSM8K -8.2pt real, ppl and generation compression "
+             "worse — keep off for real runs; diagnostic lever only.",
     )
     parser.add_argument(
         "--base_view_replay_prob",
