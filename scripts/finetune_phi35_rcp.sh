@@ -212,6 +212,8 @@ fi
 # under-filled (compression >= 2x) windows instead of dropping them. Changes
 # the data stream: not step-comparable with runs that leave it off. Default
 # off = historical stream, bit-identical.
+# MEASURED NEGATIVE 2026-08-13 on the paired 8k v0.6.4 run: GSM8K -8.2pt real
+# (p=1e-08), ppl and gen compression worse — keep off; diagnostic lever only.
 LOSSLESS_WINDOWS=${LOSSLESS_WINDOWS:-}
 LOSSLESS_FLAG=""
 if [ -n "$LOSSLESS_WINDOWS" ] && [ "$LOSSLESS_WINDOWS" != "0" ]; then

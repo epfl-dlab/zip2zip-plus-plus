@@ -215,6 +215,10 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         # the emitted (truncated) window, and under-filled windows extend
         # their raw input instead of being dropped. Only _iter_lm changes;
         # "compress" mode ignores the flag.
+        # Measured negative on the paired 8k v0.6.4 run (2026-08-13): GSM8K
+        # -8.2pt real (p=1e-08), ppl and gen compression worse — the legacy
+        # ratio>=2.0 skip is an accidental quality filter. Keep off for real
+        # runs; diagnostic lever only.
         self.lossless_windows = bool(lossless_windows)
         self.max_active_codebook_size = (
             max_codebook_size
