@@ -2,6 +2,7 @@
 
 import os
 import random
+import re
 import time
 from functools import partial
 
@@ -12,10 +13,61 @@ from torch.distributed.checkpoint.stateful import Stateful
 
 from zip2zip_compression import CodebookManager, CompressionConfig, LZWCompressor
 
-# Special tokens for compression/decompression task (unused Llama3 special token slots)
+# Default markers for the compression/decompression task -- unused Llama 3
+# special-token slots (<|reserved_special_token_0/1|>). They are ONLY valid for a
+# Llama-3 vocabulary: under Phi-3.5-mini (vocab_size=32064) both ids are out of
+# range, so a run on another tokenizer must pass its own pair. Derive them with
+# ``default_transducer_token_ids`` rather than hardcoding a second constant here.
 COMPRESS_TOKEN_ID = 128002
 DECOMPRESS_TOKEN_ID = 128003
 LLAMA31_8B_SPECIAL_TOKEN_IDS = tuple(range(128000, 128256))
+
+# Which half of a compress-mode sample carries the loss. Emitted per sample so
+# training can report the two directions separately WITHOUT changing what it
+# optimizes: the objective stays the joint mixed one. A single mixed curve cannot
+# say which direction a model failed to learn, and the mix is not even 50/50 by
+# token count -- the decompression direction supervises `compression_ratio` times
+# more target tokens per sample than the compression direction.
+DIRECTION_COMPRESS = 1    # given base tokens, produce the compressed sequence
+DIRECTION_DECOMPRESS = 0  # given the compressed sequence, produce base tokens
+
+# Which direction(s) a compress-mode run is trained on. "both" is the historical
+# behaviour (one model, 50/50 per sample) and reproduces the published Llama
+# sweep. "compress"/"decompress" train a SINGLE-direction model, which is what
+# makes a run's loss unambiguous: with "both", one curve blends two tasks whose
+# target-token counts differ by the compression ratio, so it cannot say which
+# direction the model actually learned.
+TRANSDUCER_DIRECTIONS = ("both", "compress", "decompress")
+
+# Reserved/unused special-token names across the tokenizers this repo trains on:
+# Llama 3 spells them <|reserved_special_token_N|>, Phi-3.5 <|placeholderN|>.
+_UNUSED_SPECIAL_TOKEN_RE = re.compile(r"^<\|(?:reserved_special_token_|placeholder)\d+\|>$")
+
+
+def default_transducer_token_ids(tokenizer, vocab_size: int) -> tuple[int, int]:
+    """(compress_token_id, decompress_token_id) for ``tokenizer``.
+
+    The transducer task in ``mode=compress`` needs two markers that (a) exist in
+    the model's embedding table and (b) the LZW compressor will never merge into
+    a hyper-token -- otherwise the separator itself gets absorbed into a codebook
+    entry and the task becomes ill-defined. Both tokenizers used here reserve
+    unused special-token slots for exactly this; take the two lowest.
+
+    Returns (128002, 128003) for Llama 3 and (32002, 32003) for Phi-3.5-mini,
+    i.e. the historical Llama defaults are reproduced, not merely approximated.
+    """
+    candidates = sorted(
+        i
+        for name, i in (tokenizer.get_added_vocab() or {}).items()
+        if _UNUSED_SPECIAL_TOKEN_RE.match(name) and 0 <= i < vocab_size
+    )
+    if len(candidates) < 2:
+        raise ValueError(
+            f"tokenizer exposes {len(candidates)} unused reserved special-token slots "
+            f"below vocab_size={vocab_size}, need 2 for the compress/decompress "
+            "markers. Pass --compress_token_id / --decompress_token_id explicitly."
+        )
+    return candidates[0], candidates[1]
 
 
 def _debug_data_log(enabled: bool, rank: int, worker_id: int, message: str):
@@ -138,6 +190,9 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         debug_samples: int = 0,
         include_base_view: bool = False,
         lossless_windows: bool = False,
+        compress_token_id: int = COMPRESS_TOKEN_ID,
+        decompress_token_id: int = DECOMPRESS_TOKEN_ID,
+        direction: str = "both",
     ):
         self.data_dir = data_dir
         self.seq_len = seq_len
@@ -146,6 +201,9 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         self.initial_vocab_size = initial_vocab_size
         self.pad_token_id = pad_token_id
         self.mode = mode
+        self.compress_token_id = compress_token_id
+        self.decompress_token_id = decompress_token_id
+        self.direction = direction
         self.remap_codebook = remap_codebook
         self.online_codebook_mask = online_codebook_mask
         self.include_base_view = include_base_view
@@ -227,6 +285,42 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         # different tokenizer (e.g. Phi-3.5-mini) must pass the matching ids.
         if disabled_ids is None:
             disabled_ids = LLAMA31_8B_SPECIAL_TOKEN_IDS
+
+        if self.mode == "compress":
+            if direction not in TRANSDUCER_DIRECTIONS:
+                raise ValueError(
+                    f"direction={direction!r} must be one of {TRANSDUCER_DIRECTIONS}"
+                )
+            # The markers are ordinary embedding rows, so an id past the base
+            # vocabulary would be read as a hyper-token and gather out of bounds
+            # (a CUDA device-side assert, far from its cause). They must also be
+            # in disabled_ids: an LZW-mergeable separator gets absorbed into a
+            # codebook entry and silently redefines the task.
+            for name, tok_id in (
+                ("compress_token_id", self.compress_token_id),
+                ("decompress_token_id", self.decompress_token_id),
+            ):
+                if not 0 <= tok_id < initial_vocab_size:
+                    raise ValueError(
+                        f"{name}={tok_id} is outside the base vocabulary "
+                        f"[0, {initial_vocab_size}). The Llama-3 defaults "
+                        f"({COMPRESS_TOKEN_ID}, {DECOMPRESS_TOKEN_ID}) do not carry over "
+                        "to another tokenizer -- derive the pair with "
+                        "data.default_transducer_token_ids()."
+                    )
+                if tok_id not in set(disabled_ids):
+                    raise ValueError(
+                        f"{name}={tok_id} is not in disabled_ids, so LZW may merge the "
+                        "task separator into a hyper-token. Derive disabled_ids from "
+                        "zip2zip_core.disabled_ids.compute_disabled_ids()."
+                    )
+            if self.compress_token_id == self.decompress_token_id:
+                raise ValueError(
+                    f"compress_token_id and decompress_token_id are both "
+                    f"{self.compress_token_id}; the two task directions would be "
+                    "indistinguishable to the model."
+                )
+
         self.compressor_args = dict(
             initial_vocab_size=initial_vocab_size,
             max_codebook_size=max_codebook_size,
@@ -693,10 +787,9 @@ class Zip2ZipDataset(IterableDataset, Stateful):
         Loss is only computed on the second part (labels set to -100 for the first part).
         Direction is chosen randomly (50/50) per sample.
 
-        NOTE: unlike _iter_lm this mode has no zero-hypertoken window guard, so
-        under multi-GPU FSDP a rank whose sample has no LZW merges can diverge
-        at the model's codebook gate. No current recipe uses this mode; add the
-        guard before pointing a distributed run at it.
+        The marker ids are per-tokenizer (self.compress_token_id /
+        self.decompress_token_id), not the Llama-3 module constants: under
+        Phi-3.5-mini those constants are past the end of the embedding table.
         """
         vocab = self.initial_vocab_size
         target_total = self.seq_len - 1  # content budget (excluding 2 special tokens)
@@ -755,22 +848,54 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                     base_tokens = list(chunk[:base_count])
                     comp_tokens = list(compressed[:comp_len])
 
-                    # Choose direction randomly
-                    if random.random() < 0.5:
+                    # A single-direction run must NOT consume the RNG: drawing
+                    # here and discarding the result would leave two runs on the
+                    # same seed reading different data.
+                    if self.direction == "both":
+                        compressing = random.random() < 0.5
+                    else:
+                        compressing = self.direction == "compress"
+                    if compressing:
                         # Compression: given base, produce compressed
-                        full = [DECOMPRESS_TOKEN_ID] + base_tokens + [COMPRESS_TOKEN_ID] + comp_tokens
+                        full = (
+                            [self.decompress_token_id]
+                            + base_tokens
+                            + [self.compress_token_id]
+                            + comp_tokens
+                        )
                         loss_start = base_count + 1
                     else:
                         # Decompression: given compressed, produce base
-                        full = [COMPRESS_TOKEN_ID] + comp_tokens + [DECOMPRESS_TOKEN_ID] + base_tokens
+                        full = (
+                            [self.compress_token_id]
+                            + comp_tokens
+                            + [self.decompress_token_id]
+                            + base_tokens
+                        )
                         loss_start = comp_len + 1
 
-                    loss_end = loss_start + (comp_len if full[0] == DECOMPRESS_TOKEN_ID else base_count)
+                    loss_end = loss_start + (comp_len if compressing else base_count)
 
                     # Pad to exactly seq_len + 1 tokens
                     pad_len = (self.seq_len + 1) - len(full)
                     if pad_len > 0:
                         full += [self.pad_token_id] * pad_len
+
+                    # Same hazard as _iter_lm: a window with ZERO hypertokens in
+                    # the INPUT slice leaves this rank's hyper path unused while
+                    # the other ranks take it, and the FSDP collectives deadlock
+                    # until the NCCL watchdog aborts the job. Here the window can
+                    # be hypertoken-free in either direction (LZW found no merge
+                    # inside the budget), so scan exactly what the model branches
+                    # on -- x = full[:-1], after padding.
+                    if self.max_codebook_size > 0 and not any(
+                        t >= vocab for t in full[:-1]
+                    ):
+                        self._debug_log(
+                            f"compress skip zero-hypertoken window shard_idx={shard_idx} "
+                            f"offset={offset - base_count} comp_len={comp_len}"
+                        )
+                        continue
 
                     x = torch.LongTensor(full[:-1])
                     y = torch.LongTensor(full[1:])
@@ -801,6 +926,9 @@ class Zip2ZipDataset(IterableDataset, Stateful):
                         "codebook": cb,
                         "n_base_tokens": base_count,
                         "target_n_base_tokens": base_count,
+                        "direction": (
+                            DIRECTION_COMPRESS if compressing else DIRECTION_DECOMPRESS
+                        ),
                     }, y
 
                 # Shard exhausted: the next one starts at its own beginning.
@@ -1029,6 +1157,22 @@ def remap_collate_fn(batch, pad_token_id, max_subtokens, max_active_codebook_siz
             [inp["base_n_base_tokens"] for inp in inputs_list],
             dtype=torch.long,
         )
+    # Which transducer direction each sample carries (compress mode only; see
+    # DIRECTION_COMPRESS/DIRECTION_DECOMPRESS). The lm path has no direction, so
+    # the key is absent there rather than defaulted to one of the two -- training
+    # reads it to split its reporting and must not be handed a fabricated value.
+    if "direction" in inputs_list[0]:
+        missing_direction = [
+            index for index, inp in enumerate(inputs_list) if "direction" not in inp
+        ]
+        if missing_direction:
+            raise ValueError(
+                "direction must be present on every sample of a batch once any "
+                f"sample has it; missing at batch indices {missing_direction}"
+            )
+        inputs["direction"] = torch.tensor(
+            [inp["direction"] for inp in inputs_list], dtype=torch.long
+        )
     if "codebook_counts" in inputs_list[0]:
         inputs["codebook_counts"] = torch.stack(
             [inp["codebook_counts"] for inp in inputs_list]
@@ -1060,6 +1204,9 @@ def build_dataloader(
     debug_samples: int = 0,
     include_base_view: bool = False,
     lossless_windows: bool = False,
+    compress_token_id: int = COMPRESS_TOKEN_ID,
+    decompress_token_id: int = DECOMPRESS_TOKEN_ID,
+    direction: str = "both",
 ) -> DataLoader:
     """Build a Zip2Zip DataLoader with remapping collation."""
     dataset = Zip2ZipDataset(
@@ -1079,6 +1226,9 @@ def build_dataloader(
         include_base_view=include_base_view,
         debug_samples=debug_samples,
         lossless_windows=lossless_windows,
+        compress_token_id=compress_token_id,
+        decompress_token_id=decompress_token_id,
+        direction=direction,
     )
 
     collate_fn = partial(

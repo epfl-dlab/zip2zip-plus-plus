@@ -51,6 +51,7 @@ Models trained here are exported to zip2zip format via `scripts/zip2zip_hf/expor
 - [Pretraining](docs/pretraining.md) — single-node, multi-node SLURM, curriculum training, W&B logging
 - [Finetuning](docs/finetuning.md) — finetuning from pretrained Llama weights, `--init_from_hf`
 - [Evaluation](docs/evaluation.md) — lm-evaluation-harness, W&B integration
+- [Compression Modeling](docs/compression_modeling.md) — the LZW transducer sweep: task, Phi model ladder, training, sequence-level eval
 - [Inference](docs/inference.md) — HF-based inference via `zip2zip`, torchtitan-based inference (in dev)
 - [Profiling](docs/profiling.md) — profiling training with `torch.profiler`
 - [Export & Interop](docs/export.md) — exporting to zip2zip HF format, state dict mapping, loading

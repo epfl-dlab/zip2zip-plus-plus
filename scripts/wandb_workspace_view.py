@@ -371,6 +371,40 @@ def build_layout() -> list[dict]:
         ),
     ]
 
+    # Only --mode compress runs (the LZW transducer sweep) log these; they are
+    # empty for every lm run, hence a collapsed section of its own rather than
+    # extra lines on the shared loss/accuracy panels.
+    transducer = [
+        line(
+            "loss per direzione",
+            ["direction/compress_loss", "direction/decompress_loss"],
+        ),
+        line(
+            "accuracy per direzione",
+            ["direction/compress_acc", "direction/decompress_acc"],
+        ),
+        line("quota token direzione compress", ["direction/compress_token_share"]),
+    ]
+
+    # scripts/eval_transducer.py: sequence-level scores on held-out data, one
+    # point per checkpoint. Own x-axis (eval/step) because the training run's
+    # step counter has already passed the last checkpoint by the time these are
+    # written back into it.
+    # Keys are scoped by direction because the two directions are different
+    # models in different runs: a shared key would be averaged across them as
+    # soon as runs are grouped.
+    transducer_eval = [
+        line("exact match (sequenza intera)",
+             ["eval/compress/strict_exact_match",
+              "eval/decompress/strict_exact_match"], "eval/step"),
+        line("match dopo espansione in base token",
+             ["eval/compress/relaxed_base_match",
+              "eval/decompress/relaxed_base_match"], "eval/step"),
+        line("token acc (riconciliazione col training)",
+             ["eval/compress/pooled_token_acc",
+              "eval/decompress/pooled_token_acc"], "eval/step"),
+    ]
+
     return [
         {"name": "1 Verdetto finale", "open": True, "panels": verdict},
         {"name": "2 Curve smoke", "open": True, "panels": smoke},
@@ -388,6 +422,8 @@ def build_layout() -> list[dict]:
         {"name": "13 Stderr benchmark", "open": False, "panels": stderr},
         {"name": "14 MC acc non normalizzata", "open": False, "panels": raw_acc},
         {"name": "15 Eval non prefissate (lm-eval)", "open": False, "panels": unprefixed},
+        {"name": "16 Transducer per-direzione (--mode compress)", "open": False, "panels": transducer},
+        {"name": "17 Transducer eval sequence-level (checkpoint)", "open": True, "panels": transducer_eval},
     ]
 
 
