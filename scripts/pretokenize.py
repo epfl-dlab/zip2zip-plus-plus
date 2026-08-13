@@ -200,6 +200,12 @@ def main():
     parser.add_argument("--min_doc_length", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=10_000)
     parser.add_argument("--num_workers", type=int, default=0, help="Number of workers (0 = all CPUs)")
+    parser.add_argument("--download_num_proc", type=int, default=0,
+                        help="Parallel processes for load_dataset's download+prepare "
+                             "phase (0 = datasets' default single process — the "
+                             "historical behavior). Parallelizes across the repo's "
+                             "source files without changing the prepared row order, "
+                             "so shuffle(seed=42) output is unchanged.")
     parser.add_argument("--assume_docs_processed", type=int, default=-1,
                         help="Resume a shard directory that has no manifest.json by "
                              "supplying the number of documents already consumed. A "
@@ -249,6 +255,8 @@ def main():
     }
     if args.dataset_name:
         load_kwargs["name"] = args.dataset_name
+    if args.download_num_proc > 0:
+        load_kwargs["num_proc"] = args.download_num_proc
     ds = load_dataset(**load_kwargs)
     ds = ds.shuffle(seed=42)
 

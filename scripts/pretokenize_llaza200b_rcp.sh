@@ -74,6 +74,11 @@ DATASET=${DATASET:-epfl-dlab/llaza-200B}
 export TOKENS_PER_SHARD=${TOKENS_PER_SHARD:-39000000}
 export TARGET_TOKENS=${TARGET_TOKENS:-200e9}
 NUM_WORKERS=${NUM_WORKERS:-32}
+# Parallel processes for load_dataset's download+prepare phase. The 2026-08-13
+# attempt measured ~3 MB/s on the single-process python downloader — parallel
+# files times hf_transfer (below) is what turns ~2 weeks of download into hours.
+# Does not change the prepared row order, so shuffle(seed=42) is unaffected.
+DOWNLOAD_NUM_PROC=${DOWNLOAD_NUM_PROC:-16}
 
 PROJECT_DIR=${PROJECT_DIR:-$Z2Z_SCRATCH/code/zip2zip-core}
 LOG_DIR=$Z2Z_SCRATCH/logs/tokenize
@@ -146,7 +151,22 @@ if [ ! -f "$VENV_DIR/bin/activate" ]; then
     python -m venv --system-site-packages "$VENV_DIR"
 fi
 source "$VENV_DIR/bin/activate"
-pip install --quiet "datasets==2.18.0" "transformers==4.56.2" "numpy"
+pip install --quiet "datasets==2.18.0" "transformers==4.56.2" "numpy" "hf_transfer==0.1.8"
+
+# hf_transfer: Rust multi-chunk downloader. The stock python path measured
+# ~3 MB/s single-stream on 2026-08-13 and died 7 straight Run:AI attempts on
+# mid-file ChunkedEncodingError; hf_transfer saturates the link and retries
+# per chunk. Guarded on importability so a pip hiccup degrades to the slow
+# downloader instead of a hard error at the first file. NOTE: hf_transfer does
+# not resume *.incomplete files left by killed python-path attempts — delete
+# those from the hub cache before relaunching (completed blobs are reused).
+if python -c "import hf_transfer" 2>/dev/null; then
+    export HF_HUB_ENABLE_HF_TRANSFER=1
+    echo "[tokenize] hf_transfer enabled for downloads"
+else
+    echo "[tokenize] hf_transfer unavailable — using the slow python downloader"
+fi
+export HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT:-60}
 
 cd "$PROJECT_DIR"
 
@@ -159,10 +179,17 @@ echo "  OUTPUT_DIR:       $OUTPUT_DIR"
 echo "  TOKENS_PER_SHARD: $TOKENS_PER_SHARD"
 echo "  TARGET_TOKENS:    $TARGET_TOKENS"
 echo "  NUM_WORKERS:      $NUM_WORKERS"
+echo "  DOWNLOAD_NUM_PROC:$DOWNLOAD_NUM_PROC"
 echo "  HF_HOME:          $HF_HOME"
 echo "==========================================================="
 
-python scripts/pretokenize.py \
+# Retry HERE rather than through Run:AI's 6 silent pod retries (which the
+# 2026-08-13 attempt exhausted into a Failed job on transient HF network
+# errors). Resume is cheap by design — manifest.json plus the hub/Arrow
+# caches — so each retry continues from wherever the last attempt died.
+PRETOK_RETRIES=${PRETOK_RETRIES:-20}
+attempt=1
+until python scripts/pretokenize.py \
     --output_dir "$OUTPUT_DIR" \
     --model_name "$TOKENIZER" \
     --dataset "$DATASET" \
@@ -171,7 +198,18 @@ python scripts/pretokenize.py \
     --target_tokens "$TARGET_TOKENS" \
     --tokens_per_shard "$TOKENS_PER_SHARD" \
     --min_doc_length 50 \
-    --num_workers "$NUM_WORKERS"
+    --num_workers "$NUM_WORKERS" \
+    --download_num_proc "$DOWNLOAD_NUM_PROC"
+do
+    rc=$?
+    if [ "$attempt" -ge "$PRETOK_RETRIES" ]; then
+        echo "FATAL: pretokenize.py failed $attempt times (last rc=$rc) — giving up."
+        exit "$rc"
+    fi
+    attempt=$((attempt + 1))
+    echo "[tokenize] pretokenize.py failed (rc=$rc) — retry $attempt/$PRETOK_RETRIES in 60s"
+    sleep 60
+done
 
 echo "--- manifest ---"
 cat "$OUTPUT_DIR/manifest.json"
