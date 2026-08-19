@@ -665,7 +665,7 @@ def main():
                 "meta.pt restores geometry and reproduces the source forward",
             )
 
-            # ---- TA11b: eval-only merge-size transfer for hierarchical composer ----
+            # ---- TA11b: eval/inference merge-size transfer for hierarchical composer ----
             hier_key = "_eval_max_subtokens_hier_test"
             hier_cfg = dataclasses.replace(
                 loader_cfg, max_subtokens=3, hyper_encoder_type="hierarchical"
@@ -689,16 +689,22 @@ def main():
                     os.path.join(hier_tmp, "meta.pt"),
                 )
                 adapter.zip2zip_llama_configs[hier_key] = hier_cfg
+                inference_mod.zip2zip_llama_configs[hier_key] = hier_cfg
                 loaded_hier, loaded_hier_cfg, _ = adapter._load_zip2zip_checkpoint(
                     hier_tmp, device, torch.float32, eval_max_subtokens=4
+                )
+                loaded_hier_inference, _ = inference_mod.load_model(
+                    hier_tmp, str(device), max_merge_size=4
                 )
                 check(
                     "TA11b_hier_eval_max_subtokens_override",
                     loaded_hier_cfg.max_subtokens == 4
-                    and loaded_hier.zip2zip_config.max_subtokens == 4,
+                    and loaded_hier.zip2zip_config.max_subtokens == 4
+                    and loaded_hier_inference.zip2zip_config.max_subtokens == 4,
                     "hierarchical checkpoints can widen the eval merge-size loop",
                 )
                 adapter.zip2zip_llama_configs.pop(hier_key, None)
+                inference_mod.zip2zip_llama_configs.pop(hier_key, None)
 
             flat_key = "_eval_max_subtokens_flat_test"
             flat_cfg = dataclasses.replace(
@@ -718,18 +724,26 @@ def main():
                     "hyper_encoder_type": "flat",
                 }}, os.path.join(flat_tmp, "meta.pt"))
                 adapter.zip2zip_llama_configs[flat_key] = flat_cfg
+                inference_mod.zip2zip_llama_configs[flat_key] = flat_cfg
                 flat_refused = raises(
                     lambda: adapter._load_zip2zip_checkpoint(
                         flat_tmp, device, torch.float32, eval_max_subtokens=4
                     ),
                     "Flat hyper-encoders",
                 )
+                flat_inference_refused = raises(
+                    lambda: inference_mod.load_model(
+                        flat_tmp, str(device), max_merge_size=4
+                    ),
+                    "--max-merge-size",
+                )
                 check(
                     "TA11b_flat_eval_max_subtokens_refused",
-                    flat_refused,
+                    flat_refused and flat_inference_refused,
                     "flat checkpoints have length-shaped positional embeddings",
                 )
                 adapter.zip2zip_llama_configs.pop(flat_key, None)
+                inference_mod.zip2zip_llama_configs.pop(flat_key, None)
 
             inference_mod.zip2zip_llama_configs.pop(loader_key, None)
     finally:

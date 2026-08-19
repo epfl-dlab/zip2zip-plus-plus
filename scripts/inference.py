@@ -42,7 +42,11 @@ DEFAULT_PROMPT = "The Eiffel Tower is located in"
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
+def load_model(
+    ckpt_dir: str,
+    device: str,
+    max_merge_size: int | None = None,
+) -> tuple[Zip2ZipLlama3Model, dict]:
     meta = torch.load(f"{ckpt_dir}/meta.pt", map_location="cpu", weights_only=False)
     args = meta["args"]
     cfg = zip2zip_llama_configs[args["model_config"]]
@@ -99,6 +103,18 @@ def load_model(ckpt_dir: str, device: str) -> tuple[Zip2ZipLlama3Model, dict]:
         **enc_overrides,
     )
     cfg = dataclasses.replace(cfg, **overrides)
+    checkpoint_max_subtokens = int(cfg.max_subtokens)
+    if max_merge_size is not None and max_merge_size != checkpoint_max_subtokens:
+        if cfg.hyper_encoder_type not in ("hierarchical", "fast_hierarchical"):
+            raise ValueError(
+                "--max-merge-size can only override hierarchical encoders; "
+                "flat encoders have length-shaped positional embeddings."
+            )
+        cfg = dataclasses.replace(cfg, max_subtokens=max_merge_size)
+        print(
+            "[inference] max merge size: "
+            f"checkpoint={checkpoint_max_subtokens}, inference={max_merge_size}"
+        )
     model = Zip2ZipLlama3Model(cfg)
     print(
         "[inference] decoder RoPE: "
@@ -352,6 +368,12 @@ def main():
     )
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument(
+        "--max-merge-size",
+        type=int,
+        default=None,
+        help="Inference max merge size; defaults to the checkpoint value.",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=0.0,
@@ -362,6 +384,8 @@ def main():
         parser.error("--temperature must be non-negative")
     if cli.max_new_tokens < 0:
         parser.error("--max-new-tokens must be non-negative")
+    if cli.max_merge_size is not None and cli.max_merge_size <= 0:
+        parser.error("--max-merge-size must be positive")
     try:
         prompts = load_prompts(cli.prompt, cli.prompt_file)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
@@ -371,7 +395,9 @@ def main():
     print(f"Device: {device}")
 
     print("Loading model...")
-    model, train_args = load_model(cli.ckpt_dir, device)
+    model, train_args = load_model(
+        cli.ckpt_dir, device, max_merge_size=cli.max_merge_size
+    )
     # Cast to bf16 for faster inference, but parameters and REAL buffers only.
     # A blanket .half()/.to(dtype) also converts the complex64 RoPE cache
     # (freqs_cis) to a real dtype, silently discarding the imaginary part and
