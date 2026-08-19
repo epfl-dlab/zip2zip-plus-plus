@@ -84,32 +84,19 @@ override preset values.
 merge-size-transfer stress tests. They are not part of any default preset or
 pipeline, and the standard Wikitext task is unchanged.
 
-The local corpora are built with the
-`microsoft/Phi-3.5-mini-instruct` tokenizer. They are suitable for Zip2Zip
-checkpoints that use that exact tokenizer; forced evaluation at a merge size
-not seen during training is supported only by hierarchical hyper-encoders.
-Other tokenizers need their own rebuilt corpus because token-aware block
-boundaries, single-window guarantees, and LZW compression patterns change.
+The released corpora are the `repeat4` and `repeat8` configurations of
+[`epfl-dlab/zip2zip-wikitext-repeat-phi35`](https://huggingface.co/datasets/epfl-dlab/zip2zip-wikitext-repeat-phi35).
+The task YAMLs pin revision `v1.0.0`, so evaluation downloads the exact
+artifacts used for the paper through the normal Hugging Face cache; no local
+corpus build is required.
 
-Prepare the local JSONL files once from the repository root:
-
-```bash
-uv sync --extra eval
-uv run python scripts/build_repeated_wikitext.py --repeat_n 4
-uv run python scripts/build_repeated_wikitext.py --repeat_n 8
-```
-
-By default the builder writes outside the Git repository:
-
-```text
-../datasets/wikitext-repeat4-phi35/{test.jsonl,manifest.json}
-../datasets/wikitext-repeat8-phi35/{test.jsonl,manifest.json}
-```
-
-The default build location is resolved from the script rather than the current
-working directory. The task YAMLs use the paths above, so run evaluation from
-the repository root. Existing data is never overwritten implicitly; rebuild
-explicitly with `--overwrite`.
+Both configurations were built with the
+`microsoft/Phi-3.5-mini-instruct` tokenizer and are suitable only for Zip2Zip
+checkpoints using that tokenizer. Forced evaluation at a merge size unseen
+during training is supported only by hierarchical hyper-encoders. Other
+tokenizers require separately rebuilt and identified artifacts because
+token-aware block boundaries, single-window guarantees, and LZW compression
+patterns change.
 
 Run one task by overriding the task list of the 1,024-token perplexity preset:
 
@@ -137,11 +124,9 @@ model weights. Compare perplexity only within the same repeated corpus; later
 copies are intentionally easier to predict, so repeat-4/repeat-8 absolute PPL
 is not directly comparable to standard Wikitext PPL.
 
-> **Future packaging TODO:** if these stress tests become stable public
-> benchmarks, consider publishing versioned corpus artifacts. Supporting
-> non-Phi tokenizers will require either one token-aware build per tokenizer or
-> a redesigned evaluation that constructs tokenizer-specific windows at run
-> time.
+For dataset maintenance only, `scripts/build_repeated_wikitext.py` reproduces
+the JSONL and manifests from the complete WikiText-2 raw test split. Evaluation
+does not invoke the builder, and an explicit rebuild requires `--overwrite`.
 
 ## RCP cluster wrappers (Run:AI)
 
