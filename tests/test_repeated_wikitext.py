@@ -221,7 +221,13 @@ def test_repeated_task_is_not_wired_into_defaults_or_pipeline(repeat_n):
     task_source = task_yaml.read_text(encoding="utf-8")
 
     assert f"task: {task_name}" in task_source
-    assert f"../datasets/wikitext-repeat{repeat_n}-phi35/test.jsonl" in task_source
+    assert (
+        "dataset_path: epfl-dlab/zip2zip-wikitext-repeat-phi35"
+        in task_source
+    )
+    assert f"dataset_name: repeat{repeat_n}" in task_source
+    assert "revision: v1.0.0" in task_source
+    assert "../datasets/" not in task_source
     assert "utils.repeated_wikitext_process_results" in task_source
     assert "expected_tokenizer: microsoft/Phi-3.5-mini-instruct" in task_source
     assert f"repeat_n: {repeat_n}" in task_source
