@@ -128,6 +128,53 @@ class _FakeModel:
     forward = __call__
 
 
+class _DecodeCreatedEntryModel(_FakeModel):
+    """Emit bases until a decode-created length-4 row becomes available."""
+
+    def __init__(self, vocab_size: int = 8, max_cb: int = 32):
+        super().__init__([], vocab_size=vocab_size, max_cb=max_cb)
+        self.base_choices = iter([4, 5] * 8)
+        self.selected_hyper_id = None
+        self.length4_update = None
+
+    def reset_inference_cache(self):
+        super().reset_inference_cache()
+        self.selected_hyper_id = None
+        self.length4_update = None
+
+    def __call__(self, tokens, **kwargs):
+        self.calls.append([int(token) for token in tokens[0].tolist()])
+        updates = kwargs["codebook_updates"]
+        indices = kwargs["codebook_updates_indices"][0]
+        choice = None
+        for row_index, slot in enumerate(indices):
+            expansion = [
+                int(token)
+                for token in updates[0, row_index].tolist()
+                if int(token) != self.zip2zip_config.pad_token_id
+            ]
+            if len(expansion) == 4:
+                self.length4_update = (int(slot), expansion)
+                choice = self.zip2zip_config.vocab_size + int(slot)
+                self.selected_hyper_id = choice
+                break
+        if choice is None:
+            choice = 2 if self.selected_hyper_id is not None else next(self.base_choices)
+        logits = torch.full(
+            (
+                1,
+                tokens.shape[1],
+                self.zip2zip_config.vocab_size
+                + self.zip2zip_config.max_codebook_size,
+            ),
+            -100.0,
+        )
+        logits[0, -1, choice] = 100.0
+        return logits
+
+    forward = __call__
+
+
 def _run(inference_module, *, entry, choices):
     vocab_size = 8
     prompt_ids = [1, 4, 5, 4, 5]
@@ -192,6 +239,38 @@ def test_unavailable_hypertoken_stops_without_decoding_it(inference_module):
     assert model.calls == [[1, 8]]
     assert not any(9 in decoded for decoded in tokenizer.decoded)
 
+
+
+def test_length4_created_during_decoding_becomes_selectable(inference_module):
+    vocab_size = 8
+    manager = inference_module.CodebookManager(
+        initial_vocab_size=vocab_size,
+        max_codebook_size=32,
+        max_subtokens=4,
+        embedding_dim=1,
+        pad_token_id=0,
+        disabled_ids=[],
+    )
+    compressor = _FakeCompressor([1])
+    tokenizer = _FakeTokenizer([1])
+    model = _DecodeCreatedEntryModel(vocab_size=vocab_size)
+
+    output, _ = inference_module.generate(
+        "prompt",
+        model,
+        manager,
+        compressor,
+        tokenizer,
+        {tokenizer.eos_token_id},
+        max_new_tokens=16,
+        temperature=0.0,
+        device="cpu",
+    )
+
+    assert model.length4_update == (4, [4, 5, 4, 5])
+    assert model.selected_hyper_id == vocab_size + 4
+    assert any(call[-1] == model.selected_hyper_id for call in model.calls)
+    assert output == "4 5 4 5 4 5 4 5 4 5 4 5"
 
 def test_temperature_zero_is_greedy(inference_module):
     logits = torch.tensor([-3.0, 1.0, 9.0, 2.0])
