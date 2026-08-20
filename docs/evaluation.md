@@ -93,10 +93,7 @@ corpus build is required.
 Both configurations were built with the
 `microsoft/Phi-3.5-mini-instruct` tokenizer and are suitable only for Zip2Zip
 checkpoints using that tokenizer. Forced evaluation at a merge size unseen
-during training is supported only by hierarchical hyper-encoders. Other
-tokenizers require separately rebuilt and identified artifacts because
-token-aware block boundaries, single-window guarantees, and LZW compression
-patterns change.
+during training is supported only by hierarchical hyper-encoders.
 
 Run one task by overriding the task list of the 1,024-token perplexity preset:
 
@@ -117,12 +114,6 @@ For the merge-size transfer comparison, run these three settings:
 | 3 | 3 | Native ms3 checkpoint |
 | 3 | 4 | Forced-transfer evaluation of the ms3 checkpoint |
 | 4 | 4 | Native ms4 baseline |
-
-The `3 -> 4` and `4 -> 4` rows should have identical input compression:
-compression depends on the text, tokenizer, and eval-time LZW settings, not on
-model weights. Compare perplexity only within the same repeated corpus; later
-copies are intentionally easier to predict, so repeat-4/repeat-8 absolute PPL
-is not directly comparable to standard Wikitext PPL.
 
 For dataset maintenance only, `scripts/build_repeated_wikitext.py` reproduces
 the JSONL and manifests from the complete WikiText-2 raw test split. Evaluation
