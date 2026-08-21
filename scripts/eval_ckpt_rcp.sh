@@ -49,6 +49,8 @@
 #                   prefix: a partial subset score must not enter the
 #                   comparable subset_ppl/ series.
 #   TASKS=gsm8k     Comma-separated task override (default: preset's tasks)
+#   EXACT_MULTI_VIEW=1  Additionally compute exact formula-(12)/(13) multi-view
+#                   metrics. The historical first-token multi-view stays on.
 #   LEGACY_UNTRIMMED_STOPS=1  Do not cut generated text at stop strings, as all
 #                   evals before 2026-08 did. Only for bit-exact reproduction of
 #                   those results (pin the old task list via TASKS too — the
@@ -105,6 +107,10 @@ TOKENIZER=${TOKENIZER:-meta-llama/Meta-Llama-3-8B}
 PRESET=${PRESET:-default_base}
 LIMIT=${LIMIT:-}
 TASKS=${TASKS:-}
+# EXACT_MULTI_VIEW=1: additionally score every complete valid segmentation.
+# "0" normalizes to off so it cannot half-trigger the :+ passthrough.
+EXACT_MULTI_VIEW=${EXACT_MULTI_VIEW:-}
+[ "$EXACT_MULTI_VIEW" = "0" ] && EXACT_MULTI_VIEW=""
 # EVAL_MODE=base for MAX_CODEBOOK_SIZE=0 control checkpoints (base-mode-only).
 EVAL_MODE=${EVAL_MODE:-}
 # EVAL_MAX_SUBTOKENS: eval-only LZW merge-size override. Unset follows meta.pt.
@@ -186,6 +192,7 @@ VARIANT_TAG="mode-${MODE_TAG}"
 [ -n "$DISABLE_DIGIT_IDS" ] && VARIANT_TAG="${VARIANT_TAG}-nodigits"
 [ -n "$DISABLE_MATHSYM_IDS" ] && VARIANT_TAG="${VARIANT_TAG}-nomathsym"
 [ -n "$NO_ONLINE_CODEBOOK_MASK" ] && VARIANT_TAG="${VARIANT_TAG}-legacycbmask"
+[ -n "$EXACT_MULTI_VIEW" ] && VARIANT_TAG="${VARIANT_TAG}-exactmv"
 [ -n "$LEGACY_UNTRIMMED_STOPS" ] && VARIANT_TAG="${VARIANT_TAG}-untrimmedstops"
 if [ -n "$LIMIT" ]; then
     LIMIT_TAG=$(printf '%s' "$LIMIT" | tr -cs '[:alnum:]._-' '_')
@@ -296,6 +303,7 @@ if [ -n "$CKPT_DIR" ]; then
         ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
         ${DISABLE_MATHSYM_IDS:+--disable_mathsym_ids} \
         ${NO_ONLINE_CODEBOOK_MASK:+--no_online_codebook_mask} \
+        ${EXACT_MULTI_VIEW:+--exact_multi_view} \
         ${LEGACY_UNTRIMMED_STOPS:+--legacy_untrimmed_stops} \
         $WANDB_ARGS \
         $LIMIT_ARG \
@@ -312,6 +320,7 @@ else
         ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
         ${DISABLE_MATHSYM_IDS:+--disable_mathsym_ids} \
         ${NO_ONLINE_CODEBOOK_MASK:+--no_online_codebook_mask} \
+        ${EXACT_MULTI_VIEW:+--exact_multi_view} \
         ${LEGACY_UNTRIMMED_STOPS:+--legacy_untrimmed_stops} \
         $WANDB_ARGS \
         $LIMIT_ARG \
