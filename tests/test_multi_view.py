@@ -14,7 +14,9 @@ from zip2zip_core.multi_view import (
     MultiViewAccumulator,
     build_expansion_index,
     derive_multi_view_metrics,
+    exact_segmentation_logprob,
     multi_view_candidates,
+    multi_view_segmentations,
 )
 
 V = 100  # toy base vocab size; hyper ids start here
@@ -80,6 +82,102 @@ def test_multi_view_bound_is_at_least_strict():
     assert mv >= lp[V + 1]
 
 
+# ───────────────────── exact complete segmentations ────────────────────────
+
+
+def test_exact_segmentations_cover_all_boundaries_at_ms4():
+    a, b, c, d = 1, 2, 3, 4
+    H_ab, H_bc, H_cd = V + 0, V + 1, V + 2
+    H_abc, H_bcd, H_abcd = V + 3, V + 4, V + 5
+    cb = {
+        H_ab: [a, b],
+        H_bc: [b, c],
+        H_cd: [c, d],
+        H_abc: [a, b, c],
+        H_bcd: [b, c, d],
+        H_abcd: [a, b, c, d],
+    }
+    got = set(multi_view_segmentations(H_abcd, cb, _index(cb), V))
+    assert got == {
+        (a, b, c, d),
+        (a, b, H_cd),
+        (a, H_bc, d),
+        (a, H_bcd),
+        (H_ab, c, d),
+        (H_ab, H_cd),
+        (H_abc, d),
+        (H_abcd,),
+    }
+
+
+def test_exact_segmentations_freeze_target_start_vocabulary():
+    a, b, c, d = 1, 2, 3, 4
+    H_ab, H_bc, H_cd = V + 0, V + 1, V + 2
+    H_abc, H_bcd, H_abcd = V + 3, V + 4, V + 5
+    cb = {
+        H_ab: [a, b],
+        H_bc: [b, c],
+        H_cd: [c, d],
+        H_abc: [a, b, c],
+        H_bcd: [b, c, d],
+        H_abcd: [a, b, c, d],
+    }
+    got = set(
+        multi_view_segmentations(
+            H_abcd,
+            cb,
+            _index(cb),
+            V,
+            available_hyper_ids={H_ab, H_bc, H_abcd},
+        )
+    )
+    assert got == {
+        (a, b, c, d),
+        (a, H_bc, d),
+        (H_ab, c, d),
+        (H_abcd,),
+    }
+
+
+
+def test_exact_segmentations_keep_canonical_path_with_stale_index():
+    target = V + 7
+    cb = {target: [1, 2, 3]}
+    got = multi_view_segmentations(target, cb, {}, V)
+    assert (target,) in got
+    assert (1, 2, 3) in got
+
+
+def test_exact_logprob_matches_hand_computed_formula_12():
+    a, b, c = 1, 2, 3
+    H_ab, H_bc, H_abc = V + 0, V + 1, V + 2
+    cb = {H_ab: [a, b], H_bc: [b, c], H_abc: [a, b, c]}
+    segmentations = multi_view_segmentations(H_abc, cb, _index(cb), V)
+    probabilities = {
+        ((), a): 0.4,
+        ((), H_ab): 0.3,
+        ((), H_abc): 0.2,
+        ((a,), b): 0.5,
+        ((a,), H_bc): 0.2,
+        ((a, b), c): 0.6,
+        ((H_ab,), c): 0.7,
+    }
+
+    exact = exact_segmentation_logprob(
+        segmentations,
+        lambda prefix, token: math.log(probabilities[(prefix, token)]),
+    )
+    strict = math.log(0.2)
+    first_token_bound = math.log(0.4 + 0.3 + 0.2)
+    assert exact == pytest.approx(math.log(0.61), abs=1e-12)
+    assert strict <= exact <= first_token_bound
+
+
+def test_exact_logprob_rejects_empty_segmentation_set():
+    with pytest.raises(ValueError, match="requires a segmentation"):
+        exact_segmentation_logprob([], lambda _prefix, _token: 0.0)
+
+
 # ─────────────────────────── accumulator ───────────────────────────────────
 
 
@@ -115,6 +213,17 @@ def test_accumulator_none_task_buckets_as_unknown():
     assert "unknown" in acc.summary()
 
 
+def test_accumulator_records_exact_sum_only_when_supplied():
+    acc = MultiViewAccumulator()
+    acc.add_document("wiki", -2.0, -1.0, 1, 1, exact_multi_view_logprob=-1.5)
+    exact = acc.summary()["wiki"]
+    assert exact["exact_multi_view_loglik_sum"] == -1.5
+
+    legacy = MultiViewAccumulator()
+    legacy.add_document("wiki", -2.0, -1.0, 1, 1)
+    assert "exact_multi_view_loglik_sum" not in legacy.summary()["wiki"]
+
+
 # ─────────────────────── denominator-free derivation ───────────────────────
 
 
@@ -137,6 +246,35 @@ def test_derivation_matches_hand_computed_metrics():
     assert out["segmentation_gap_bits_per_byte"] >= 0
     # back-solved denominator lands exactly on the byte count
     assert abs(out["implied_byte_denominator"] - 5.0) < 1e-9
+
+
+def test_derivation_supports_exact_metric_namespace():
+    sums = {
+        "strict_loglik_sum": -4.0,
+        "multi_view_loglik_sum": -3.0,
+        "exact_multi_view_loglik_sum": -3.5,
+    }
+    ln2 = math.log(2)
+    reported = {
+        "byte_perplexity": math.exp(4.0 / 5),
+        "bits_per_byte": 4.0 / (5 * ln2),
+    }
+    out = derive_multi_view_metrics(
+        sums,
+        reported,
+        loglik_key="exact_multi_view_loglik_sum",
+        metric_prefix="exact_multi_view",
+        gap_prefix="exact_segmentation_gap",
+    )
+    assert out["exact_multi_view_byte_perplexity"] == pytest.approx(
+        math.exp(3.5 / 5), abs=1e-12
+    )
+    assert out["exact_multi_view_bits_per_byte"] == pytest.approx(
+        3.5 / (5 * ln2), abs=1e-12
+    )
+    assert out["exact_segmentation_gap_bits_per_byte"] == pytest.approx(
+        0.5 / (5 * ln2), abs=1e-12
+    )
 
 
 def test_derivation_never_beats_strict():

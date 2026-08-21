@@ -636,5 +636,51 @@ def test_online_codebook_mask_invariants():
     assert not failed, f"failed invariants: {failed}"
 
 
+def test_exact_multi_view_scorer_brackets_strict_and_first_token():
+    adapter, lm_eval_stubs = import_eval_adapter()
+    try:
+        scorer_model, scorer_cfg = small_model()
+        scorer_model.eval()
+        lm = object.__new__(adapter.Zip2ZipLM)
+        lm.cfg = scorer_cfg
+        lm.model = scorer_model
+        lm._device = torch.device("cpu")
+        lm._dtype = torch.bfloat16
+        lm._max_length = 64
+        lm._compressor_kwargs = {
+            **codec_args(),
+            "max_codebook_size": scorer_cfg.max_codebook_size,
+        }
+        lm.hyper_causal_mask = True
+        lm.online_codebook_mask = True
+        lm.online_codebook_mask_active = True
+        lm.multi_view = True
+        lm.compression_stats = {
+            "in_comp": 0,
+            "in_base": 0,
+            "gen_comp": 0,
+            "gen_base": 0,
+            "online_skipped_targets": 0,
+            "online_replay_requests": 0,
+            "online_replay_tokens": 0,
+            "online_replay_seconds": 0.0,
+        }
+
+        strict, _, _, _, first_token, n_hyper, exact = lm._score_compressed(
+            [1, 2, 1, 2],
+            cont_start_base=0,
+            compute_multi_view=True,
+            compute_exact_multi_view=True,
+        )
+        assert n_hyper == 1
+        assert strict <= exact <= first_token
+        assert strict < exact
+    finally:
+        if lm_eval_stubs:
+            sys.modules.pop("zip2zip_core.lm_eval_adapter", None)
+            for name in reversed(lm_eval_stubs):
+                sys.modules.pop(name, None)
+
+
 if __name__ == "__main__":
     sys.exit(1 if main() else 0)
