@@ -667,7 +667,7 @@ class Zip2ZipLM(LM):
         }
 
     def _exact_multi_view_targets_logprobs(self, **kwargs) -> Dict[int, float]:
-        """Score all target marginals with a shared packed forest."""
+        """Score all target marginals with a shared packed tree-attention batch."""
         cfg = self.model.zip2zip_config
         first_layer = next(iter(self.model.layers.values()))
         forest_supported = (

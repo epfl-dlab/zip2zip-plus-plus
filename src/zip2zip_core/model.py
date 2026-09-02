@@ -672,7 +672,7 @@ class Zip2ZipTransformerBlock(TransformerBlock):
         attention_mask: torch.Tensor,
         positions: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Run this block's GQA with an explicit dense causal-tree mask.
+        """Run this block's GQA with an explicit dense tree-attention mask.
 
         TorchTitan's SDPA wrapper intentionally exposes only the ordinary
         triangular causal path. Exact multi-view evaluation needs an arbitrary
@@ -682,7 +682,7 @@ class Zip2ZipTransformerBlock(TransformerBlock):
         attention = self.attention
         if attention.attn_backend != "sdpa":
             raise ValueError(
-                "dense tree attention currently requires the SDPA backend, got "
+                "dense tree attention requires the SDPA backend, got "
                 f"{attention.attn_backend!r}"
             )
 
@@ -1305,8 +1305,8 @@ class Zip2ZipLlama3Model(Decoder):
             logit_positions: optional one-dimensional indices selecting which
                 sequence positions need output logits. Transformer states are
                 still computed for the full sequence; selection happens before
-                the vocabulary projections. Used by packed tree evaluation,
-                where only branch-node distributions are consumed.
+                the vocabulary projections. Used by packed tree-attention
+                evaluation, where only branch-node distributions are consumed.
         """
         positions_were_provided = positions is not None
 
