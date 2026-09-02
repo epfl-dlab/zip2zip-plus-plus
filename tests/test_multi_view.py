@@ -14,7 +14,10 @@ from zip2zip_core.multi_view import (
     MultiViewAccumulator,
     build_expansion_index,
     derive_multi_view_metrics,
+    exact_segmentation_logprob,
     multi_view_candidates,
+    multi_view_segmentations,
+    segmentation_proper_prefixes,
 )
 
 V = 100  # toy base vocab size; hyper ids start here
@@ -80,18 +83,138 @@ def test_multi_view_bound_is_at_least_strict():
     assert mv >= lp[V + 1]
 
 
+# ───────────────────── exact complete segmentations ────────────────────────
+
+
+def test_exact_segmentations_cover_all_boundaries_at_ms4():
+    a, b, c, d = 1, 2, 3, 4
+    H_ab, H_bc, H_cd = V + 0, V + 1, V + 2
+    H_abc, H_bcd, H_abcd = V + 3, V + 4, V + 5
+    cb = {
+        H_ab: [a, b],
+        H_bc: [b, c],
+        H_cd: [c, d],
+        H_abc: [a, b, c],
+        H_bcd: [b, c, d],
+        H_abcd: [a, b, c, d],
+    }
+    got = set(multi_view_segmentations(H_abcd, cb, _index(cb), V))
+    assert got == {
+        (a, b, c, d),
+        (a, b, H_cd),
+        (a, H_bc, d),
+        (a, H_bcd),
+        (H_ab, c, d),
+        (H_ab, H_cd),
+        (H_abc, d),
+        (H_abcd,),
+    }
+
+
+def test_exact_segmentations_freeze_target_start_vocabulary():
+    a, b, c, d = 1, 2, 3, 4
+    H_ab, H_bc, H_cd = V + 0, V + 1, V + 2
+    H_abc, H_bcd, H_abcd = V + 3, V + 4, V + 5
+    cb = {
+        H_ab: [a, b],
+        H_bc: [b, c],
+        H_cd: [c, d],
+        H_abc: [a, b, c],
+        H_bcd: [b, c, d],
+        H_abcd: [a, b, c, d],
+    }
+    got = set(
+        multi_view_segmentations(
+            H_abcd,
+            cb,
+            _index(cb),
+            V,
+            available_hyper_ids={H_ab, H_bc, H_abcd},
+        )
+    )
+    assert got == {
+        (a, b, c, d),
+        (a, H_bc, d),
+        (H_ab, c, d),
+        (H_abcd,),
+    }
+
+
+
+def test_exact_segmentations_keep_canonical_path_with_stale_index():
+    target = V + 7
+    cb = {target: [1, 2, 3]}
+    got = multi_view_segmentations(target, cb, {}, V)
+    assert (target,) in got
+    assert (1, 2, 3) in got
+
+
+def test_segmentation_proper_prefixes_are_unique_and_parent_first():
+    segmentations = [
+        (1, 2, 3, 4),
+        (1, 2, V + 2),
+        (1, V + 1, 4),
+        (V + 0, 3, 4),
+        (V + 0, V + 2),
+        (V + 3, 4),
+        (V + 5,),
+    ]
+    prefixes = segmentation_proper_prefixes(segmentations)
+    assert len(prefixes) == len(set(prefixes))
+    assert set(prefixes) == {
+        (1,), (V + 0,), (V + 3,),
+        (1, 2), (1, V + 1), (V + 0, 3),
+        (1, 2, 3),
+    }
+    positions = {prefix: i for i, prefix in enumerate(prefixes)}
+    for prefix in prefixes:
+        if len(prefix) > 1:
+            assert positions[prefix[:-1]] < positions[prefix]
+
+
+def test_exact_logprob_matches_hand_computed_formula_12():
+    a, b, c = 1, 2, 3
+    H_ab, H_bc, H_abc = V + 0, V + 1, V + 2
+    cb = {H_ab: [a, b], H_bc: [b, c], H_abc: [a, b, c]}
+    segmentations = multi_view_segmentations(H_abc, cb, _index(cb), V)
+    probabilities = {
+        ((), a): 0.4,
+        ((), H_ab): 0.3,
+        ((), H_abc): 0.2,
+        ((a,), b): 0.5,
+        ((a,), H_bc): 0.2,
+        ((a, b), c): 0.6,
+        ((H_ab,), c): 0.7,
+    }
+
+    exact = exact_segmentation_logprob(
+        segmentations,
+        lambda prefix, token: math.log(probabilities[(prefix, token)]),
+    )
+    strict = math.log(0.2)
+    first_token_bound = math.log(0.4 + 0.3 + 0.2)
+    assert exact == pytest.approx(math.log(0.61), abs=1e-12)
+    assert strict <= exact <= first_token_bound
+
+
+def test_exact_logprob_rejects_empty_segmentation_set():
+    with pytest.raises(ValueError, match="requires a segmentation"):
+        exact_segmentation_logprob([], lambda _prefix, _token: 0.0)
+
+
 # ─────────────────────────── accumulator ───────────────────────────────────
 
 
 def test_accumulator_sums_documents_per_task():
     acc = MultiViewAccumulator()
-    acc.add_document("pile", -2.0, -1.5, 1, 2)
-    acc.add_document("pile", -2.0, -1.5, 0, 2)
-    acc.add_document("mc4", -1.0, -1.0, 0, 1)  # separate task
+    acc.add_document("pile", -2.0, -1.7, 1, 2, -1.5)
+    acc.add_document("pile", -2.0, -1.7, 0, 2, -1.5)
+    acc.add_document("mc4", -1.0, -1.0, 0, 1, -1.0)  # separate task
     s = acc.summary()
     assert s["pile"] == dict(
         strict_loglik_sum=-4.0,
-        multi_view_loglik_sum=-3.0,
+        multi_view_loglik_sum=-3.4,
+        first_token_multi_view_loglik_sum=-3.0,
         docs=2,
         targets_scored=4,
         hyper_targets_scored=1,
@@ -102,8 +225,8 @@ def test_accumulator_sums_documents_per_task():
 
 def test_accumulator_counts_unscored_documents():
     acc = MultiViewAccumulator()
-    acc.add_document("wikitext", -3.0, -3.0, 0, 1)
-    acc.add_document("wikitext", 0.0, 0.0, 0, 0)  # doc too short to score
+    acc.add_document("wikitext", -3.0, -3.0, 0, 1, -3.0)
+    acc.add_document("wikitext", 0.0, 0.0, 0, 0, 0.0)  # doc too short
     s = acc.summary()["wikitext"]
     assert s["docs"] == 2
     assert s["strict_loglik_sum"] == -3.0
@@ -111,8 +234,23 @@ def test_accumulator_counts_unscored_documents():
 
 def test_accumulator_none_task_buckets_as_unknown():
     acc = MultiViewAccumulator()
-    acc.add_document(None, -1.0, -1.0, 0, 1)
+    acc.add_document(None, -1.0, -1.0, 0, 1, -1.0)
     assert "unknown" in acc.summary()
+
+
+def test_accumulator_records_exact_and_first_token_sums():
+    acc = MultiViewAccumulator()
+    acc.add_document(
+        "wiki",
+        -2.0,
+        -1.5,
+        1,
+        1,
+        first_token_multi_view_logprob=-1.0,
+    )
+    summary = acc.summary()["wiki"]
+    assert summary["multi_view_loglik_sum"] == -1.5
+    assert summary["first_token_multi_view_loglik_sum"] == -1.0
 
 
 # ─────────────────────── denominator-free derivation ───────────────────────
@@ -137,6 +275,35 @@ def test_derivation_matches_hand_computed_metrics():
     assert out["segmentation_gap_bits_per_byte"] >= 0
     # back-solved denominator lands exactly on the byte count
     assert abs(out["implied_byte_denominator"] - 5.0) < 1e-9
+
+
+def test_derivation_supports_first_token_metric_namespace():
+    sums = {
+        "strict_loglik_sum": -4.0,
+        "multi_view_loglik_sum": -3.5,
+        "first_token_multi_view_loglik_sum": -3.0,
+    }
+    ln2 = math.log(2)
+    reported = {
+        "byte_perplexity": math.exp(4.0 / 5),
+        "bits_per_byte": 4.0 / (5 * ln2),
+    }
+    out = derive_multi_view_metrics(
+        sums,
+        reported,
+        loglik_key="first_token_multi_view_loglik_sum",
+        metric_prefix="first_token_multi_view",
+        gap_prefix="first_token_segmentation_gap",
+    )
+    assert out["first_token_multi_view_byte_perplexity"] == pytest.approx(
+        math.exp(3.0 / 5), abs=1e-12
+    )
+    assert out["first_token_multi_view_bits_per_byte"] == pytest.approx(
+        3.0 / (5 * ln2), abs=1e-12
+    )
+    assert out["first_token_segmentation_gap_bits_per_byte"] == pytest.approx(
+        1.0 / (5 * ln2), abs=1e-12
+    )
 
 
 def test_derivation_never_beats_strict():

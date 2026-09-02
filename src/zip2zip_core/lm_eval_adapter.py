@@ -22,7 +22,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import time
-from typing import List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -46,7 +46,10 @@ from zip2zip_core.model import Zip2ZipLlama3Model, restore_encoder_residual
 from zip2zip_core.multi_view import (
     MultiViewAccumulator,
     build_expansion_index,
+    exact_segmentation_logprob,
     multi_view_candidates,
+    multi_view_segmentations,
+    segmentation_proper_prefixes,
 )
 
 from lm_eval.api.model import LM
@@ -424,9 +427,12 @@ class Zip2ZipLM(LM):
         # gen_*: tokens emitted by generate_until.
         self.compression_stats = {"in_comp": 0, "in_base": 0, "gen_comp": 0, "gen_base": 0}
         # Multi-view (segmentation-marginalized) perplexity, accumulated per
-        # rolling-perplexity task and read back via multi_view_summary().
-        # On by default; strict scores returned to lm-eval are unaffected.
+        # rolling-perplexity task and read back via multi_view_summary(). Exact
+        # complete-segmentation scoring is the primary metric; the historical
+        # first-token upper bound is reported as a companion metric at no
+        # additional model-forward cost.
         self.multi_view = bool(multi_view)
+        self._exact_forest_max_nodes = 512
         self._multi_view_accum = MultiViewAccumulator()
         if self.online_codebook_mask_active:
             self.compression_stats.update(
@@ -543,6 +549,391 @@ class Zip2ZipLM(LM):
 
     # ─────────────────────────── scoring ──────────────────────────────────
 
+    def _exact_multi_view_target_logprob_sequential(
+        self,
+        *,
+        target_id: int,
+        canonical_context: List[int],
+        codebook,
+        cb_tensor: torch.LongTensor,
+        cb_dict: Dict[int, Sequence[int]],
+        expansion_index: Dict[Tuple[int, ...], List[int]],
+        root_log_probs: torch.Tensor,
+    ) -> float:
+        """Exact formula-(12) marginal for one canonical hypertoken target.
+
+        S(x_i) is frozen to the hyper-token ids available at the start of the
+        target. For every non-empty proper segmentation prefix, the model is
+        re-run on canonical_context + prefix so subsequent factors use the
+        actual non-canonical autoregressive history. Online dictionary counts
+        are replayed on that same branch.
+        """
+        V = self.cfg.vocab_size
+        finite_slots = torch.nonzero(
+            torch.isfinite(root_log_probs[V:]), as_tuple=False
+        ).flatten()
+        available_hyper_ids = {V + int(slot) for slot in finite_slots.tolist()}
+        if target_id not in available_hyper_ids:
+            raise RuntimeError(
+                f"exact multi-view target {target_id} is unavailable at the "
+                "start of its canonical context"
+            )
+
+        segmentations = multi_view_segmentations(
+            target_id,
+            cb_dict,
+            expansion_index,
+            V,
+            available_hyper_ids=available_hyper_ids,
+        )
+        prefix_log_probs: Dict[Tuple[int, ...], torch.Tensor] = {
+            (): root_log_probs
+        }
+
+        def token_logprob(prefix: Tuple[int, ...], token: int) -> float:
+            branch_log_probs = prefix_log_probs.get(prefix)
+            if branch_log_probs is None:
+                branch_ids = canonical_context + list(prefix)
+                if len(branch_ids) > self._max_length:
+                    raise RuntimeError(
+                        "exact multi-view branch exceeded max_length: "
+                        f"{len(branch_ids)} > {self._max_length}"
+                    )
+                x = torch.tensor(
+                    branch_ids, dtype=torch.long, device=self._device
+                ).unsqueeze(0)
+                branch_counts = None
+                if self.online_codebook_mask_active:
+                    replay_start = time.perf_counter()
+                    counts_cpu = online_codebook_counts(
+                        branch_ids, codebook, self._compressor_kwargs
+                    )
+                    self.compression_stats["online_replay_seconds"] += (
+                        time.perf_counter() - replay_start
+                    )
+                    self.compression_stats["online_replay_requests"] += 1
+                    self.compression_stats["online_replay_tokens"] += len(branch_ids)
+                    branch_counts = counts_cpu.to(self._device).unsqueeze(0)
+
+                with torch.autocast(
+                    device_type=self._device.type, dtype=self._dtype
+                ):
+                    if branch_counts is None:
+                        out = self.model(
+                            x,
+                            codebook=cb_tensor,
+                            hyper_causal_mask=self.hyper_causal_mask,
+                        )
+                    else:
+                        out = self.model(
+                            x,
+                            codebook=cb_tensor,
+                            hyper_causal_mask=self.hyper_causal_mask,
+                            codebook_counts=branch_counts,
+                        )
+                logits = out[0] if isinstance(out, tuple) else out
+                branch_log_probs = F.log_softmax(
+                    logits[0, -1].float(), dim=-1
+                )
+                prefix_log_probs[prefix] = branch_log_probs
+            return branch_log_probs[token].item()
+
+        return exact_segmentation_logprob(segmentations, token_logprob)
+
+    def _exact_multi_view_targets_logprobs_sequential(
+        self,
+        *,
+        canonical_tokens: Sequence[int],
+        targets: Sequence[Tuple[int, int, torch.Tensor]],
+        codebook,
+        cb_tensor: torch.LongTensor,
+        cb_dict: Dict[int, Sequence[int]],
+        expansion_index: Dict[Tuple[int, ...], List[int]],
+        canonical_codebook_counts: torch.Tensor | None = None,
+    ) -> Dict[int, float]:
+        """Correctness-first fallback that scores every target sequentially."""
+        del canonical_codebook_counts
+        return {
+            position: self._exact_multi_view_target_logprob_sequential(
+                target_id=target_id,
+                canonical_context=list(canonical_tokens[: position + 1]),
+                codebook=codebook,
+                cb_tensor=cb_tensor,
+                cb_dict=cb_dict,
+                expansion_index=expansion_index,
+                root_log_probs=root_log_probs,
+            )
+            for position, target_id, root_log_probs in targets
+        }
+
+    def _exact_multi_view_targets_logprobs(self, **kwargs) -> Dict[int, float]:
+        """Score all target marginals with a shared packed forest."""
+        cfg = self.model.zip2zip_config
+        first_layer = next(iter(self.model.layers.values()))
+        forest_supported = (
+            first_layer.attention.attn_backend == "sdpa"
+            and not cfg.two_axis_rope
+            and not cfg.gated_compressed_rope
+        )
+        if not forest_supported:
+            return self._exact_multi_view_targets_logprobs_sequential(**kwargs)
+        return self._exact_multi_view_targets_logprobs_forest(**kwargs)
+
+    def _exact_multi_view_targets_logprobs_forest(
+        self,
+        *,
+        canonical_tokens: Sequence[int],
+        targets: Sequence[Tuple[int, int, torch.Tensor]],
+        codebook,
+        cb_tensor: torch.LongTensor,
+        cb_dict: Dict[int, Sequence[int]],
+        expansion_index: Dict[Tuple[int, ...], List[int]],
+        canonical_codebook_counts: torch.Tensor | None = None,
+    ) -> Dict[int, float]:
+        """Score many independent target marginals in packed attention forests.
+
+        The canonical tokens form a shared causal backbone. A branch node for
+        target position ``t`` can attend to canonical rows ``[:t + 1]`` and to
+        nodes on its own segmentation-prefix ancestry, but never to another
+        target or sibling branch. Packing therefore changes only the execution
+        schedule: every node retains the per-target scorer's dependency graph,
+        RoPE position, and codebook mask.
+
+        Forests are split by node count to bound dense-mask and activation
+        memory. Tests can override the conservative default through
+        ``_exact_forest_max_nodes`` on the adapter.
+        """
+        if not targets:
+            return {}
+
+        V = self.cfg.vocab_size
+        prepared = []
+        results: Dict[int, float] = {}
+        for position, target_id, root_log_probs in targets:
+            finite_slots = torch.nonzero(
+                torch.isfinite(root_log_probs[V:]), as_tuple=False
+            ).flatten()
+            available_hyper_ids = {
+                V + int(slot) for slot in finite_slots.tolist()
+            }
+            if target_id not in available_hyper_ids:
+                raise RuntimeError(
+                    f"exact multi-view target {target_id} is unavailable at "
+                    f"canonical position {position}"
+                )
+            segmentations = multi_view_segmentations(
+                target_id,
+                cb_dict,
+                expansion_index,
+                V,
+                available_hyper_ids=available_hyper_ids,
+            )
+            prefixes = segmentation_proper_prefixes(segmentations)
+            if not prefixes:
+                results[position] = exact_segmentation_logprob(
+                    segmentations,
+                    lambda prefix, token, root=root_log_probs: root[token].item(),
+                )
+                continue
+            context_len = position + 1
+            for prefix in prefixes:
+                branch_len = context_len + len(prefix)
+                if branch_len > self._max_length:
+                    raise RuntimeError(
+                        "exact multi-view branch exceeded max_length: "
+                        f"{branch_len} > {self._max_length}"
+                    )
+            prepared.append(
+                (position, target_id, root_log_probs, segmentations, prefixes)
+            )
+
+        max_nodes = int(getattr(self, "_exact_forest_max_nodes", 512))
+        if max_nodes <= 0:
+            raise ValueError(
+                f"_exact_forest_max_nodes must be positive, got {max_nodes}"
+            )
+        chunks = []
+        chunk = []
+        chunk_nodes = 0
+        for target in prepared:
+            target_nodes = len(target[4])
+            if chunk and chunk_nodes + target_nodes > max_nodes:
+                chunks.append(chunk)
+                chunk = []
+                chunk_nodes = 0
+            chunk.append(target)
+            chunk_nodes += target_nodes
+        if chunk:
+            chunks.append(chunk)
+
+        def token_span(token: int) -> int:
+            return len(cb_dict[token]) if token >= V else 1
+
+        for forest_targets in chunks:
+            backbone_len = max(target[0] + 1 for target in forest_targets)
+            backbone = list(canonical_tokens[:backbone_len])
+            base_ends = []
+            base_cursor = 0
+            for token in backbone:
+                base_cursor += token_span(token)
+                base_ends.append(base_cursor)
+
+            node_records = []
+            node_lookup = {}
+            for target_number, target in enumerate(forest_targets):
+                for prefix in target[4]:
+                    node_lookup[(target_number, prefix)] = len(node_records)
+                    node_records.append((target_number, prefix))
+
+            node_start = backbone_len
+            packed_ids = backbone + [prefix[-1] for _, prefix in node_records]
+            total_len = len(packed_ids)
+            x = torch.tensor(
+                packed_ids, dtype=torch.long, device=self._device
+            ).unsqueeze(0)
+
+            forest_mask = torch.zeros(
+                (total_len, total_len),
+                dtype=torch.bool,
+            )
+            forest_mask[:backbone_len, :backbone_len] = torch.ones(
+                (backbone_len, backbone_len),
+                dtype=torch.bool,
+            ).tril_()
+            for node, (target_number, prefix) in enumerate(node_records):
+                row = node_start + node
+                position = forest_targets[target_number][0]
+                forest_mask[row, : position + 1] = True
+                for depth in range(1, len(prefix) + 1):
+                    ancestor = prefix[:depth]
+                    ancestor_node = node_lookup[(target_number, ancestor)]
+                    forest_mask[row, node_start + ancestor_node] = True
+            forest_mask = forest_mask.to(self._device)
+
+            if self.cfg.base_token_positions:
+                canonical_positions = [end - 1 for end in base_ends]
+                node_positions = []
+                for target_number, prefix in node_records:
+                    position = forest_targets[target_number][0]
+                    node_positions.append(
+                        base_ends[position]
+                        + sum(token_span(token) for token in prefix)
+                        - 1
+                    )
+            else:
+                canonical_positions = list(range(backbone_len))
+                node_positions = [
+                    forest_targets[target_number][0] + len(prefix)
+                    for target_number, prefix in node_records
+                ]
+            positions = torch.tensor(
+                [canonical_positions + node_positions],
+                dtype=torch.long,
+                device=self._device,
+            )
+
+            packed_counts = None
+            if self.online_codebook_mask_active:
+                if canonical_codebook_counts is None:
+                    raise RuntimeError(
+                        "online forest scoring requires canonical codebook counts"
+                    )
+                counts = torch.empty(
+                    total_len, dtype=torch.long, device=self._device
+                )
+                counts[:backbone_len] = canonical_codebook_counts[
+                    :backbone_len
+                ].to(device=self._device, dtype=torch.long)
+                for node, (target_number, prefix) in enumerate(node_records):
+                    position = forest_targets[target_number][0]
+                    branch_ids = list(canonical_tokens[: position + 1]) + list(
+                        prefix
+                    )
+                    replay_start = time.perf_counter()
+                    branch_counts = online_codebook_counts(
+                        branch_ids, codebook, self._compressor_kwargs
+                    )
+                    self.compression_stats["online_replay_seconds"] += (
+                        time.perf_counter() - replay_start
+                    )
+                    self.compression_stats["online_replay_requests"] += 1
+                    self.compression_stats["online_replay_tokens"] += len(
+                        branch_ids
+                    )
+                    counts[node_start + node] = branch_counts[-1]
+                packed_counts = counts.unsqueeze(0)
+            elif self.hyper_causal_mask:
+                counts = list(range(1, backbone_len + 1))
+                counts.extend(
+                    forest_targets[target_number][0] + 1 + len(prefix)
+                    for target_number, prefix in node_records
+                )
+                packed_counts = torch.tensor(
+                    [counts], dtype=torch.long, device=self._device
+                )
+
+            logit_positions = torch.arange(
+                node_start, total_len, dtype=torch.long, device=self._device
+            )
+            with torch.autocast(
+                device_type=self._device.type, dtype=self._dtype
+            ):
+                out = self.model(
+                    x,
+                    codebook=cb_tensor,
+                    attention_masks=forest_mask,
+                    positions=positions,
+                    hyper_causal_mask=self.hyper_causal_mask,
+                    codebook_counts=packed_counts,
+                    logit_positions=logit_positions,
+                )
+            logits = out[0] if isinstance(out, tuple) else out
+            node_log_probs = F.log_softmax(logits[0].float(), dim=-1)
+
+            for target_number, target in enumerate(forest_targets):
+                position, _, root_log_probs, segmentations, prefixes = target
+                prefix_log_probs = {
+                    prefix: node_log_probs[
+                        node_lookup[(target_number, prefix)]
+                    ]
+                    for prefix in prefixes
+                }
+
+                def token_logprob(
+                    prefix: Tuple[int, ...],
+                    token: int,
+                    *,
+                    root=root_log_probs,
+                    branches=prefix_log_probs,
+                ) -> float:
+                    if not prefix:
+                        return root[token].item()
+                    return branches[prefix][token].item()
+
+                results[position] = exact_segmentation_logprob(
+                    segmentations, token_logprob
+                )
+
+            self.compression_stats.setdefault("exact_forest_forwards", 0)
+            self.compression_stats.setdefault("exact_forest_targets", 0)
+            self.compression_stats.setdefault("exact_forest_nodes", 0)
+            self.compression_stats.setdefault("exact_forest_backbone_tokens", 0)
+            self.compression_stats.setdefault("exact_forest_packed_tokens", 0)
+            self.compression_stats.setdefault("exact_forest_max_packed_tokens", 0)
+            self.compression_stats["exact_forest_forwards"] += 1
+            self.compression_stats["exact_forest_targets"] += len(
+                forest_targets
+            )
+            self.compression_stats["exact_forest_nodes"] += len(node_records)
+            self.compression_stats["exact_forest_backbone_tokens"] += backbone_len
+            self.compression_stats["exact_forest_packed_tokens"] += total_len
+            self.compression_stats["exact_forest_max_packed_tokens"] = max(
+                self.compression_stats["exact_forest_max_packed_tokens"],
+                total_len,
+            )
+
+        return results
+
     @torch.no_grad()
     def _score_compressed(
         self,
@@ -551,29 +942,25 @@ class Zip2ZipLM(LM):
         *,
         reject_unavailable_targets: bool = False,
         compute_multi_view: bool = False,
-    ) -> Tuple[float, bool, int, int, float, int]:
+    ) -> Tuple[float, bool, int, int, float, int, float]:
         """Compress full_ids, run the model, sum logprobs of compressed tokens
         whose base span starts at or after `cont_start_base`.
 
         Returns (logprob_sum, is_greedy, n_compressed_scored, n_base_scored,
-        multi_view_logprob_sum, n_hyper_scored). With compute_multi_view (only
-        the rolling-perplexity path asks for it, and only when self.multi_view
-        is on), the multi-view sum scores the same positions but, at
-        hypertoken targets, marginalizes over every token whose expansion is
-        a prefix of the target's (the first-token bound; see
-        zip2zip_core.multi_view). It never affects the strict sum or
-        is_greedy, and degenerates to the strict sum when not computed or
-        when no hypertoken was scored.
+        first_token_logprob_sum, n_hyper_scored, exact_logprob_sum).
+        ``compute_multi_view`` computes both the exact complete-segmentation
+        marginal and its first-token upper bound. It never affects the strict
+        score or ``is_greedy``.
         """
         if len(full_ids) < 2:
-            return 0.0, True, 0, 0, 0.0, 0
+            return 0.0, True, 0, 0, 0.0, 0, 0.0
 
         compressor = LZWCompressor(**self._compressor_kwargs)
         compressed, _, codebook = compressor.encode(
             full_ids, padding="do_not_pad", truncation=False
         )
         if len(compressed) < 2:
-            return 0.0, True, 0, 0, 0.0, 0
+            return 0.0, True, 0, 0, 0.0, 0, 0.0
 
         self.compression_stats["in_base"] += len(full_ids)
         self.compression_stats["in_comp"] += len(compressed)
@@ -636,10 +1023,13 @@ class Zip2ZipLM(LM):
 
         total = 0.0
         mv_total = 0.0
+        exact_total = 0.0
         is_greedy = True
         n_comp = 0
         n_base = 0
         n_hyper = 0
+        exact_targets: List[Tuple[int, int, torch.Tensor]] = []
+        exact_bounds: Dict[int, Tuple[float, float]] = {}
         for t in range(len(compressed) - 1):
             target = compressed[t + 1]
             bstart, bend = spans[t + 1]
@@ -659,29 +1049,65 @@ class Zip2ZipLM(LM):
             lp_target = log_probs[t, target].item()
             total += lp_target
             if mv_index is None or target < V:
-                # Base-token targets have a single view; multi-view == strict.
+                # Base-token targets have a single view; both variants are strict.
                 mv_total += lp_target
+                exact_total += lp_target
             else:
                 cands = multi_view_candidates(target, cb_dict, mv_index, V)
-                mv_total += torch.logsumexp(log_probs[t, cands], dim=0).item()
+                first_token_lp = torch.logsumexp(
+                    log_probs[t, cands], dim=0
+                ).item()
+                mv_total += first_token_lp
+                exact_targets.append((t, target, log_probs[t]))
+                exact_bounds[t] = (lp_target, first_token_lp)
                 n_hyper += 1
             if int(log_probs[t].argmax().item()) != target:
                 is_greedy = False
             n_comp += 1
             n_base += bend - bstart
-        return total, is_greedy, n_comp, n_base, mv_total, n_hyper
+
+        if exact_targets:
+            if mv_index is None:
+                raise RuntimeError("exact multi-view targets require an index")
+            exact_logprobs = self._exact_multi_view_targets_logprobs(
+                canonical_tokens=compressed[:-1],
+                targets=exact_targets,
+                codebook=codebook,
+                cb_tensor=cb,
+                cb_dict=cb_dict,
+                expansion_index=mv_index,
+                canonical_codebook_counts=(
+                    codebook_counts[0] if codebook_counts is not None else None
+                ),
+            )
+            tolerance = 5e-5
+            for t, target, _ in exact_targets:
+                exact_lp = exact_logprobs[t]
+                lp_target, first_token_lp = exact_bounds[t]
+                if (
+                    exact_lp < lp_target - tolerance
+                    or exact_lp > first_token_lp + tolerance
+                ):
+                    raise RuntimeError(
+                        "exact multi-view probability violated "
+                        "strict <= exact <= first-token bound: "
+                        f"target={target} strict={lp_target} "
+                        f"exact={exact_lp} first_token={first_token_lp}"
+                    )
+                exact_total += exact_lp
+        return total, is_greedy, n_comp, n_base, mv_total, n_hyper, exact_total
 
     @torch.no_grad()
     def _score_base(
         self, full_ids: List[int], cont_start_base: int
-    ) -> Tuple[float, bool, int, int, float, int]:
+    ) -> Tuple[float, bool, int, int, float, int, float]:
         """Vanilla LM scoring: feed base tokens, no codebook, base-vocab logits only.
 
         Base tokens have a single view, so the multi-view sum equals the
         strict sum by definition (returned for a uniform _score signature).
         """
         if len(full_ids) < 2:
-            return 0.0, True, 0, 0, 0.0, 0
+            return 0.0, True, 0, 0, 0.0, 0, 0.0
         self.compression_stats["in_base"] += len(full_ids)
         self.compression_stats["in_comp"] += len(full_ids)
         x = torch.tensor(full_ids[:-1], dtype=torch.long, device=self._device).unsqueeze(0)
@@ -702,7 +1128,7 @@ class Zip2ZipLM(LM):
             if int(log_probs[t].argmax().item()) != target:
                 is_greedy = False
             n += 1
-        return total, is_greedy, n, n, total, 0
+        return total, is_greedy, n, n, total, 0, total
 
     def _score(
         self,
@@ -743,12 +1169,12 @@ class Zip2ZipLM(LM):
         return s
 
     def multi_view_summary(self) -> dict:
-        """Per-task strict/multi-view loglikelihood sums from the rolling-
-        perplexity requests. Empty when multi_view is off or no
-        loglikelihood_rolling task ran. Callers turn the sums into metrics
-        with zip2zip_core.multi_view.derive_multi_view_metrics, which rescales
-        the harness-reported strict metrics so the denominator basis (bytes,
-        words, whatever the task counts) cancels exactly.
+        """Per-task strict/exact multi-view loglikelihood sums from rolling PPL.
+
+        The historical first-token upper bound is included as
+        ``first_token_multi_view_loglik_sum``. Empty when multi_view is off or
+        no loglikelihood_rolling task ran. Callers turn the sums into metrics
+        with ``derive_multi_view_metrics`` so task denominators cancel exactly.
         """
         if not self.multi_view:
             return {}
@@ -788,7 +1214,7 @@ class Zip2ZipLM(LM):
             else:
                 cont_start_base = len(ctx_ids)
 
-            lp, greedy, _, _, _, _ = self._score(
+            lp, greedy, _, _, _, _, _ = self._score(
                 full_ids,
                 cont_start_base,
                 reject_unavailable_targets=True,
@@ -805,11 +1231,19 @@ class Zip2ZipLM(LM):
             ids = self.tok_encode(text)
             if len(ids) < 2:
                 if self.multi_view:
-                    self._multi_view_accum.add_document(task_name, 0.0, 0.0, 0, 0)
+                    self._multi_view_accum.add_document(
+                        task_name,
+                        0.0,
+                        0.0,
+                        0,
+                        0,
+                        first_token_multi_view_logprob=0.0,
+                    )
                 out.append(0.0)
                 continue
             total = 0.0
             mv_total = 0.0
+            exact_total = 0.0
             n_targets = 0
             n_hyper = 0
             for prefix_tokens, pred_tokens in map(
@@ -824,18 +1258,24 @@ class Zip2ZipLM(LM):
                 full_ids = list(prefix_tokens) + list(pred_tokens)
                 if len(full_ids) < 2:
                     continue
-                lp, _, n_comp, _, mv_lp, nh = self._score(
+                lp, _, n_comp, _, mv_lp, nh, exact_lp = self._score(
                     full_ids,
                     cont_start_base=len(prefix_tokens),
                     compute_multi_view=True,
                 )
                 total += lp
                 mv_total += mv_lp
+                exact_total += exact_lp
                 n_targets += n_comp
                 n_hyper += nh
             if self.multi_view:
                 self._multi_view_accum.add_document(
-                    task_name, total, mv_total, n_hyper, n_targets
+                    task_name,
+                    total,
+                    exact_total,
+                    n_hyper,
+                    n_targets,
+                    first_token_multi_view_logprob=mv_total,
                 )
             out.append(total)
         return out

@@ -120,9 +120,8 @@ def main():
     p.add_argument("--no_multi_view", action="store_true",
                    help="Disable the multi-view perplexity columns. On by "
                         "default: rolling-perplexity tasks additionally report "
-                        "multi_view_* metrics that marginalize each hypertoken "
-                        "target over every valid same-text first token "
-                        "(first-token bound). Strict metrics are never "
+                        "multi_view_* metrics using the exact complete-"
+                        "segmentation marginal. Strict metrics are never "
                         "affected either way.")
     p.add_argument("--legacy_untrimmed_stops", action="store_true",
                    help="Return generated text without cutting it at the first "
@@ -279,10 +278,26 @@ def main():
             if name in ("word_perplexity", "byte_perplexity", "bits_per_byte"):
                 reported.setdefault(name, v)
         derived = derive_multi_view_metrics(mv_sums, reported)
+        derived.update(
+            derive_multi_view_metrics(
+                mv_sums,
+                reported,
+                loglik_key="first_token_multi_view_loglik_sum",
+                metric_prefix="first_token_multi_view",
+                gap_prefix="first_token_segmentation_gap",
+            )
+        )
         multi_view[mv_task] = {**mv_sums, **derived}
         if row is not None:
             for k, v in derived.items():
-                if k.startswith(("multi_view_", "segmentation_gap_")) and isinstance(
+                if k.startswith(
+                    (
+                        "multi_view_",
+                        "segmentation_gap_",
+                        "first_token_multi_view_",
+                        "first_token_segmentation_gap_",
+                    )
+                ) and isinstance(
                     v, (int, float)
                 ):
                     row[f"{k},none"] = v
@@ -296,8 +311,8 @@ def main():
     print("Compression (base tokens per compressed token, >1 = more compression):")
     print(json.dumps(compression, indent=2))
     if multi_view:
-        print("Multi-view perplexity (hypertoken targets marginalized over all "
-              "same-text first tokens; first-token bound):")
+        print("Multi-view perplexity (exact complete-segmentation marginal "
+              "plus first-token upper bound):")
         print(json.dumps(multi_view, indent=2))
         for mv_task, mv_metrics in multi_view.items():
             # Back-solving the byte denominator from our strict sum and the

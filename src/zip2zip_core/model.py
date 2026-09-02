@@ -22,7 +22,11 @@ except ImportError:
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.embedding import Embedding
-from torchtitan.models.common.rope import RoPE
+from torchtitan.models.common.rope import (
+    RoPE,
+    apply_rotary_emb_complex,
+    apply_rotary_emb_cos_sin,
+)
 from torchtitan.models.common.utils import trunc_normal_
 from torchtitan.models.utils import get_dense_model_nparams_and_flops
 from torchtitan.tools.logging import logger
@@ -645,14 +649,82 @@ class Zip2ZipTransformerBlock(TransformerBlock):
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
-        attention_masks: AttentionMasksType | None,
+        attention_masks: AttentionMasksType | torch.Tensor | None,
         positions: torch.Tensor | None = None,
     ):
-        h = x + self.attention(
-            self.attention_norm(x), freqs_cis, attention_masks, positions
-        )
+        normed = self.attention_norm(x)
+        if isinstance(attention_masks, torch.Tensor):
+            attn_out = self._forward_masked_sdpa(
+                normed, freqs_cis, attention_masks, positions
+            )
+        else:
+            attn_out = self.attention(
+                normed, freqs_cis, attention_masks, positions
+            )
+        h = x + attn_out
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
+
+    def _forward_masked_sdpa(
+        self,
+        x: torch.Tensor,
+        rope_cache: torch.Tensor,
+        attention_mask: torch.Tensor,
+        positions: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run this block's GQA with an explicit dense causal-tree mask.
+
+        TorchTitan's SDPA wrapper intentionally exposes only the ordinary
+        triangular causal path. Exact multi-view evaluation needs an arbitrary
+        ancestor mask, so keep that exceptional path local to Zip2Zip instead
+        of modifying the vendored TorchTitan submodule.
+        """
+        attention = self.attention
+        if attention.attn_backend != "sdpa":
+            raise ValueError(
+                "dense tree attention currently requires the SDPA backend, got "
+                f"{attention.attn_backend!r}"
+            )
+
+        batch_size, seq_len, _ = x.shape
+        q = attention.wq(x).view(
+            batch_size, seq_len, -1, attention.head_dim
+        )
+        k = attention.wk(x).view(
+            batch_size, seq_len, -1, attention.head_dim
+        )
+        v = attention.wv(x).view(
+            batch_size, seq_len, -1, attention.head_dim
+        )
+        if attention.q_norm is not None:
+            q = attention.q_norm(q)
+        if attention.k_norm is not None:
+            k = attention.k_norm(k)
+        if attention.use_rope:
+            if attention.rope_backend == "cos_sin":
+                q, k = apply_rotary_emb_cos_sin(
+                    q, k, rope_cache, positions
+                )
+            else:
+                q, k = apply_rotary_emb_complex(
+                    q, k, freqs_cis=rope_cache, positions=positions
+                )
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        output = torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attention_mask,
+            is_causal=False,
+            scale=attention.scaling,
+            enable_gqa=attention.enable_gqa,
+        )
+        output = output.transpose(1, 2).contiguous().view(
+            batch_size, seq_len, -1
+        )
+        return attention.wo(output)
 
     def init_weights(self, **kwargs):
         for norm in (self.attention_norm, self.ffn_norm):
@@ -1208,6 +1280,7 @@ class Zip2ZipLlama3Model(Decoder):
         codebook_updates_indices: list[list[int]] | None = None,
         hyper_causal_mask: bool = False,
         codebook_counts: torch.Tensor | None = None,
+        logit_positions: torch.Tensor | None = None,
     ):
         """Forward pass with zip2zip compressed tokens.
 
@@ -1229,6 +1302,11 @@ class Zip2ZipLlama3Model(Decoder):
             codebook_counts: optional (B, T) exact number of decoder-installed
                 rows after each input token. Takes precedence over the legacy
                 position-based hyper causal mask.
+            logit_positions: optional one-dimensional indices selecting which
+                sequence positions need output logits. Transformer states are
+                still computed for the full sequence; selection happens before
+                the vocabulary projections. Used by packed tree evaluation,
+                where only branch-node distributions are consumed.
         """
         positions_were_provided = positions is not None
 
@@ -1361,6 +1439,19 @@ class Zip2ZipLlama3Model(Decoder):
 
         h = self.norm(h) if self.norm is not None else h
 
+        logits_codebook_counts = codebook_counts
+        if logit_positions is not None:
+            if logit_positions.ndim != 1:
+                raise ValueError(
+                    "logit_positions must be one-dimensional, got "
+                    f"{tuple(logit_positions.shape)}"
+                )
+            logit_positions = logit_positions.to(device=h.device, dtype=torch.long)
+            h = h.index_select(1, logit_positions)
+            if logits_codebook_counts is not None:
+                logits_codebook_counts = logits_codebook_counts.index_select(
+                    1, logit_positions
+                )
         # === Token type prediction (base vs hyper) ===
         token_type_logits = None
         if self.token_type_head is not None:
@@ -1383,7 +1474,7 @@ class Zip2ZipLlama3Model(Decoder):
                     hyper_logits = hyper_logits.masked_fill(
                         ~codebook_used.unsqueeze(1), float("-inf")
                     )
-                    if codebook_counts is not None:
+                    if logits_codebook_counts is not None:
                         # Exact decoder-time mask: after consuming token t, only
                         # the first count[t] sequential LZW rows exist.
                         K = hyper_embeds.shape[1]
@@ -1391,7 +1482,7 @@ class Zip2ZipLlama3Model(Decoder):
                             K, device=h.device
                         ).view(1, 1, K)
                         hyper_logits = hyper_logits.masked_fill(
-                            entry_idx >= codebook_counts.unsqueeze(-1),
+                            entry_idx >= logits_codebook_counts.unsqueeze(-1),
                             float("-inf"),
                         )
                     # Legacy approximation: entry k is assumed to be created at

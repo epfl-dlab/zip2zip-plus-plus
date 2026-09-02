@@ -7,10 +7,12 @@ so probability mass the model puts on the other, equally correct, views is
 counted as error. The multi-view probability sums that mass back.
 
 The exact sum over all segmentations of an n-token expansion has O(2^(n-1))
-terms; this module implements the tractable first-token upper bound from the
-zip2zip++ paper (eq. 6-7): only the *first* token of each valid segmentation
-is scored, and the distinct first tokens of the segmentations of (y1..yn) are
-exactly the tokens whose own expansion is a non-empty prefix of (y1..yn):
+terms. This module provides both the complete segmentation enumeration used
+by the default multi-view scorer and the tractable first-token upper bound
+from the zip2zip++ paper (eq. 14-15). The bound scores only the *first*
+token of each valid segmentation; the distinct first tokens of the
+segmentations of (y1..yn) are exactly the tokens whose own expansion is a
+non-empty prefix of (y1..yn):
 
     p*(x | ctx) = p(y1 | ctx) + sum over L in 2..n of p(h_L | ctx)
 
@@ -20,10 +22,14 @@ perplexity is a lower (more favorable) bound and strict/multi-view bracket
 the model's true quality. For a base-token target the set degenerates to the
 singleton {x} and multi-view equals strict.
 
-Availability note: LZW dictionaries are prefix-closed — an entry W·z is only
-ever inserted when W is already an entry — so every prefix entry of a target
-was created strictly before the target itself. Whenever the canonical target
-is a legal emission, so is every candidate; no decode-time replay is needed.
+Availability note for the bound: LZW dictionaries are prefix-closed — an entry
+W·z is only ever inserted when W is already an entry — so every prefix entry
+of a target was created strictly before the target itself. Whenever the
+canonical target is a legal emission, so is every first-token candidate; no
+decode-time replay is needed for the bound. The exact scorer additionally
+considers entries matching interior substrings, filters them against the
+dictionary state at the start of the target, and replays decoder state along
+each non-canonical prefix.
 
 Aggregation is denominator-free by design: lm-eval reports every rolling
 perplexity metric as a monotone function of sum(loglik)/D for some per-task
@@ -41,7 +47,7 @@ separate implementation and are intentionally left untouched.
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Collection, Dict, List, Sequence, Tuple
 
 
 def build_expansion_index(
@@ -96,6 +102,128 @@ def multi_view_candidates(
     return out
 
 
+def multi_view_segmentations(
+    target_id: int,
+    cb_dict: Dict[int, Sequence[int]],
+    expansion_index: Dict[Tuple[int, ...], List[int]],
+    vocab_size: int,
+    available_hyper_ids: Collection[int] | None = None,
+) -> List[Tuple[int, ...]]:
+    """Enumerate every token sequence that expands to ``target_id``.
+
+    The target expansion defines a small DAG over base-token offsets. Every
+    base token contributes a one-position edge; every codebook entry whose
+    expansion matches an interior substring contributes a hyper-token edge.
+    Complete paths through the DAG are the valid segmentations.
+
+    ``available_hyper_ids`` freezes the dynamic vocabulary at the start of the
+    target, as required by S(x_i). Base tokens are always available. Passing
+    ``None`` admits every entry in ``cb_dict``. Distinct token ids with
+    duplicate expansions remain distinct paths because the model assigns them
+    distinct probabilities.
+    """
+    if target_id < vocab_size:
+        return [(target_id,)]
+
+    expansion = tuple(cb_dict[target_id])
+    if not expansion:
+        # Match multi_view_candidates' defensive malformed-codebook behavior.
+        return [(target_id,)]
+
+    allowed = available_hyper_ids
+    n = len(expansion)
+    paths: List[Tuple[int, ...]] = []
+
+    def visit(offset: int, prefix: Tuple[int, ...]) -> None:
+        if offset == n:
+            paths.append(prefix)
+            return
+
+        # The single base token at this offset is always a valid edge.
+        visit(offset + 1, prefix + (expansion[offset],))
+
+        # Real LZW entries have length >= 2. Iterate by increasing end offset
+        # and preserve expansion_index's deterministic codebook-id order.
+        for end in range(offset + 2, n + 1):
+            for hid in expansion_index.get(expansion[offset:end], ()):
+                if allowed is None or hid in allowed:
+                    visit(end, prefix + (hid,))
+
+    visit(0, ())
+    canonical = (target_id,)
+    if (
+        (allowed is None or target_id in allowed)
+        and canonical not in paths
+    ):
+        # A stale index must not silently drop the strict segmentation.
+        paths.append(canonical)
+    return paths
+
+
+def exact_segmentation_logprob(
+    segmentations: Sequence[Sequence[int]],
+    token_logprob: Callable[[Tuple[int, ...], int], float],
+) -> float:
+    """Return the exact log marginal of ``segmentations``.
+
+    ``token_logprob(prefix, token)`` supplies
+    ``log p(token | canonical_context, prefix)``. Keeping this traversal pure
+    and framework-free lets unit tests use hand-written conditional
+    probabilities while the production adapter supplies model forwards.
+    """
+    path_logprobs: List[float] = []
+    for segmentation in segmentations:
+        if not segmentation:
+            raise ValueError("a multi-view segmentation cannot be empty")
+        prefix: Tuple[int, ...] = ()
+        path_logprob = 0.0
+        for token in segmentation:
+            path_logprob += float(token_logprob(prefix, int(token)))
+            prefix += (int(token),)
+        path_logprobs.append(path_logprob)
+
+    if not path_logprobs:
+        raise ValueError("exact multi-view scoring requires a segmentation")
+    largest = max(path_logprobs)
+    if math.isinf(largest):
+        return largest
+    return largest + math.log(
+        sum(math.exp(value - largest) for value in path_logprobs)
+    )
+
+
+def segmentation_proper_prefixes(
+    segmentations: Sequence[Sequence[int]],
+) -> List[Tuple[int, ...]]:
+    """Return the unique non-empty proper prefixes needed by the exact sum.
+
+    A model forward after prefix ``s[:j]`` supplies the conditional
+    distribution for token ``s[j]``. The empty prefix is already represented
+    by the canonical/root logits, and a complete segmentation never needs a
+    continuation distribution, so neither belongs in the returned list.
+
+    Prefixes are ordered by depth, then by first appearance in
+    ``segmentations``. Consequently every prefix's parent precedes it, which
+    is the topological order used by the packed tree-attention scorer.
+    """
+    by_depth: Dict[int, List[Tuple[int, ...]]] = {}
+    seen: set[Tuple[int, ...]] = set()
+    for segmentation in segmentations:
+        if not segmentation:
+            raise ValueError("a multi-view segmentation cannot be empty")
+        tokens = tuple(int(token) for token in segmentation)
+        for length in range(1, len(tokens)):
+            prefix = tokens[:length]
+            if prefix not in seen:
+                seen.add(prefix)
+                by_depth.setdefault(length, []).append(prefix)
+    return [
+        prefix
+        for depth in sorted(by_depth)
+        for prefix in by_depth[depth]
+    ]
+
+
 class MultiViewAccumulator:
     """Per-task strict and multi-view loglikelihood sums over rolling docs.
 
@@ -115,12 +243,14 @@ class MultiViewAccumulator:
         multi_view_logprob: float,
         n_hyper_targets: int,
         n_targets: int,
+        first_token_multi_view_logprob: float,
     ) -> None:
         s = self._tasks.setdefault(
             task or "unknown",
             dict(
                 strict_loglik_sum=0.0,
                 multi_view_loglik_sum=0.0,
+                first_token_multi_view_loglik_sum=0.0,
                 docs=0,
                 targets_scored=0,
                 hyper_targets_scored=0,
@@ -128,6 +258,7 @@ class MultiViewAccumulator:
         )
         s["strict_loglik_sum"] += strict_logprob
         s["multi_view_loglik_sum"] += multi_view_logprob
+        s["first_token_multi_view_loglik_sum"] += first_token_multi_view_logprob
         s["docs"] += 1
         s["targets_scored"] += n_targets
         s["hyper_targets_scored"] += n_hyper_targets
@@ -137,7 +268,12 @@ class MultiViewAccumulator:
 
 
 def derive_multi_view_metrics(
-    sums: Dict[str, float], reported: Dict[str, float]
+    sums: Dict[str, float],
+    reported: Dict[str, float],
+    *,
+    loglik_key: str = "multi_view_loglik_sum",
+    metric_prefix: str = "multi_view",
+    gap_prefix: str = "segmentation_gap",
 ) -> Dict[str, float]:
     """Derive multi-view metrics from one task's sums and its reported strict
     metrics ({'word_perplexity': ..., 'byte_perplexity': ..., 'bits_per_byte':
@@ -161,7 +297,7 @@ def derive_multi_view_metrics(
     Empty when nothing was scored (S == 0) — degenerate, not an error.
     """
     strict_sum = sums["strict_loglik_sum"]
-    mv_sum = sums["multi_view_loglik_sum"]
+    mv_sum = sums[loglik_key]
     out: Dict[str, float] = {}
     if strict_sum == 0.0:
         return out
@@ -169,13 +305,13 @@ def derive_multi_view_metrics(
     for name in ("word_perplexity", "byte_perplexity"):
         value = reported.get(name)
         if isinstance(value, (int, float)) and value > 0:
-            out[f"multi_view_{name}"] = value ** ratio
+            out[f"{metric_prefix}_{name}"] = value ** ratio
     bpb = reported.get("bits_per_byte")
     if isinstance(bpb, (int, float)):
-        out["multi_view_bits_per_byte"] = bpb * ratio
+        out[f"{metric_prefix}_bits_per_byte"] = bpb * ratio
         # strict_bpb - multi_view_bpb >= 0: the share of the strict loss that
         # is pure segmentation ambiguity, not model error.
-        out["segmentation_gap_bits_per_byte"] = bpb * (1.0 - ratio)
+        out[f"{gap_prefix}_bits_per_byte"] = bpb * (1.0 - ratio)
     byte_ppl = reported.get("byte_perplexity")
     if isinstance(byte_ppl, (int, float)) and byte_ppl > 0 and byte_ppl != 1.0:
         out["implied_byte_denominator"] = -strict_sum / math.log(byte_ppl)

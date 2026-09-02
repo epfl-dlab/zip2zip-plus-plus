@@ -89,7 +89,7 @@ def reference_counts(compressed, codebook, args):
     return counts
 
 
-def small_model():
+def small_model(*, base_token_positions=False):
     base = zip2zip_llama_configs["Phi3.5-mini"]
     dim = 128
     cfg = dataclasses.replace(
@@ -102,6 +102,7 @@ def small_model():
         max_subtokens=4,
         tie_hyper_encoder=False,
         encoder_dim=dim,
+        base_token_positions=base_token_positions,
         encoder_n_layers=1,
         encoder_n_heads=4,
         encoder_intermediate_size=256,
@@ -634,6 +635,205 @@ def main():
 def test_online_codebook_mask_invariants():
     failed = main()
     assert not failed, f"failed invariants: {failed}"
+
+
+def test_exact_multi_view_scorer_brackets_strict_and_first_token():
+    adapter, lm_eval_stubs = import_eval_adapter()
+    try:
+        scorer_model, scorer_cfg = small_model(base_token_positions=True)
+        scorer_model.eval()
+        lm = object.__new__(adapter.Zip2ZipLM)
+        lm.cfg = scorer_cfg
+        lm.model = scorer_model
+        lm._device = torch.device("cpu")
+        lm._dtype = torch.bfloat16
+        lm._max_length = 64
+        lm._compressor_kwargs = {
+            **codec_args(),
+            "max_codebook_size": scorer_cfg.max_codebook_size,
+        }
+        lm.hyper_causal_mask = True
+        lm.online_codebook_mask = True
+        lm.online_codebook_mask_active = True
+        lm.multi_view = True
+        lm.compression_stats = {
+            "in_comp": 0,
+            "in_base": 0,
+            "gen_comp": 0,
+            "gen_base": 0,
+            "online_skipped_targets": 0,
+            "online_replay_requests": 0,
+            "online_replay_tokens": 0,
+            "online_replay_seconds": 0.0,
+        }
+
+        forest_result = lm._score_compressed(
+            [1, 2, 1, 2],
+            cont_start_base=0,
+            compute_multi_view=True,
+        )
+        strict, _, _, _, first_token, n_hyper, exact = forest_result
+        assert n_hyper == 1
+        assert strict <= exact <= first_token
+        assert strict < exact
+        assert lm.compression_stats["exact_forest_forwards"] == 1
+        assert lm.compression_stats["exact_forest_targets"] == 1
+
+        lm._exact_multi_view_targets_logprobs = types.MethodType(
+            adapter.Zip2ZipLM._exact_multi_view_targets_logprobs_sequential, lm
+        )
+        sequential_result = lm._score_compressed(
+            [1, 2, 1, 2],
+            cont_start_base=0,
+            compute_multi_view=True,
+        )
+        torch.testing.assert_close(
+            torch.tensor(forest_result[6]),
+            torch.tensor(sequential_result[6]),
+            rtol=0,
+            atol=5e-4,
+        )
+        torch.testing.assert_close(
+            torch.tensor(forest_result[0]),
+            torch.tensor(sequential_result[0]),
+            rtol=0,
+            atol=1e-5,
+        )
+        torch.testing.assert_close(
+            torch.tensor(forest_result[4]),
+            torch.tensor(sequential_result[4]),
+            rtol=0,
+            atol=1e-5,
+        )
+
+        # Multiple online-codebook targets share one forest while retaining
+        # the exact branch replay count at every node.
+        lm._dtype = torch.float32
+        lm._exact_multi_view_targets_logprobs = types.MethodType(
+            adapter.Zip2ZipLM._exact_multi_view_targets_logprobs_forest, lm
+        )
+        online_multi_ids = [1, 2] * 16
+        online_forest = lm._score_compressed(
+            online_multi_ids,
+            cont_start_base=0,
+            compute_multi_view=True,
+        )
+        lm._exact_multi_view_targets_logprobs = types.MethodType(
+            adapter.Zip2ZipLM._exact_multi_view_targets_logprobs_sequential, lm
+        )
+        online_sequential = lm._score_compressed(
+            online_multi_ids,
+            cont_start_base=0,
+            compute_multi_view=True,
+        )
+        assert online_forest[5] > 1
+        torch.testing.assert_close(
+            torch.tensor(online_forest[6]),
+            torch.tensor(online_sequential[6]),
+            rtol=0,
+            atol=1e-5,
+        )
+
+        # A longer legacy-mask stream creates length-3/4 hypertokens and
+        # sibling segmentation prefixes; this exercises ancestor isolation,
+        # not just the single alternate prefix of a two-token target.
+        lm.online_codebook_mask = False
+        lm.online_codebook_mask_active = False
+        # Different packed shapes can change bf16 SDPA reduction order. Use
+        # fp32 here so this is a strict graph-equivalence test, not a tolerance
+        # test for low-precision kernel numerics.
+        forest_values = {}
+
+        def capture_forest(**kwargs):
+            values = adapter.Zip2ZipLM._exact_multi_view_targets_logprobs_forest(
+                lm, **kwargs
+            )
+            forest_values.update(values)
+            return values
+
+        lm._exact_multi_view_targets_logprobs = capture_forest
+        long_ids = [1, 2, 3, 4] * 8
+        forest_forwards_before = lm.compression_stats["exact_forest_forwards"]
+        forest_long = lm._score_compressed(
+            long_ids,
+            cont_start_base=0,
+            compute_multi_view=True,
+        )
+        assert len(forest_values) >= 3
+        assert (
+            lm.compression_stats["exact_forest_forwards"]
+            - forest_forwards_before
+            == 1
+        )
+        unchunked_values = dict(forest_values)
+        lm._exact_forest_max_nodes = 1
+        chunked_values = {}
+
+        def capture_chunked_forest(**kwargs):
+            values = adapter.Zip2ZipLM._exact_multi_view_targets_logprobs_forest(
+                lm, **kwargs
+            )
+            chunked_values.update(values)
+            return values
+
+        lm._exact_multi_view_targets_logprobs = capture_chunked_forest
+        chunked_forwards_before = lm.compression_stats["exact_forest_forwards"]
+        lm._score_compressed(
+            long_ids,
+            cont_start_base=0,
+            compute_multi_view=True,
+        )
+        assert (
+            lm.compression_stats["exact_forest_forwards"]
+            - chunked_forwards_before
+            > 1
+        )
+        assert unchunked_values.keys() == chunked_values.keys()
+        for position in unchunked_values:
+            torch.testing.assert_close(
+                torch.tensor(unchunked_values[position]),
+                torch.tensor(chunked_values[position]),
+                rtol=0,
+                atol=1e-5,
+            )
+        del lm._exact_forest_max_nodes
+        sequential_values = {}
+
+        def capture_sequential(**kwargs):
+            values = (
+                adapter.Zip2ZipLM._exact_multi_view_targets_logprobs_sequential(
+                    lm, **kwargs
+                )
+            )
+            sequential_values.update(values)
+            return values
+
+        lm._exact_multi_view_targets_logprobs = capture_sequential
+        sequential_long = lm._score_compressed(
+            long_ids,
+            cont_start_base=0,
+            compute_multi_view=True,
+        )
+        assert forest_values.keys() == sequential_values.keys()
+        for position in forest_values:
+            torch.testing.assert_close(
+                torch.tensor(forest_values[position]),
+                torch.tensor(sequential_values[position]),
+                rtol=0,
+                atol=1e-5,
+            )
+        assert forest_long[5] >= 3
+        torch.testing.assert_close(
+            torch.tensor(forest_long[6]),
+            torch.tensor(sequential_long[6]),
+            rtol=0,
+            atol=1e-5,
+        )
+    finally:
+        if lm_eval_stubs:
+            sys.modules.pop("zip2zip_core.lm_eval_adapter", None)
+            for name in reversed(lm_eval_stubs):
+                sys.modules.pop(name, None)
 
 
 if __name__ == "__main__":
