@@ -8,11 +8,11 @@ counted as error. The multi-view probability sums that mass back.
 
 The exact sum over all segmentations of an n-token expansion has O(2^(n-1))
 terms. This module provides both the complete segmentation enumeration used
-by the opt-in exact scorer and the tractable first-token upper bound from the
-zip2zip++ paper (eq. 14-15). The bound scores only the *first* token of each
-valid segmentation; the distinct first tokens of the segmentations of
-(y1..yn) are exactly the tokens whose own expansion is a non-empty prefix of
-(y1..yn):
+by the default multi-view scorer and the tractable first-token upper bound
+from the zip2zip++ paper (eq. 14-15). The bound scores only the *first*
+token of each valid segmentation; the distinct first tokens of the
+segmentations of (y1..yn) are exactly the tokens whose own expansion is a
+non-empty prefix of (y1..yn):
 
     p*(x | ctx) = p(y1 | ctx) + sum over L in 2..n of p(h_L | ctx)
 
@@ -192,6 +192,38 @@ def exact_segmentation_logprob(
     )
 
 
+def segmentation_proper_prefixes(
+    segmentations: Sequence[Sequence[int]],
+) -> List[Tuple[int, ...]]:
+    """Return the unique non-empty proper prefixes needed by the exact sum.
+
+    A model forward after prefix ``s[:j]`` supplies the conditional
+    distribution for token ``s[j]``. The empty prefix is already represented
+    by the canonical/root logits, and a complete segmentation never needs a
+    continuation distribution, so neither belongs in the returned list.
+
+    Prefixes are ordered by depth, then by first appearance in
+    ``segmentations``. Consequently every prefix's parent precedes it, which
+    is the topological order used by the packed tree-attention scorer.
+    """
+    by_depth: Dict[int, List[Tuple[int, ...]]] = {}
+    seen: set[Tuple[int, ...]] = set()
+    for segmentation in segmentations:
+        if not segmentation:
+            raise ValueError("a multi-view segmentation cannot be empty")
+        tokens = tuple(int(token) for token in segmentation)
+        for length in range(1, len(tokens)):
+            prefix = tokens[:length]
+            if prefix not in seen:
+                seen.add(prefix)
+                by_depth.setdefault(length, []).append(prefix)
+    return [
+        prefix
+        for depth in sorted(by_depth)
+        for prefix in by_depth[depth]
+    ]
+
+
 class MultiViewAccumulator:
     """Per-task strict and multi-view loglikelihood sums over rolling docs.
 
@@ -211,13 +243,14 @@ class MultiViewAccumulator:
         multi_view_logprob: float,
         n_hyper_targets: int,
         n_targets: int,
-        exact_multi_view_logprob: float | None = None,
+        first_token_multi_view_logprob: float,
     ) -> None:
         s = self._tasks.setdefault(
             task or "unknown",
             dict(
                 strict_loglik_sum=0.0,
                 multi_view_loglik_sum=0.0,
+                first_token_multi_view_loglik_sum=0.0,
                 docs=0,
                 targets_scored=0,
                 hyper_targets_scored=0,
@@ -225,9 +258,7 @@ class MultiViewAccumulator:
         )
         s["strict_loglik_sum"] += strict_logprob
         s["multi_view_loglik_sum"] += multi_view_logprob
-        if exact_multi_view_logprob is not None:
-            s.setdefault("exact_multi_view_loglik_sum", 0.0)
-            s["exact_multi_view_loglik_sum"] += exact_multi_view_logprob
+        s["first_token_multi_view_loglik_sum"] += first_token_multi_view_logprob
         s["docs"] += 1
         s["targets_scored"] += n_targets
         s["hyper_targets_scored"] += n_hyper_targets

@@ -17,6 +17,7 @@ from zip2zip_core.multi_view import (
     exact_segmentation_logprob,
     multi_view_candidates,
     multi_view_segmentations,
+    segmentation_proper_prefixes,
 )
 
 V = 100  # toy base vocab size; hyper ids start here
@@ -148,6 +149,29 @@ def test_exact_segmentations_keep_canonical_path_with_stale_index():
     assert (1, 2, 3) in got
 
 
+def test_segmentation_proper_prefixes_are_unique_and_parent_first():
+    segmentations = [
+        (1, 2, 3, 4),
+        (1, 2, V + 2),
+        (1, V + 1, 4),
+        (V + 0, 3, 4),
+        (V + 0, V + 2),
+        (V + 3, 4),
+        (V + 5,),
+    ]
+    prefixes = segmentation_proper_prefixes(segmentations)
+    assert len(prefixes) == len(set(prefixes))
+    assert set(prefixes) == {
+        (1,), (V + 0,), (V + 3,),
+        (1, 2), (1, V + 1), (V + 0, 3),
+        (1, 2, 3),
+    }
+    positions = {prefix: i for i, prefix in enumerate(prefixes)}
+    for prefix in prefixes:
+        if len(prefix) > 1:
+            assert positions[prefix[:-1]] < positions[prefix]
+
+
 def test_exact_logprob_matches_hand_computed_formula_12():
     a, b, c = 1, 2, 3
     H_ab, H_bc, H_abc = V + 0, V + 1, V + 2
@@ -183,13 +207,14 @@ def test_exact_logprob_rejects_empty_segmentation_set():
 
 def test_accumulator_sums_documents_per_task():
     acc = MultiViewAccumulator()
-    acc.add_document("pile", -2.0, -1.5, 1, 2)
-    acc.add_document("pile", -2.0, -1.5, 0, 2)
-    acc.add_document("mc4", -1.0, -1.0, 0, 1)  # separate task
+    acc.add_document("pile", -2.0, -1.7, 1, 2, -1.5)
+    acc.add_document("pile", -2.0, -1.7, 0, 2, -1.5)
+    acc.add_document("mc4", -1.0, -1.0, 0, 1, -1.0)  # separate task
     s = acc.summary()
     assert s["pile"] == dict(
         strict_loglik_sum=-4.0,
-        multi_view_loglik_sum=-3.0,
+        multi_view_loglik_sum=-3.4,
+        first_token_multi_view_loglik_sum=-3.0,
         docs=2,
         targets_scored=4,
         hyper_targets_scored=1,
@@ -200,8 +225,8 @@ def test_accumulator_sums_documents_per_task():
 
 def test_accumulator_counts_unscored_documents():
     acc = MultiViewAccumulator()
-    acc.add_document("wikitext", -3.0, -3.0, 0, 1)
-    acc.add_document("wikitext", 0.0, 0.0, 0, 0)  # doc too short to score
+    acc.add_document("wikitext", -3.0, -3.0, 0, 1, -3.0)
+    acc.add_document("wikitext", 0.0, 0.0, 0, 0, 0.0)  # doc too short
     s = acc.summary()["wikitext"]
     assert s["docs"] == 2
     assert s["strict_loglik_sum"] == -3.0
@@ -209,19 +234,23 @@ def test_accumulator_counts_unscored_documents():
 
 def test_accumulator_none_task_buckets_as_unknown():
     acc = MultiViewAccumulator()
-    acc.add_document(None, -1.0, -1.0, 0, 1)
+    acc.add_document(None, -1.0, -1.0, 0, 1, -1.0)
     assert "unknown" in acc.summary()
 
 
-def test_accumulator_records_exact_sum_only_when_supplied():
+def test_accumulator_records_exact_and_first_token_sums():
     acc = MultiViewAccumulator()
-    acc.add_document("wiki", -2.0, -1.0, 1, 1, exact_multi_view_logprob=-1.5)
-    exact = acc.summary()["wiki"]
-    assert exact["exact_multi_view_loglik_sum"] == -1.5
-
-    legacy = MultiViewAccumulator()
-    legacy.add_document("wiki", -2.0, -1.0, 1, 1)
-    assert "exact_multi_view_loglik_sum" not in legacy.summary()["wiki"]
+    acc.add_document(
+        "wiki",
+        -2.0,
+        -1.5,
+        1,
+        1,
+        first_token_multi_view_logprob=-1.0,
+    )
+    summary = acc.summary()["wiki"]
+    assert summary["multi_view_loglik_sum"] == -1.5
+    assert summary["first_token_multi_view_loglik_sum"] == -1.0
 
 
 # ─────────────────────── denominator-free derivation ───────────────────────
@@ -248,11 +277,11 @@ def test_derivation_matches_hand_computed_metrics():
     assert abs(out["implied_byte_denominator"] - 5.0) < 1e-9
 
 
-def test_derivation_supports_exact_metric_namespace():
+def test_derivation_supports_first_token_metric_namespace():
     sums = {
         "strict_loglik_sum": -4.0,
-        "multi_view_loglik_sum": -3.0,
-        "exact_multi_view_loglik_sum": -3.5,
+        "multi_view_loglik_sum": -3.5,
+        "first_token_multi_view_loglik_sum": -3.0,
     }
     ln2 = math.log(2)
     reported = {
@@ -262,18 +291,18 @@ def test_derivation_supports_exact_metric_namespace():
     out = derive_multi_view_metrics(
         sums,
         reported,
-        loglik_key="exact_multi_view_loglik_sum",
-        metric_prefix="exact_multi_view",
-        gap_prefix="exact_segmentation_gap",
+        loglik_key="first_token_multi_view_loglik_sum",
+        metric_prefix="first_token_multi_view",
+        gap_prefix="first_token_segmentation_gap",
     )
-    assert out["exact_multi_view_byte_perplexity"] == pytest.approx(
-        math.exp(3.5 / 5), abs=1e-12
+    assert out["first_token_multi_view_byte_perplexity"] == pytest.approx(
+        math.exp(3.0 / 5), abs=1e-12
     )
-    assert out["exact_multi_view_bits_per_byte"] == pytest.approx(
-        3.5 / (5 * ln2), abs=1e-12
+    assert out["first_token_multi_view_bits_per_byte"] == pytest.approx(
+        3.0 / (5 * ln2), abs=1e-12
     )
-    assert out["exact_segmentation_gap_bits_per_byte"] == pytest.approx(
-        0.5 / (5 * ln2), abs=1e-12
+    assert out["first_token_segmentation_gap_bits_per_byte"] == pytest.approx(
+        1.0 / (5 * ln2), abs=1e-12
     )
 
 
