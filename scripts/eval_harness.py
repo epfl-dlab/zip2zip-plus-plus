@@ -120,16 +120,9 @@ def main():
     p.add_argument("--no_multi_view", action="store_true",
                    help="Disable the multi-view perplexity columns. On by "
                         "default: rolling-perplexity tasks additionally report "
-                        "multi_view_* metrics that marginalize each hypertoken "
-                        "target over every valid same-text first token "
-                        "(first-token bound). Strict metrics are never "
+                        "multi_view_* metrics using the exact complete-"
+                        "segmentation marginal. Strict metrics are never "
                         "affected either way.")
-    p.add_argument("--exact_multi_view", action="store_true",
-                   help="Additionally compute the exact formula-(12)/(13) "
-                        "multi-view metrics by scoring every complete valid "
-                        "segmentation. Correctness-first and potentially much "
-                        "slower because each non-canonical prefix requires a "
-                        "full model forward.")
     p.add_argument("--legacy_untrimmed_stops", action="store_true",
                    help="Return generated text without cutting it at the first "
                         "stop-string occurrence, as all evals did before 2026-08. "
@@ -167,8 +160,6 @@ def main():
 
     preset_info = _apply_preset(p)
     args = p.parse_args()
-    if args.exact_multi_view and args.no_multi_view:
-        p.error("--exact_multi_view cannot be combined with --no_multi_view")
 
     ckpt_dir = _resolve_ckpt_dir(args)
     tasks = (
@@ -199,7 +190,6 @@ def main():
         eval_max_subtokens=args.eval_max_subtokens,
         trim_stop_strings=not args.legacy_untrimmed_stops,
         multi_view=not args.no_multi_view,
-        exact_multi_view=args.exact_multi_view,
     )
     # The adapter auto-enables digit protection for checkpoints trained with it
     # and auto-switches control checkpoints (max_codebook_size=0) to base mode —
@@ -224,7 +214,6 @@ def main():
     args.online_codebook_mask_active = lm.online_codebook_mask_active
     args.trim_stop_strings = lm.trim_stop_strings
     args.multi_view = lm.multi_view
-    args.exact_multi_view = lm.exact_multi_view
     # Distinguishes "inactive because base mode" from "inactive because this eval
     # deliberately asked for the legacy mask" — otherwise a results JSON cannot
     # be audited for which regime produced its numbers.
@@ -289,16 +278,15 @@ def main():
             if name in ("word_perplexity", "byte_perplexity", "bits_per_byte"):
                 reported.setdefault(name, v)
         derived = derive_multi_view_metrics(mv_sums, reported)
-        if "exact_multi_view_loglik_sum" in mv_sums:
-            derived.update(
-                derive_multi_view_metrics(
-                    mv_sums,
-                    reported,
-                    loglik_key="exact_multi_view_loglik_sum",
-                    metric_prefix="exact_multi_view",
-                    gap_prefix="exact_segmentation_gap",
-                )
+        derived.update(
+            derive_multi_view_metrics(
+                mv_sums,
+                reported,
+                loglik_key="first_token_multi_view_loglik_sum",
+                metric_prefix="first_token_multi_view",
+                gap_prefix="first_token_segmentation_gap",
             )
+        )
         multi_view[mv_task] = {**mv_sums, **derived}
         if row is not None:
             for k, v in derived.items():
@@ -306,8 +294,8 @@ def main():
                     (
                         "multi_view_",
                         "segmentation_gap_",
-                        "exact_multi_view_",
-                        "exact_segmentation_gap_",
+                        "first_token_multi_view_",
+                        "first_token_segmentation_gap_",
                     )
                 ) and isinstance(
                     v, (int, float)
@@ -323,12 +311,8 @@ def main():
     print("Compression (base tokens per compressed token, >1 = more compression):")
     print(json.dumps(compression, indent=2))
     if multi_view:
-        if args.exact_multi_view:
-            print("Multi-view perplexity (historical same-text first-token "
-                  "bound plus exact complete-segmentation marginal):")
-        else:
-            print("Multi-view perplexity (hypertoken targets marginalized over "
-                  "all same-text first tokens; first-token bound):")
+        print("Multi-view perplexity (exact complete-segmentation marginal "
+              "plus first-token upper bound):")
         print(json.dumps(multi_view, indent=2))
         for mv_task, mv_metrics in multi_view.items():
             # Back-solving the byte denominator from our strict sum and the
