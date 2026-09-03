@@ -4,6 +4,19 @@ The audited values come from the Repeat-4/Repeat-8 evaluation JSONs under
 ``/dlabscratch1/xinma/logs/eval``.  M3 is vx0.6.4.5 (trained with maximum
 merge size 3); M4 is vx0.6.4.3 (trained with maximum merge size 4).
 
+Every perplexity below was regenerated on 2026-09-03 with the fixed multi-view
+harness, from these seven runs (``results_*<tag>*.json``):
+
+    mvfix-m3-r8-k3, -k5, -k6, -k7, -k8   M3, WikiText x8 only, K_eval = 3,5..8
+    mvfix-m3-all-k4                      M3, all three corpora, K_eval = 4
+    mvfix-m4-all-k4                      M4, all three corpora, K_eval = 4
+
+Strict perplexities reproduced the previous values exactly; only the
+multi-view values moved, by 1e-6 to 2e-6.  The three compression arrays are
+LZW properties of the corpus and ``K_eval`` alone -- independent of the
+checkpoint and of the perplexity scorer -- so they are unchanged, and the
+Repeat-8 column was re-verified against the five single-corpus runs above.
+
 Usage:
     python plot/plot_merge_size_transfer.py
     python plot/plot_merge_size_transfer.py --output-dir /path/to/figures
@@ -32,12 +45,12 @@ STRICT_BYTE_PPL = np.array([
     1.1712367105,
 ])
 MULTI_VIEW_BYTE_PPL = np.array([
-    1.1033723623,
-    1.1489542686,
-    1.1598255479,
-    1.1542962221,
-    1.1539505401,
-    1.1538362955,
+    1.1033719017,
+    1.1489530517,
+    1.1598237164,
+    1.1542942817,
+    1.1539484902,
+    1.1538341796,
 ])
 COMPRESSION = np.array([
     2.0284793001,
@@ -52,13 +65,13 @@ WIKITEXT_COMPRESSION = np.array([1.1664272766, 1.1689825309, 1.1695630726, 1.169
 
 # Native M4 at the matched K_eval=4 Repeat-8 segmentation.
 M4_STRICT_REPEAT8_BYTE_PPL = 1.1121679450
-M4_MULTI_REPEAT8_BYTE_PPL = 1.1096448877
+M4_MULTI_REPEAT8_BYTE_PPL = 1.1096440250
 
 # Strict and exact multi-view byte PPL at matched K_eval=4 segmentation.
 M3_TRANSFER_STRICT_BYTE_PPL = np.array([1.6599958493, 1.2049554316, 1.1534654876])
-M3_TRANSFER_MULTI_BYTE_PPL = np.array([1.6301596421, 1.1975311245, 1.1489542686])
+M3_TRANSFER_MULTI_BYTE_PPL = np.array([1.6301572635, 1.1975300953, 1.1489530517])
 M4_NATIVE_STRICT_BYTE_PPL = np.array([1.6586237867, 1.1922272337, 1.1121679450])
-M4_NATIVE_MULTI_BYTE_PPL = np.array([1.6301320336, 1.1863572862, 1.1096448877])
+M4_NATIVE_MULTI_BYTE_PPL = np.array([1.6301298759, 1.1863561672, 1.1096440250])
 
 
 INK = "#171717"
