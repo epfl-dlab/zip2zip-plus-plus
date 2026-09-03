@@ -562,11 +562,11 @@ class Zip2ZipLM(LM):
     ) -> float:
         """Exact formula-(12) marginal for one canonical hypertoken target.
 
-        S(x_i) is frozen to the hyper-token ids available at the start of the
-        target. For every non-empty proper segmentation prefix, the model is
-        re-run on canonical_context + prefix so subsequent factors use the
-        actual non-canonical autoregressive history. Online dictionary counts
-        are replayed on that same branch.
+        S(x_i) and the output codebook are frozen to the hyper-token ids
+        available at the start of the target. For every non-empty proper
+        segmentation prefix, the model is re-run on canonical_context + prefix
+        so subsequent factors use the actual non-canonical autoregressive
+        history without exposing later codebook rows.
         """
         V = self.cfg.vocab_size
         finite_slots = torch.nonzero(
@@ -578,6 +578,7 @@ class Zip2ZipLM(LM):
                 f"exact multi-view target {target_id} is unavailable at the "
                 "start of its canonical context"
             )
+        root_codebook_count = int(finite_slots[-1]) + 1
 
         segmentations = multi_view_segmentations(
             target_id,
@@ -602,35 +603,21 @@ class Zip2ZipLM(LM):
                 x = torch.tensor(
                     branch_ids, dtype=torch.long, device=self._device
                 ).unsqueeze(0)
-                branch_counts = None
-                if self.online_codebook_mask_active:
-                    replay_start = time.perf_counter()
-                    counts_cpu = online_codebook_counts(
-                        branch_ids, codebook, self._compressor_kwargs
-                    )
-                    self.compression_stats["online_replay_seconds"] += (
-                        time.perf_counter() - replay_start
-                    )
-                    self.compression_stats["online_replay_requests"] += 1
-                    self.compression_stats["online_replay_tokens"] += len(branch_ids)
-                    branch_counts = counts_cpu.to(self._device).unsqueeze(0)
+                # The complete-segmentation marginal is defined against the
+                # target-start codebook. Passing an explicit constant count
+                # prevents the legacy k<=t mask (or online replay) from
+                # exposing additional rows as this branch prefix grows.
+                branch_counts = torch.full_like(x, root_codebook_count)
 
                 with torch.autocast(
                     device_type=self._device.type, dtype=self._dtype
                 ):
-                    if branch_counts is None:
-                        out = self.model(
-                            x,
-                            codebook=cb_tensor,
-                            hyper_causal_mask=self.hyper_causal_mask,
-                        )
-                    else:
-                        out = self.model(
-                            x,
-                            codebook=cb_tensor,
-                            hyper_causal_mask=self.hyper_causal_mask,
-                            codebook_counts=branch_counts,
-                        )
+                    out = self.model(
+                        x,
+                        codebook=cb_tensor,
+                        hyper_causal_mask=self.hyper_causal_mask,
+                        codebook_counts=branch_counts,
+                    )
                 logits = out[0] if isinstance(out, tuple) else out
                 branch_log_probs = F.log_softmax(
                     logits[0, -1].float(), dim=-1
@@ -743,8 +730,16 @@ class Zip2ZipLM(LM):
                         "exact multi-view branch exceeded max_length: "
                         f"{branch_len} > {self._max_length}"
                     )
+            root_codebook_count = int(finite_slots[-1]) + 1
             prepared.append(
-                (position, target_id, root_log_probs, segmentations, prefixes)
+                (
+                    position,
+                    target_id,
+                    root_log_probs,
+                    segmentations,
+                    prefixes,
+                    root_codebook_count,
+                )
             )
 
         max_nodes = int(getattr(self, "_exact_forest_max_nodes", 512))
@@ -832,7 +827,9 @@ class Zip2ZipLM(LM):
                 device=self._device,
             )
 
-            packed_counts = None
+            # Keep every branch on its target-start output codebook. The
+            # backbone values only make this a full-shaped tensor;
+            # logit_positions selects branch nodes before the output heads.
             if self.online_codebook_mask_active:
                 if canonical_codebook_counts is None:
                     raise RuntimeError(
@@ -844,33 +841,26 @@ class Zip2ZipLM(LM):
                 counts[:backbone_len] = canonical_codebook_counts[
                     :backbone_len
                 ].to(device=self._device, dtype=torch.long)
-                for node, (target_number, prefix) in enumerate(node_records):
-                    position = forest_targets[target_number][0]
-                    branch_ids = list(canonical_tokens[: position + 1]) + list(
-                        prefix
-                    )
-                    replay_start = time.perf_counter()
-                    branch_counts = online_codebook_counts(
-                        branch_ids, codebook, self._compressor_kwargs
-                    )
-                    self.compression_stats["online_replay_seconds"] += (
-                        time.perf_counter() - replay_start
-                    )
-                    self.compression_stats["online_replay_requests"] += 1
-                    self.compression_stats["online_replay_tokens"] += len(
-                        branch_ids
-                    )
-                    counts[node_start + node] = branch_counts[-1]
-                packed_counts = counts.unsqueeze(0)
             elif self.hyper_causal_mask:
-                counts = list(range(1, backbone_len + 1))
-                counts.extend(
-                    forest_targets[target_number][0] + 1 + len(prefix)
-                    for target_number, prefix in node_records
+                counts = torch.empty(
+                    total_len, dtype=torch.long, device=self._device
                 )
-                packed_counts = torch.tensor(
-                    [counts], dtype=torch.long, device=self._device
+                counts[:backbone_len] = torch.arange(
+                    1,
+                    backbone_len + 1,
+                    dtype=torch.long,
+                    device=self._device,
                 )
+            else:
+                counts = torch.full(
+                    (total_len,),
+                    cb_tensor.shape[1],
+                    dtype=torch.long,
+                    device=self._device,
+                )
+            for node, (target_number, _) in enumerate(node_records):
+                counts[node_start + node] = forest_targets[target_number][5]
+            packed_counts = counts.unsqueeze(0)
 
             logit_positions = torch.arange(
                 node_start, total_len, dtype=torch.long, device=self._device
@@ -891,7 +881,7 @@ class Zip2ZipLM(LM):
             node_log_probs = F.log_softmax(logits[0].float(), dim=-1)
 
             for target_number, target in enumerate(forest_targets):
-                position, _, root_log_probs, segmentations, prefixes = target
+                position, _, root_log_probs, segmentations, prefixes, _ = target
                 prefix_log_probs = {
                     prefix: node_log_probs[
                         node_lookup[(target_number, prefix)]
