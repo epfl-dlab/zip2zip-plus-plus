@@ -387,6 +387,24 @@ $$
 \le \mathrm{BPPL}_{\mathrm{strict}}.
 $$
 
+### Performance
+
+The first-token-only evaluation took 65.0 seconds. The original sequential
+exact scorer increased end-to-end evaluation time to 2,675.7 seconds, or
+41.16x the first-token baseline. The current fixed-root tree-attention scorer
+completed in 103.0 seconds, or 1.58x the first-token baseline:
+
+| Implementation | Evaluation time | Relative to first-token |
+|---|---:|---:|
+| First-token only | 65.0s | 1.00x |
+| Original sequential exact | 2,675.7s | 41.16x |
+| Current cross-target tree attention | 103.0s | 1.58x |
+
+Tree attention is therefore approximately 26.0x faster than the original
+sequential exact scorer end to end. Absolute times vary with hardware and
+cluster load, but the comparison shows that exact multi-view scoring is now
+close to the cost of first-token evaluation.
+
 Tree execution statistics:
 
 ```text
