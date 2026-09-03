@@ -32,12 +32,12 @@ STRICT_BYTE_PPL = np.array([
     1.1712367105,
 ])
 MULTI_VIEW_BYTE_PPL = np.array([
-    1.0959358916,
-    1.1026679268,
-    1.1040350346,
-    1.1043257040,
-    1.1044348092,
-    1.1044937425,
+    1.1033723623,
+    1.1489542686,
+    1.1598255479,
+    1.1542962221,
+    1.1539505401,
+    1.1538362955,
 ])
 COMPRESSION = np.array([
     2.0284793001,
@@ -52,14 +52,13 @@ WIKITEXT_COMPRESSION = np.array([1.1664272766, 1.1689825309, 1.1695630726, 1.169
 
 # Native M4 at the matched K_eval=4 Repeat-8 segmentation.
 M4_STRICT_REPEAT8_BYTE_PPL = 1.1121679450
-M4_MULTI_REPEAT8_BYTE_PPL = 1.0989894566
+M4_MULTI_REPEAT8_BYTE_PPL = 1.1096448877
 
-# Matched-segmentation relative transfer penalties:
-# 100 * (PPL(M3, K_eval=4) / PPL(M4, K_eval=4) - 1).
-STRICT_TRANSFER_PCT = np.array([0.0827229508, 1.0675983239, 3.7132469835])
-MULTI_TRANSFER_PCT = np.array([-0.0233673253, 0.2524785799, 0.3347138756])
-# Fraction of scored compressed targets whose expansion length is exactly 4.
-LENGTH4_TARGET_SHARE = np.array([0.3974632174, 2.8073336482, 15.9927013087])
+# Strict and exact multi-view byte PPL at matched K_eval=4 segmentation.
+M3_TRANSFER_STRICT_BYTE_PPL = np.array([1.6599958493, 1.2049554316, 1.1534654876])
+M3_TRANSFER_MULTI_BYTE_PPL = np.array([1.6301596421, 1.1975311245, 1.1489542686])
+M4_NATIVE_STRICT_BYTE_PPL = np.array([1.6586237867, 1.1922272337, 1.1121679450])
+M4_NATIVE_MULTI_BYTE_PPL = np.array([1.6301320336, 1.1863572862, 1.1096448877])
 
 
 INK = "#171717"
@@ -111,8 +110,8 @@ def make_figure() -> plt.Figure:
         style_axis(ax)
 
     # (a) Strict and multi-view loss under extrapolation.
-    ax_loss.axvspan(3.02, 8.25, color=UNSEEN, zorder=0)
-    ax_loss.axvline(3, color=INK2, linewidth=1.0, linestyle=(0, (3, 3)), zorder=1)
+    ax_loss.axvspan(3.5, 8.25, color=UNSEEN, zorder=0)
+    ax_loss.axvline(3.5, color=INK2, linewidth=1.0, linestyle=(0, (3, 3)), zorder=1)
     ax_loss.plot(
         K_EVAL,
         STRICT_BYTE_PPL,
@@ -151,7 +150,11 @@ def make_figure() -> plt.Figure:
         label="M4 multi-view", zorder=5,
     )
     ax_loss.text(
-        5.72, 1.29, "unseen merge sizes",
+        3.08, 1.29, "seen merge sizes",
+        ha="center", va="top", fontsize=6.8, color=INK2,
+    )
+    ax_loss.text(
+        5.85, 1.29, "unseen merge sizes",
         ha="center", va="top", fontsize=7.5, color=INK2,
     )
     ax_loss.annotate(
@@ -181,8 +184,8 @@ def make_figure() -> plt.Figure:
     ax_loss.set_yticklabels([f"{tick:.3f}" for tick in loss_ticks])
     ax_loss.set_xticks(K_EVAL)
     ax_loss.set_xlabel(r"Evaluation max merge size $K_{\mathrm{eval}}$")
-    ax_loss.set_ylabel("Byte perplexity (lower is better)")
-    ax_loss.set_title("(c) Repeat-8 extrapolation", loc="left", fontweight="bold")
+    ax_loss.set_ylabel("Byte perplexity")
+    ax_loss.set_title("(c) WikiText ×8 generalization", loc="left", fontweight="bold")
     ax_loss.legend(
         loc="lower right",
         bbox_to_anchor=(1.01, 0.03),
@@ -201,7 +204,7 @@ def make_figure() -> plt.Figure:
         markersize=5.2,
         markeredgecolor=SURFACE,
         markeredgewidth=0.9,
-        label="Repeat-8",
+        label="WikiText ×8",
         zorder=4,
     )
     ax_comp.plot(
@@ -214,7 +217,7 @@ def make_figure() -> plt.Figure:
         markersize=4.8,
         markeredgecolor=SURFACE,
         markeredgewidth=0.9,
-        label="Repeat-4",
+        label="WikiText ×4",
         zorder=4,
     )
     ax_comp.plot(
@@ -241,58 +244,66 @@ def make_figure() -> plt.Figure:
 
     # Matched M3-transfer vs. M4-native comparison at identical K_eval=4.
     x = np.arange(3)
-    width = 0.28
-    strict_bars = ax_penalty.bar(
-        x - width / 2, STRICT_TRANSFER_PCT, width,
-        color=STRICT, label="Strict", zorder=3,
+    width = 0.16
+    m3_strict_bars = ax_penalty.bar(
+        x - 1.75 * width, M3_TRANSFER_STRICT_BYTE_PPL, width,
+        color=STRICT, edgecolor=STRICT, linewidth=1.4,
+        label="M3 strict", zorder=3,
     )
-    multi_bars = ax_penalty.bar(
-        x + width / 2, MULTI_TRANSFER_PCT, width,
-        color=MULTI, label="Multi-view", zorder=3,
+    m4_strict_bars = ax_penalty.bar(
+        x - 0.75 * width, M4_NATIVE_STRICT_BYTE_PPL, width,
+        facecolor=SURFACE, edgecolor=STRICT, linewidth=1.4,
+        hatch="///", label="M4 strict", zorder=3,
     )
-    for bars in (strict_bars, multi_bars):
-        x_offset = -4 if bars is strict_bars else 4
+    m3_multi_bars = ax_penalty.bar(
+        x + 0.75 * width, M3_TRANSFER_MULTI_BYTE_PPL, width,
+        color=MULTI, edgecolor=MULTI, linewidth=1.4,
+        label="M3 multi-view", zorder=3,
+    )
+    m4_multi_bars = ax_penalty.bar(
+        x + 1.75 * width, M4_NATIVE_MULTI_BYTE_PPL, width,
+        facecolor=SURFACE, edgecolor=MULTI, linewidth=1.4,
+        hatch="///", label="M4 multi-view", zorder=3,
+    )
+    for bars in (
+        m3_strict_bars,
+        m3_multi_bars,
+        m4_strict_bars,
+        m4_multi_bars,
+    ):
         for bar in bars:
             height = bar.get_height()
-            label = "≈0%" if abs(height) < 0.05 else f"{height:.2f}%"
             ax_penalty.annotate(
-                label,
-                (bar.get_x() + bar.get_width() / 2, max(height, 0.0)),
-                xytext=(x_offset, 8),
+                f"{height:.4f}",
+                (bar.get_x() + bar.get_width() / 2, height),
+                xytext=(0, 3),
                 textcoords="offset points",
                 ha="center",
                 va="bottom",
-                bbox={"facecolor": SURFACE, "edgecolor": "none", "pad": 0.25},
-                fontsize=7.4,
+                rotation=90,
+                fontsize=6.2,
                 color=INK,
             )
     ax_penalty.set_xticks(x)
     ax_penalty.set_xticklabels([
-        f"WikiText\n({LENGTH4_TARGET_SHARE[0]:.1f}%)",
-        f"Repeat-4\n({LENGTH4_TARGET_SHARE[1]:.1f}%)",
-        f"Repeat-8\n({LENGTH4_TARGET_SHARE[2]:.1f}%)",
+        "WikiText",
+        "WikiText ×4",
+        "WikiText ×8",
     ])
-    ax_penalty.set_ylim(-0.12, 4.45)
-    ax_penalty.set_ylabel("Relative byte-PPL difference: M3 vs. M4 (%)")
-    ax_penalty.set_title("(b) Matched segmentation", loc="left", fontweight="bold")
+    ax_penalty.set_ylim(1.0, 1.76)
+    ax_penalty.set_ylabel("Byte perplexity")
+    ax_penalty.set_title(
+        "(b) M3: 3→4 vs. M4: 4→4*", loc="left", fontweight="bold"
+    )
     ax_penalty.legend(
-        loc="upper left", frameon=False, ncol=1, labelspacing=0.35,
-        handlelength=1.4, bbox_to_anchor=(0.01, 0.99),
+        loc="upper right", frameon=False, ncol=2, columnspacing=0.8,
+        labelspacing=0.3, handlelength=1.3, fontsize=6.5,
+        bbox_to_anchor=(1.01, 0.99),
     )
     ax_penalty.text(
         0.5,
-        -0.20,
-        "Parentheses: share of length-4 targets",
-        transform=ax_penalty.transAxes,
-        ha="center",
-        va="top",
-        fontsize=6.8,
-        color=INK2,
-    )
-    ax_penalty.text(
-        0.5,
-        -0.32,
-        r"$100\!\times\![\mathrm{PPL}(M3,K=4)/\mathrm{PPL}(M4,K=4)-1]$",
+        -0.13,
+        r"* Train → evaluation max merge size; both use $K_{\mathrm{eval}}=4$",
         transform=ax_penalty.transAxes,
         ha="center",
         va="top",
@@ -300,7 +311,7 @@ def make_figure() -> plt.Figure:
         color=INK2,
     )
 
-    fig.subplots_adjust(left=0.068, right=0.992, top=0.90, bottom=0.27)
+    fig.subplots_adjust(left=0.068, right=0.992, top=0.90, bottom=0.17)
     return fig
 
 
