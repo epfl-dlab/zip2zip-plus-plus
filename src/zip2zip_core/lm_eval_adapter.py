@@ -780,8 +780,24 @@ class Zip2ZipLM(LM):
                     node_lookup[(target_number, prefix)] = len(node_records)
                     node_records.append((target_number, prefix))
 
-            node_start = backbone_len
-            packed_ids = backbone + [prefix[-1] for _, prefix in node_records]
+            targets_by_position: Dict[int, List[int]] = {}
+            for target_number, target in enumerate(forest_targets):
+                targets_by_position.setdefault(target[0], []).append(target_number)
+
+            # Interleave every target tree immediately after its canonical root.
+            # Physical order is presentation-only: the explicit row maps below
+            # preserve the same canonical and branch dependency graph.
+            packed_ids = []
+            canonical_rows = {}
+            node_rows = {}
+            for position, token in enumerate(backbone):
+                canonical_rows[position] = len(packed_ids)
+                packed_ids.append(token)
+                for target_number in targets_by_position.get(position, []):
+                    for prefix in forest_targets[target_number][4]:
+                        node_rows[(target_number, prefix)] = len(packed_ids)
+                        packed_ids.append(prefix[-1])
+
             total_len = len(packed_ids)
             x = torch.tensor(
                 packed_ids, dtype=torch.long, device=self._device
@@ -791,41 +807,41 @@ class Zip2ZipLM(LM):
                 (total_len, total_len),
                 dtype=torch.bool,
             )
-            forest_mask[:backbone_len, :backbone_len] = torch.ones(
-                (backbone_len, backbone_len),
-                dtype=torch.bool,
-            ).tril_()
-            for node, (target_number, prefix) in enumerate(node_records):
-                row = node_start + node
+            canonical_row_indices = torch.tensor(
+                [canonical_rows[position] for position in range(backbone_len)],
+                dtype=torch.long,
+            )
+            forest_mask[
+                canonical_row_indices[:, None], canonical_row_indices[None, :]
+            ] = torch.ones((backbone_len, backbone_len), dtype=torch.bool).tril_()
+            for target_number, prefix in node_records:
+                row = node_rows[(target_number, prefix)]
                 position = forest_targets[target_number][0]
-                forest_mask[row, : position + 1] = True
+                forest_mask[row, canonical_row_indices[: position + 1]] = True
                 for depth in range(1, len(prefix) + 1):
                     ancestor = prefix[:depth]
-                    ancestor_node = node_lookup[(target_number, ancestor)]
-                    forest_mask[row, node_start + ancestor_node] = True
+                    forest_mask[row, node_rows[(target_number, ancestor)]] = True
             forest_mask = forest_mask.to(self._device)
 
+            packed_positions = torch.empty(total_len, dtype=torch.long)
             if self.cfg.base_token_positions:
-                canonical_positions = [end - 1 for end in base_ends]
-                node_positions = []
+                for position, row in canonical_rows.items():
+                    packed_positions[row] = base_ends[position] - 1
                 for target_number, prefix in node_records:
                     position = forest_targets[target_number][0]
-                    node_positions.append(
+                    packed_positions[node_rows[(target_number, prefix)]] = (
                         base_ends[position]
                         + sum(token_span(token) for token in prefix)
                         - 1
                     )
             else:
-                canonical_positions = list(range(backbone_len))
-                node_positions = [
-                    forest_targets[target_number][0] + len(prefix)
-                    for target_number, prefix in node_records
-                ]
-            positions = torch.tensor(
-                [canonical_positions + node_positions],
-                dtype=torch.long,
-                device=self._device,
-            )
+                for position, row in canonical_rows.items():
+                    packed_positions[row] = position
+                for target_number, prefix in node_records:
+                    packed_positions[node_rows[(target_number, prefix)]] = (
+                        forest_targets[target_number][0] + len(prefix)
+                    )
+            positions = packed_positions.unsqueeze(0).to(self._device)
 
             # Keep every branch on its target-start output codebook. The
             # backbone values only make this a full-shaped tensor;
@@ -838,19 +854,14 @@ class Zip2ZipLM(LM):
                 counts = torch.empty(
                     total_len, dtype=torch.long, device=self._device
                 )
-                counts[:backbone_len] = canonical_codebook_counts[
-                    :backbone_len
-                ].to(device=self._device, dtype=torch.long)
+                for position, row in canonical_rows.items():
+                    counts[row] = canonical_codebook_counts[position]
             elif self.hyper_causal_mask:
                 counts = torch.empty(
                     total_len, dtype=torch.long, device=self._device
                 )
-                counts[:backbone_len] = torch.arange(
-                    1,
-                    backbone_len + 1,
-                    dtype=torch.long,
-                    device=self._device,
-                )
+                for position, row in canonical_rows.items():
+                    counts[row] = position + 1
             else:
                 counts = torch.full(
                     (total_len,),
@@ -858,12 +869,16 @@ class Zip2ZipLM(LM):
                     dtype=torch.long,
                     device=self._device,
                 )
-            for node, (target_number, _) in enumerate(node_records):
-                counts[node_start + node] = forest_targets[target_number][5]
+            for target_number, prefix in node_records:
+                counts[node_rows[(target_number, prefix)]] = forest_targets[
+                    target_number
+                ][5]
             packed_counts = counts.unsqueeze(0)
 
-            logit_positions = torch.arange(
-                node_start, total_len, dtype=torch.long, device=self._device
+            logit_positions = torch.tensor(
+                [node_rows[record] for record in node_records],
+                dtype=torch.long,
+                device=self._device,
             )
             with torch.autocast(
                 device_type=self._device.type, dtype=self._dtype

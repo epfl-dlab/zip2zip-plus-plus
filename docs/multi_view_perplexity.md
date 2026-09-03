@@ -188,42 +188,45 @@ flowchart LR
     class HABC,C_A,HBC,C_B,HDE,E leaf;
 ```
 
-The Transformer receives:
+The Transformer interleaves each target tree immediately after its canonical
+root:
 
 ```text
-[C0, X1, X2, H_ab, a, b, d]
- |-- backbone --|  |-- prefix nodes --|
+[C0 | H_ab, a, b | X1 | d | X2]
+      X1 branches       X2 branch
 ```
 
-Physical order does not define node history. The attention mask, logical
-position, and codebook count define each computation.
+Here `H_ab`, `a`, and `b` belong to the target rooted at `C0`; `d` belongs to
+the target rooted at canonical `X1`. Physical order does not define node
+history. The attention mask, logical position, and codebook count define each
+computation.
 
 ## 5. Complete tree-attention mask
 
 A `1` means that a query may read the corresponding key:
 
-| Query / Key | C0 | X1 | X2 | H_ab | a | b=[a,b] | d |
+| Query / Key | C0 | H_ab | a | b=[a,b] | X1 | d | X2 |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | C0 | 1 | 0 | 0 | 0 | 0 | 0 | 0 |
-| X1 | 1 | 1 | 0 | 0 | 0 | 0 | 0 |
-| X2 | 1 | 1 | 1 | 0 | 0 | 0 | 0 |
-| H_ab (X1 branch) | 1 | 0 | 0 | 1 | 0 | 0 | 0 |
-| a (X1 branch) | 1 | 0 | 0 | 0 | 1 | 0 | 0 |
-| b=[a,b] (X1 branch) | 1 | 0 | 0 | 0 | 1 | 1 | 0 |
-| d (X2 branch) | 1 | 1 | 0 | 0 | 0 | 0 | 1 |
+| H_ab (X1 branch) | 1 | 1 | 0 | 0 | 0 | 0 | 0 |
+| a (X1 branch) | 1 | 0 | 1 | 0 | 0 | 0 | 0 |
+| b=[a,b] (X1 branch) | 1 | 0 | 1 | 1 | 0 | 0 | 0 |
+| X1 | 1 | 0 | 0 | 0 | 1 | 0 | 0 |
+| d (X2 branch) | 1 | 0 | 0 | 0 | 1 | 1 | 0 |
+| X2 | 1 | 0 | 0 | 0 | 1 | 0 | 1 |
 
 Matrix form:
 
 ```text
              keys
-             C0 X1 X2 Hab a  b  d
+             C0 Hab a  b  X1 d  X2
 queries C0 [ 1, 0, 0, 0, 0, 0, 0 ]
-        X1 [ 1, 1, 0, 0, 0, 0, 0 ]
-        X2 [ 1, 1, 1, 0, 0, 0, 0 ]
-        Hab[ 1, 0, 0, 1, 0, 0, 0 ]
-        a  [ 1, 0, 0, 0, 1, 0, 0 ]
-        b  [ 1, 0, 0, 0, 1, 1, 0 ]
-        d  [ 1, 1, 0, 0, 0, 0, 1 ]
+        Hab[ 1, 1, 0, 0, 0, 0, 0 ]
+        a  [ 1, 0, 1, 0, 0, 0, 0 ]
+        b  [ 1, 0, 1, 1, 0, 0, 0 ]
+        X1 [ 1, 0, 0, 0, 1, 0, 0 ]
+        d  [ 1, 0, 0, 0, 1, 1, 0 ]
+        X2 [ 1, 0, 0, 0, 1, 0, 1 ]
 ```
 
 This guarantees:
