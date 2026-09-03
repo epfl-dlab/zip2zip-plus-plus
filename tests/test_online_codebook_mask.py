@@ -678,6 +678,9 @@ def test_exact_multi_view_scorer_brackets_strict_and_first_token():
         assert strict < exact
         assert lm.compression_stats["exact_forest_forwards"] == 1
         assert lm.compression_stats["exact_forest_targets"] == 1
+        # Only the canonical stream is replayed. Exact multi-view branches
+        # reuse the codebook availability at their target root.
+        assert lm.compression_stats["online_replay_requests"] == 1
 
         lm._exact_multi_view_targets_logprobs = types.MethodType(
             adapter.Zip2ZipLM._exact_multi_view_targets_logprobs_sequential, lm
@@ -705,9 +708,10 @@ def test_exact_multi_view_scorer_brackets_strict_and_first_token():
             rtol=0,
             atol=1e-5,
         )
+        assert lm.compression_stats["online_replay_requests"] == 2
 
         # Multiple online-codebook targets share one forest while retaining
-        # the exact branch replay count at every node.
+        # the target-start codebook count at every node.
         lm._dtype = torch.float32
         lm._exact_multi_view_targets_logprobs = types.MethodType(
             adapter.Zip2ZipLM._exact_multi_view_targets_logprobs_forest, lm
