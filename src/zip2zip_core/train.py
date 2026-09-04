@@ -1567,6 +1567,21 @@ def main():
     from zip2zip_core.disabled_ids import compute_disabled_ids, digit_ids as _digit_ids_fn
 
     _dl_tok = AutoTokenizer.from_pretrained(args.tokenizer)
+    # Guard against a tokenizer/model-config mismatch (e.g. a forgotten
+    # TOKENIZER override leaving the Phi default against a 128k-vocab Llama
+    # config): it would silently derive the wrong disabled-id set and corrupt
+    # the training distribution from step 0. Only enforced for production-scale
+    # vocabs (>= 32000) so small debug/from-scratch configs with tiny custom
+    # vocabs are unaffected; the tokenizer must fit inside the model vocab and
+    # be no more than a small padding margin smaller.
+    _vocab_gap = config.vocab_size - len(_dl_tok)
+    if config.vocab_size >= 32000 and (_vocab_gap < 0 or _vocab_gap > 1000):
+        raise ValueError(
+            f"tokenizer {args.tokenizer!r} has {len(_dl_tok)} tokens but the "
+            f"model config vocab_size is {config.vocab_size} (gap {_vocab_gap}); "
+            f"this is the wrong tokenizer for this model config. Pass the "
+            f"matching TOKENIZER."
+        )
     disabled_ids = compute_disabled_ids(
         _dl_tok, config.vocab_size, disable_digit_ids=args.disable_digit_ids
     )

@@ -222,6 +222,10 @@ zip2zip_llama_configs = {
             theta=500000,
             backend="complex",
             scaling="llama",
+            # Llama 3.2 ships rope_scaling factor 32.0; the field's default
+            # (8.0) is the Llama 3.1 value and silently detunes pretrained
+            # Llama 3.2 weights at every position.
+            scaling_factor=32.0,
         ),
     ),
     # ── Phi-shaped from-scratch family ─────────────────────────────────────
@@ -502,6 +506,10 @@ zip2zip_llama_configs = {
             theta=500000,
             backend="complex",
             scaling="llama",
+            # Llama 3.2 ships rope_scaling factor 32.0; the field's default
+            # (8.0) is the Llama 3.1 value and silently detunes pretrained
+            # Llama 3.2 weights at every position.
+            scaling_factor=32.0,
         ),
     ),
     # ~8B params — Llama 3.1 8B architecture

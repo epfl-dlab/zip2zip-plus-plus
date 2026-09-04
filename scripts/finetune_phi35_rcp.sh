@@ -256,10 +256,34 @@ MIN_HYPER_LR=${MIN_HYPER_LR:-}
 SAVE_FREQ=${SAVE_FREQ:-500}
 LOG_FREQ=${LOG_FREQ:-10}
 
-ENCODER_DIM=${ENCODER_DIM:-3072}
+# Encoder geometry is keyed on MODEL_CONFIG. The operative geometry has always
+# come from these launcher values, never from configs.py: train.py overrides
+# the model config whenever the flags are set, and this launcher always sets
+# them. Phi3.5-mini keeps the historical v0.x values verbatim; "1B" is the
+# faithful port of the same design (encoder_dim == model dim, head_dim 64,
+# 4x FFN, so no input/output projection layers). Any other MODEL_CONFIG must
+# set the three values explicitly or the run would silently train a
+# Phi-shaped encoder.
+case "$MODEL_CONFIG" in
+    Phi3.5-mini)
+        ENCODER_DIM=${ENCODER_DIM:-3072}
+        ENCODER_N_HEADS=${ENCODER_N_HEADS:-32}
+        ENCODER_INTERMEDIATE_SIZE=${ENCODER_INTERMEDIATE_SIZE:-12288}
+        ;;
+    1B)
+        ENCODER_DIM=${ENCODER_DIM:-2048}
+        ENCODER_N_HEADS=${ENCODER_N_HEADS:-32}
+        ENCODER_INTERMEDIATE_SIZE=${ENCODER_INTERMEDIATE_SIZE:-8192}
+        ;;
+    *)
+        if [ -z "${ENCODER_DIM:-}" ] || [ -z "${ENCODER_N_HEADS:-}" ] || [ -z "${ENCODER_INTERMEDIATE_SIZE:-}" ]; then
+            echo "FATAL: no launcher encoder defaults for MODEL_CONFIG=$MODEL_CONFIG;"
+            echo "       set ENCODER_DIM, ENCODER_N_HEADS and ENCODER_INTERMEDIATE_SIZE explicitly."
+            exit 1
+        fi
+        ;;
+esac
 ENCODER_N_LAYERS=${ENCODER_N_LAYERS:-2}
-ENCODER_N_HEADS=${ENCODER_N_HEADS:-32}
-ENCODER_INTERMEDIATE_SIZE=${ENCODER_INTERMEDIATE_SIZE:-12288}
 HYPER_ENCODER_TYPE=${HYPER_ENCODER_TYPE:-flat}
 
 FREEZE_DECODER=${FREEZE_DECODER:-1}

@@ -60,13 +60,24 @@ from lm_eval.utils import get_rolling_token_windows, make_disjoint_window
 _LLAMA3_DISABLED_IDS = [128000, 128001, 128002, 128003]
 _DEFAULT_TOKENIZER = "meta-llama/Meta-Llama-3-8B"
 
+# Chat templates that inject the current date (Llama 3.x) otherwise render the
+# eval-day date, making chat-templated evals non-reproducible and mismatched
+# with the training data. Pin it to the same constant the SFT dataset scripts
+# use (scripts/create_sft_dataset_zip2zip1B.py CHAT_TEMPLATE_DATE). Templates
+# without date logic (e.g. Phi-3.5) never see this and are unaffected.
+_CHAT_TEMPLATE_DATE = "26 Jul 2024"
+
 # Special-token ids that must never be merged into the codebook. The Llama
 # tokenizers historically disabled a fixed set; for other tokenizers (e.g.
 # Phi-3.5-mini) we fall back to the tokenizer's own special-token ids.
+# Only from-scratch base-tokenizer runs that were actually trained with this
+# fixed 4-id list belong here. Instruct finetunes (e.g. Llama-3.2-1B-Instruct)
+# train with train.py's full compute_disabled_ids (every special + added vocab),
+# so they must fall through to base_disabled_ids below — keying them to the
+# legacy 4-id list re-creates the chat-special LZW-merge bug at eval time.
 _DISABLED_IDS_BY_TOKENIZER = {
     "meta-llama/Meta-Llama-3-8B": _LLAMA3_DISABLED_IDS,
     "meta-llama/Llama-3.1-8B": _LLAMA3_DISABLED_IDS,
-    "meta-llama/Llama-3.2-1B-Instruct": _LLAMA3_DISABLED_IDS,
 }
 
 
@@ -310,8 +321,14 @@ class Zip2ZipLM(LM):
                 + (f" ({meta_tok!r} per meta.pt)." if meta_tok else ".")
             )
         if meta_tok and meta_tok != tokenizer:
-            print(f"[zip2zip-lm-eval] WARNING: eval tokenizer {tokenizer!r} != "
-                  f"training tokenizer {meta_tok!r} (meta.pt)")
+            msg = (f"eval tokenizer {tokenizer!r} != training tokenizer "
+                   f"{meta_tok!r} (meta.pt). Evaluating a checkpoint with the "
+                   f"wrong tokenizer silently corrupts every metric. Pass "
+                   f"TOKENIZER={meta_tok!r}, or set ALLOW_TOKENIZER_MISMATCH=1 "
+                   f"to override deliberately.")
+            if os.environ.get("ALLOW_TOKENIZER_MISMATCH") != "1":
+                raise ValueError(msg)
+            print(f"[zip2zip-lm-eval] WARNING (ALLOW_TOKENIZER_MISMATCH=1): {msg}")
         disabled_ids = _DISABLED_IDS_BY_TOKENIZER.get(tokenizer)
         if disabled_ids is None:
             # Must mirror train.py's derivation (all_special_ids | added vocab):
@@ -487,6 +504,23 @@ class Zip2ZipLM(LM):
         return self.tokenizer.eos_token_id or self.cfg.pad_token_id
 
     @property
+    def rolling_prefix_token_id(self) -> int:
+        # Rolling perplexity conditions the first window on one synthetic
+        # document-start token. Historically this was eos_token_id, which for
+        # Phi (<|endoftext|>) is exactly the document separator seen in
+        # training. Llama-3 instruct tokenizers set eos to <|eot_id|> (a
+        # turn marker that never precedes fresh document text), so use BOS
+        # instead — every training document begins with it. Gated on the
+        # <|eot_id|> eos so Phi and base-Llama tokenizers keep their exact
+        # historical prefix and the v0.6.x wikitext series stays comparable.
+        if (
+            self.tokenizer.eos_token == "<|eot_id|>"
+            and self.tokenizer.bos_token_id is not None
+        ):
+            return self.tokenizer.bos_token_id
+        return self.eot_token_id
+
+    @property
     def max_length(self) -> int:
         return self._max_length
 
@@ -511,11 +545,19 @@ class Zip2ZipLM(LM):
     def apply_chat_template(
         self, chat_history: list[dict[str, str]], add_generation_prompt: bool = True
     ) -> str:
+        # Pin the template date only for templates that actually use it (Llama
+        # 3.x), so date-free templates (Phi-3.5) render byte-identically to
+        # before and their historical evals stay reproducible.
+        extra = {}
+        template = self.tokenizer.chat_template
+        if isinstance(template, str) and "date_string" in template:
+            extra["date_string"] = _CHAT_TEMPLATE_DATE
         return self.tokenizer.apply_chat_template(
             chat_history,
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
             continue_final_message=not add_generation_prompt,
+            **extra,
         )
 
     @property
@@ -1255,7 +1297,7 @@ class Zip2ZipLM(LM):
                 make_disjoint_window,
                 get_rolling_token_windows(
                     ids,
-                    prefix_token=self.eot_token_id,
+                    prefix_token=self.rolling_prefix_token_id,
                     max_seq_len=self._max_length,
                     context_len=1,
                 ),
