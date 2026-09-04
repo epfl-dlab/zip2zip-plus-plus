@@ -1,8 +1,15 @@
-"""Process epfl-dlab/zip2zip-1B for SFT training.
+"""Process epfl-dlab/zip2zip-1B for SFT training — Llama-3.2 tokenizer variant.
+
+Same pipeline as create_sft_dataset_zip2zip1B_phi.py at the eosfix stage
+(b12efc0), tokenized with the official meta-llama/Llama-3.2-1B-Instruct
+tokenizer and its chat template. Deliberately does NOT include the NuminaMath
+mathchat re-rendering: the production Phi dataset used by every v0.x run is
+phi-1B-sft-8shards-eosfix (eosfix only), and the Llama dataset must differ
+from it on no axis other than the tokenizer.
 
 Dataset has 'text' column with mixed formats:
 - HuggingFaceH4/ultrachat_200k: Zephyr chat format (<|user|>/<|end|>/<|assistant|>)
-- Other sources: plain text
+- Other sources (NuminaMath included): plain text
 
 Processing:
 - Chat examples (ultrachat): parse Zephyr → re-apply apply_chat_template (Llama format)
@@ -19,7 +26,7 @@ import numpy as np
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/capstor/store/cscs/swissai/a0101/mxx/zip2zip-data/zip2zip-1B-sft-8shards")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/capstor/store/cscs/swissai/a0101/mxx/zip2zip-data/llama32-1B-sft-8shards")
 TOKENS_PER_SHARD = 125_000_000
 TOKENIZE_BATCH_SIZE = 5_000
 TOKENIZE_NUM_PROC = 8
@@ -27,10 +34,19 @@ SHUFFLE_SEED = 42
 ADD_BOS = True
 ADD_EOS = True
 
-# Use Llama 3.2 chat template for proper <|eot_id|> at each assistant turn end.
-# Vocab is identical between zip2zip and Llama 3.2 tokenizers — only chat_template differs.
+# Official tokenizer for both base tokenization and chat templating (the Phi
+# variant does the same). The earlier version of this script tokenized with
+# nathanrchn/zip2zip-tokenizer relying on its vocab being identical to
+# Llama 3.2's; using the official tokenizer end-to-end removes that assumption
+# and matches what the eval side (TOKENIZER=meta-llama/Llama-3.2-1B-Instruct)
+# will use. Gated repo: the job needs HF credentials or a warm cache.
 CHAT_TOKENIZER_NAME = "meta-llama/Llama-3.2-1B-Instruct"
-BASE_TOKENIZER_NAME = "nathanrchn/zip2zip-tokenizer"
+BASE_TOKENIZER_NAME = "meta-llama/Llama-3.2-1B-Instruct"
+
+# Pin the date the Llama chat template renders into its default system block,
+# so the emitted text (and therefore every token id and mask) is independent
+# of the day the script runs. "26 Jul 2024" is the template's own fallback.
+CHAT_TEMPLATE_DATE = "26 Jul 2024"
 
 # Llama 3.2 format markers (these are real single special tokens):
 #   <|start_header_id|> (128006) / <|end_header_id|> (128007) / <|eot_id|> (128009)
@@ -43,6 +59,16 @@ CHAT_SOURCES = {"HuggingFaceH4/ultrachat_200k"}
 user_cache = os.environ.get("USER_HF_CACHE", None)
 tokenizer = AutoTokenizer.from_pretrained(BASE_TOKENIZER_NAME, cache_dir=user_cache)
 chat_tokenizer = AutoTokenizer.from_pretrained(CHAT_TOKENIZER_NAME, cache_dir=user_cache)
+
+# Document separator appended after each doc. The instruct tokenizer's
+# eos_token is <|eot_id|> (turn end), but the Phi dataset's equivalent role
+# (<|endoftext|> 32000) is the document-end token, which for Llama 3 is
+# <|end_of_text|> (128001) — generation_config stops on it too. Resolve it
+# explicitly instead of trusting tokenizer.eos_token_id.
+DOC_EOS_TOKEN = "<|end_of_text|>"
+DOC_EOS_ID = tokenizer.convert_tokens_to_ids(DOC_EOS_TOKEN)
+if DOC_EOS_ID is None or DOC_EOS_ID == tokenizer.unk_token_id:
+    raise ValueError(f"{DOC_EOS_TOKEN} not found in {BASE_TOKENIZER_NAME} vocab")
 
 
 def parse_zephyr_to_messages(text):
@@ -77,7 +103,8 @@ def convert_to_chatml(sample):
             if messages and any(m['role'] == 'assistant' for m in messages):
                 # Use Llama 3.2 tokenizer → proper <|eot_id|> at each turn end
                 llama_fmt = chat_tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=False
+                    messages, tokenize=False, add_generation_prompt=False,
+                    date_string=CHAT_TEMPLATE_DATE,
                 )
                 return {'text': llama_fmt, 'is_chat': True}
         except Exception:
@@ -131,10 +158,18 @@ def maybe_add_boundary_tokens(tokens, mask):
         if not tokens or tokens[0] != tokenizer.bos_token_id:
             tokens = [tokenizer.bos_token_id] + tokens
             mask = [0] + mask
-    if ADD_EOS and tokenizer.eos_token_id is not None:
-        if not tokens or tokens[-1] != tokenizer.eos_token_id:
-            tokens = tokens + [tokenizer.eos_token_id]
-            mask = mask + [0]
+    if ADD_EOS:
+        if not tokens or tokens[-1] != DOC_EOS_ID:
+            tokens = tokens + [DOC_EOS_ID]
+            # EOS must be IN the loss (mask=1): with mask=0 the model gets no
+            # gradient to ever emit end-of-text after a completed plain-text
+            # document, so at inference it runs past its answer into a
+            # fabricated next document (observed on GSM8K: the step_8000 repro
+            # answers correctly, then generates a new invented math problem
+            # whose numbers poison lm-eval's flexible-extract scoring).
+            # Chat docs already learn stopping via <|eot_id|> in the assistant
+            # span; this fixes plain-text (NuminaMath/fineweb/stack) docs.
+            mask = mask + [1]
     return tokens, mask
 
 
@@ -242,25 +277,30 @@ def save_token_shards(tokenized_dataset):
 
 # ---- main ----
 
-print("Loading epfl-dlab/zip2zip-1B (train split)...")
-ds = load_dataset("epfl-dlab/zip2zip-1B", split="train")
-print(ds)
+def main():
+    print("Loading epfl-dlab/zip2zip-1B (train split)...")
+    ds = load_dataset("epfl-dlab/zip2zip-1B", split="train")
+    print(ds)
 
-# Check chat stats
-n_chat = sum(1 for s in ds['source'] if s in CHAT_SOURCES)
-print(f"Chat examples (ultrachat): {n_chat} / {len(ds)}")
+    # Check chat stats
+    n_chat = sum(1 for s in ds['source'] if s in CHAT_SOURCES)
+    print(f"Chat examples (ultrachat): {n_chat} / {len(ds)}")
 
-print("Converting Zephyr chat → ChatML, plain text passthrough...")
-ds = ds.map(
-    convert_to_chatml,
-    batched=False,
-    num_proc=TOKENIZE_NUM_PROC,
-    remove_columns=[c for c in ds.column_names if c not in ('text', 'is_chat', 'source')],
-)
+    print("Converting Zephyr chat → Llama 3.2 ChatML, plain text passthrough...")
+    ds = ds.map(
+        convert_to_chatml,
+        batched=False,
+        num_proc=TOKENIZE_NUM_PROC,
+        remove_columns=[c for c in ds.column_names if c not in ('text', 'is_chat', 'source')],
+    )
 
-print("Tokenizing...")
-tokenized = tokenize_dataset(ds)
-print(tokenized)
+    print("Tokenizing...")
+    tokenized = tokenize_dataset(ds)
+    print(tokenized)
 
-print("Saving shards...")
-save_token_shards(tokenized)
+    print("Saving shards...")
+    save_token_shards(tokenized)
+
+
+if __name__ == "__main__":
+    main()
