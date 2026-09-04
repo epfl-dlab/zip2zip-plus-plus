@@ -300,7 +300,18 @@ def apply_fsdp(model, world_size):
 
     mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
 
-    if model.tok_embeddings is not None:
+    # Llama ties output.weight to tok_embeddings.weight (Phi-3.5-mini does not).
+    # FSDP2 requires a shared parameter to live in exactly one group, so a tied
+    # embedding table must be sharded together with the output head rather than
+    # in its own group — otherwise fully_shard raises "Parameter 'output.weight'
+    # is shared with a parameter already managed by another FSDP group".
+    tied_embeddings = (
+        model.tok_embeddings is not None
+        and model.output is not None
+        and model.output.weight is model.tok_embeddings.weight
+    )
+
+    if model.tok_embeddings is not None and not tied_embeddings:
         fully_shard(model.tok_embeddings, mesh=mesh)
     fully_shard(model.hyper_encoder, mesh=mesh)
     if getattr(model, "hyper_output", None) is not None:
@@ -308,7 +319,13 @@ def apply_fsdp(model, world_size):
     for block in model.layers.values():
         fully_shard(block, mesh=mesh)
     if model.norm is not None and model.output is not None:
-        fully_shard([model.norm, model.output], mesh=mesh, reshard_after_forward=False)
+        # For tied embeddings the shared table joins this group (kept gathered
+        # across the step via reshard_after_forward=False, since it is read at
+        # the input, by the hyper-encoder, and again at the output head).
+        output_group = [model.norm, model.output]
+        if tied_embeddings:
+            output_group.insert(0, model.tok_embeddings)
+        fully_shard(output_group, mesh=mesh, reshard_after_forward=False)
     fully_shard(model, mesh=mesh)
     return model
 
