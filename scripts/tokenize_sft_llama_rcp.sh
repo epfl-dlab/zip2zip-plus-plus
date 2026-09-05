@@ -1,8 +1,10 @@
 #!/bin/bash
 # Tokenize epfl-dlab/zip2zip-1B with the Llama-3.2-1B-Instruct tokenizer + chat
 # template into packed SFT shards (shard_*.npy + mask_*.npy + manifest.json) on
-# the RCP PVC. CPU-only job — no GPU needed. Expected output: ~1B tokens, 8
-# full shards of 125M tokens each (~5GB tokens + masks). Mirrors
+# the RCP PVC. CPU-only job — no GPU needed. Expected output: ~846M tokens in
+# 8 equal shards of ~105.8M (~4GB tokens + masks). The shard count is pinned to
+# 8 because data.py deals shards out per DP rank and a short rank would wrap
+# into a second epoch mid-run (the Phi set has 8 full 125M shards). Mirrors
 # tokenize_sft_phi_rcp.sh; the dataset is the Llama twin of
 # phi-1B-sft-8shards-eosfix (eosfix, no mathchat).
 #
@@ -28,6 +30,8 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
 export OUTPUT_DIR=${OUTPUT_DIR:-$Z2Z_SCRATCH/datasets/llama32-1B-sft-8shards-eosfix}
+# 846,327,722 tokens / 8 = 105.8M per shard -> exactly 8 shards, 2 per rank on 4 GPUs.
+export TOKENS_PER_SHARD=${TOKENS_PER_SHARD:-105800000}
 
 PROJECT_DIR=${PROJECT_DIR:-$Z2Z_SCRATCH/code/zip2zip-core}
 LOG_DIR=$Z2Z_SCRATCH/logs/tokenize
@@ -57,11 +61,14 @@ python scripts/create_sft_dataset_zip2zip1B.py
 echo "--- manifest ---"
 cat "$OUTPUT_DIR/manifest.json"
 
-echo "--- sanity: token ids in Llama vocab, EOS in loss ---"
+echo "--- sanity: 8 shards, token ids in Llama vocab, EOS in loss, chat headers present ---"
 python - <<'EOF'
 import os, numpy as np
 d = os.environ["OUTPUT_DIR"]
-shard = sorted(f for f in os.listdir(d) if f.startswith("shard_"))[0]
+shards = sorted(f for f in os.listdir(d) if f.startswith("shard_"))
+print(f"shard files: {len(shards)}")
+assert len(shards) == 8, f"expected 8 shards (2 per rank on 4 GPUs), got {len(shards)}"
+shard = shards[0]
 mask = shard.replace("shard_", "mask_")
 a = np.load(os.path.join(d, shard), mmap_mode="r")[:10_000_000]
 m = np.load(os.path.join(d, mask), mmap_mode="r")[:10_000_000]
@@ -77,7 +84,16 @@ assert n_eos > 0, "No <|end_of_text|> found — doc separator missing!"
 # 128001 and may carry mask=0 inside chat turns, so require a ratio not equality
 assert n_eos_in_loss / n_eos > 0.99, "Doc EOS mostly mask=0 — eosfix not applied!"
 bos_pos = a == 128000
-print(f"<|begin_of_text|> occurrences: {int(bos_pos.sum())}, with mask=1: {int((m[bos_pos] == 1).sum())} (expected 0)")
+n_bos_in_loss = int((m[bos_pos] == 1).sum())
+print(f"<|begin_of_text|> occurrences: {int(bos_pos.sum())}, with mask=1: {n_bos_in_loss} (expected 0)")
+assert n_bos_in_loss == 0, "BOS found inside the loss — boundary masking broken!"
+# chat re-rendering is wrapped in a broad except in the dataset script, so prove
+# it actually ran: Llama chat headers must be present, and only assistant turn
+# ends may carry mask=1
+n_hdr = int((a == 128006).sum())
+eot_pos = a == 128009
+print(f"<|start_header_id|> occurrences: {n_hdr}; <|eot_id|> occurrences: {int(eot_pos.sum())}, with mask=1: {int((m[eot_pos] == 1).sum())}")
+assert n_hdr > 0, "No chat headers found — ultrachat docs were NOT re-rendered with the Llama template!"
 EOF
 
 } 2>&1 | tee "$LOGFILE"

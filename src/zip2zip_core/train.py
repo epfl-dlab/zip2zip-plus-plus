@@ -319,9 +319,12 @@ def apply_fsdp(model, world_size):
     for block in model.layers.values():
         fully_shard(block, mesh=mesh)
     if model.norm is not None and model.output is not None:
-        # For tied embeddings the shared table joins this group (kept gathered
-        # across the step via reshard_after_forward=False, since it is read at
-        # the input, by the hyper-encoder, and again at the output head).
+        # For tied embeddings the shared table joins this group so the one
+        # parameter has a single FSDP owner; the group's reshard_after_forward=
+        # False then also keeps it gathered from the input lookup to the output
+        # head. The hyper-encoder's own read of tok_embeddings.weight happens
+        # before this group's forward and goes through full_tensor(), exactly as
+        # for untied models, so it neither benefits nor suffers from this.
         output_group = [model.norm, model.output]
         if tied_embeddings:
             output_group.insert(0, model.tok_embeddings)

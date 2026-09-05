@@ -1,11 +1,14 @@
 """Process epfl-dlab/zip2zip-1B for SFT training — Llama-3.2 tokenizer variant.
 
 Same pipeline as create_sft_dataset_zip2zip1B_phi.py at the eosfix stage
-(b12efc0), tokenized with the official meta-llama/Llama-3.2-1B-Instruct
+(commit 15d7968), tokenized with the official meta-llama/Llama-3.2-1B-Instruct
 tokenizer and its chat template. Deliberately does NOT include the NuminaMath
-mathchat re-rendering: the production Phi dataset used by every v0.x run is
-phi-1B-sft-8shards-eosfix (eosfix only), and the Llama dataset must differ
-from it on no axis other than the tokenizer.
+mathchat re-rendering: the production Phi dataset behind the v0.4+ lineage is
+phi-1B-sft-8shards-eosfix (eosfix only), and the Llama dataset must differ from
+it on no axis other than the tokenizer. The one formatting difference that the
+tokenizer brings with it: the Llama chat template always prepends its dated
+system block (~20 tokens, loss mask 0) to chat documents; Phi's template has no
+such block.
 
 Dataset has 'text' column with mixed formats:
 - HuggingFaceH4/ultrachat_200k: Zephyr chat format (<|user|>/<|end|>/<|assistant|>)
@@ -27,7 +30,12 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/capstor/store/cscs/swissai/a0101/mxx/zip2zip-data/llama32-1B-sft-8shards")
-TOKENS_PER_SHARD = 125_000_000
+# data.py hands shard files out round-robin per DP rank (shard_files[rank::world_size])
+# and a rank that runs out of tokens wraps into a second epoch silently, so the
+# shard count must be a multiple of the training world size and the shards
+# equal-sized. 125M gives the Phi set 8 full shards; this corpus tokenizes to
+# ~846M Llama tokens, so the launcher passes ~105.8M for 8 shards / 4 GPUs.
+TOKENS_PER_SHARD = int(os.environ.get("TOKENS_PER_SHARD", 125_000_000))
 TOKENIZE_BATCH_SIZE = 5_000
 TOKENIZE_NUM_PROC = 8
 SHUFFLE_SEED = 42
