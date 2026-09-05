@@ -204,7 +204,11 @@ For digit-protected evals (`--disable_digit_ids` / `DISABLE_DIGIT_IDS=1`, matchi
 checkpoints trained with the same flag — the canonical recipe since v0.4) the
 first line reads `disabled_ids (24)` instead, preceded by
 `digit ids disabled for LZW (10): [...]` — that pair is the expected health
-signature, not a bug. The adapter auto-enables digit protection when the
+signature on Phi-3.5, not a bug. On Llama-3.2 the same recipe reads
+`digit ids disabled for LZW (1110)` and `disabled_ids (1366)`: its byte-level
+BPE has a piece for every 1-, 2- and 3-digit string, and all of them are
+protected so numbers keep their base segmentation (up-to-3-digit groups,
+where Phi keeps single digits). The adapter auto-enables digit protection when the
 checkpoint's meta.pt records it (and logs that it did), so a forgotten flag
 cannot silently evaluate a digitsafe checkpoint in the wrong distribution; the
 results JSON records the effective setting.

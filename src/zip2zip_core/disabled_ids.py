@@ -10,6 +10,8 @@ then digits). Always derive it here instead of re-deriving it locally.
 
 from __future__ import annotations
 
+import re
+
 
 def base_disabled_ids(tokenizer, vocab_size: int) -> set[int]:
     """Special + added-vocab token ids (chat markers, etc.) -- never merged,
@@ -19,14 +21,23 @@ def base_disabled_ids(tokenizer, vocab_size: int) -> set[int]:
     return {i for i in (special | added) if 0 <= i < vocab_size}
 
 
+# ASCII-digit runs only. Phi-3.5's SentencePiece vocab exposes exactly "0".."9"
+# (digits are always split), so this yields the same 10 ids it always did.
+# Llama-3's byte-level BPE pre-tokenizes digits in groups of up to three, so
+# every 1-, 2- and 3-digit string is its own piece (10 + 100 + 1000 = 1110) and
+# all of them must be protected for numbers to keep their base segmentation.
+# Deliberately not \p{N} / str.isdigit(): both vocabs carry superscript and
+# fraction pieces (², ½, ₀, ...) that were never protected historically.
+_DIGIT_PIECE = re.compile(r"[▁Ġ]?[0-9]+")
+
+
 def digit_ids(tokenizer, vocab_size: int) -> set[int]:
-    """Token ids for single digits 0-9, with and without the SentencePiece
-    word-boundary marker -- gated behind --disable_digit_ids."""
-    pieces = {str(d) for d in range(10)} | {f"▁{d}" for d in range(10)}
+    """Token ids of every vocab piece that is a run of ASCII digits, with or
+    without a leading word-boundary marker -- gated behind --disable_digit_ids."""
     return {
         i
         for piece, i in tokenizer.get_vocab().items()
-        if piece in pieces and 0 <= i < vocab_size
+        if _DIGIT_PIECE.fullmatch(piece) and 0 <= i < vocab_size
     }
 
 

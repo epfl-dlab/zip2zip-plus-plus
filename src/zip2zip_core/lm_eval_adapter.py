@@ -57,7 +57,6 @@ from lm_eval.api.registry import register_model
 from lm_eval.utils import get_rolling_token_windows, make_disjoint_window
 
 
-_LLAMA3_DISABLED_IDS = [128000, 128001, 128002, 128003]
 _DEFAULT_TOKENIZER = "meta-llama/Meta-Llama-3-8B"
 
 # Chat templates that inject the current date (Llama 3.x) otherwise render the
@@ -67,18 +66,13 @@ _DEFAULT_TOKENIZER = "meta-llama/Meta-Llama-3-8B"
 # without date logic (e.g. Phi-3.5) never see this and are unaffected.
 _CHAT_TEMPLATE_DATE = "26 Jul 2024"
 
-# Special-token ids that must never be merged into the codebook. The Llama
-# tokenizers historically disabled a fixed set; for other tokenizers (e.g.
-# Phi-3.5-mini) we fall back to the tokenizer's own special-token ids.
-# Only from-scratch base-tokenizer runs that were actually trained with this
-# fixed 4-id list belong here. Instruct finetunes (e.g. Llama-3.2-1B-Instruct)
-# train with train.py's full compute_disabled_ids (every special + added vocab),
-# so they must fall through to base_disabled_ids below — keying them to the
-# legacy 4-id list re-creates the chat-special LZW-merge bug at eval time.
-_DISABLED_IDS_BY_TOKENIZER = {
-    "meta-llama/Meta-Llama-3-8B": _LLAMA3_DISABLED_IDS,
-    "meta-llama/Llama-3.1-8B": _LLAMA3_DISABLED_IDS,
-}
+# The LZW disabled-id set is always derived from the tokenizer through
+# zip2zip_core.disabled_ids, exactly as train.py derives it, so train and eval
+# cannot drift. A hardcoded 4-id Llama list [128000..128003] used to live here:
+# training only ever used that set between 9201a4a and 83a252d (Mar-Apr 2026,
+# raw-pretrain checkpoints where ids >= 128004 never occur, so the derived set
+# is behaviorally identical for them), and for every later checkpoint it
+# under-protects the chat specials the model was trained with.
 
 
 def _strip_wrapper_prefixes(state_dict: dict) -> dict:
@@ -329,15 +323,13 @@ class Zip2ZipLM(LM):
             if os.environ.get("ALLOW_TOKENIZER_MISMATCH") != "1":
                 raise ValueError(msg)
             print(f"[zip2zip-lm-eval] WARNING (ALLOW_TOKENIZER_MISMATCH=1): {msg}")
-        disabled_ids = _DISABLED_IDS_BY_TOKENIZER.get(tokenizer)
-        if disabled_ids is None:
-            # Must mirror train.py's derivation (all_special_ids | added vocab):
-            # for Phi-3.5, all_special_ids alone is {unk,bos,eos} and misses the
-            # chat tokens <|user|>/<|assistant|>/<|end|> (32001-32010), which the
-            # compressor would then merge into hyper-tokens the model never saw
-            # in training — collapsing every chat-templated eval. Sourced from
-            # zip2zip_core.disabled_ids so train/eval/export can't drift apart.
-            disabled_ids = sorted(base_disabled_ids(self.tokenizer, self.cfg.vocab_size))
+        # Must mirror train.py's derivation (all_special_ids | added vocab):
+        # for Phi-3.5, all_special_ids alone is {unk,bos,eos} and misses the
+        # chat tokens <|user|>/<|assistant|>/<|end|> (32001-32010), which the
+        # compressor would then merge into hyper-tokens the model never saw
+        # in training — collapsing every chat-templated eval. Sourced from
+        # zip2zip_core.disabled_ids so train/eval/export can't drift apart.
+        disabled_ids = sorted(base_disabled_ids(self.tokenizer, self.cfg.vocab_size))
         if (
             eval_mode == "compressed"
             and (self.train_args or {}).get("disable_digit_ids")
