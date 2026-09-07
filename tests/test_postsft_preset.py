@@ -27,7 +27,7 @@ REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / "scripts"
 TASKS_DIR = SCRIPTS / "lm_eval_tasks"
 
-POSTSFT_TASKS = ["math500", "humaneval_instruct", "ifeval"]
+POSTSFT_TASKS = ["math500", "humaneval_instruct_fence", "ifeval"]
 EXTRA_EVAL_PINS = {
     "langdetect==1.0.9",
     "immutabledict==4.2.1",
@@ -272,6 +272,6 @@ def test_docs_describe_the_preset():
     assert "### Post-SFT generation benchmarks (`postsft`, paper Table 2)" in docs
     for task in POSTSFT_TASKS:
         assert f"`{task}`" in docs
-    assert "final/humaneval_instruct/pass@1_create_test" in docs
+    assert "final/humaneval_instruct_fence/pass@1_create_test" in docs
     assert ".venvs/lm-eval-postsft-extras" in docs
     assert "LEGACY_STRIPPED_GENERATION" in docs

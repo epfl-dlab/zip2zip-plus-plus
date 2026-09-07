@@ -93,7 +93,7 @@ silently turn MATH-500 into a 2-shot run).
 | Task | What runs | Few-shot | Table 2 column |
 |------|-----------|----------|----------------|
 | `math500` | local YAML: `HuggingFaceH4/MATH-500` test split (500 problems, revision-pinned) scored by lm-eval's own `minerva_math` code — Minerva "Problem:/Solution:" prompt, answer normalisation and both scorers, reached via `scripts/lm_eval_tasks/math500_utils.py`; `max_gen_toks` 1024 (the harness default 256 truncates MATH solutions) | 4 fixed Minerva exemplars | strict = `exact_match`: the answer must sit in the Minerva sentence "Final Answer: The final answer is X. I hope it is correct." and be sympy-equivalent to the gold; flex = `math_verify`: `verify(parse(gold), parse(generation))`, i.e. the rightmost `\boxed{}`/math expression anywhere in the generation, checked symbolically. Gold for both = Minerva-normalised last `\boxed{}` of the reference solution (the dataset's `answer` column is rewritten with it) |
-| `humaneval_instruct` | stock task for chat models: user turn "Write a solution to the following problem and make sure that it passes the tests:" + fenced prompt, assistant turn pre-filled with the function header, generation cut at the closing fence, executed by HF `code_eval` | 0 | `pass@1` (greedy, one sample) |
+| `humaneval_instruct_fence` | local copy of the stock `humaneval_instruct` (same user turn "Write a solution to the following problem and make sure that it passes the tests:" + fenced prompt, assistant turn pre-filled with the function header, HF `code_eval`) with the closing ``` added to the stop sequences. The stock task stops only on completion-style strings and its filter keeps everything up to the LAST fence, so a chat model's explanation after the code lands inside the tested program: 0/164 on a Phi-3.5 finetune whose code was often correct. | 0 | `pass@1` (greedy, one sample) |
 | `ifeval` | stock task, 541 prompts, no stop strings, `max_gen_toks` 1280 | 0 | `prompt_level_strict_acc` (Table 2's "prompt (s)"); loose and instruction-level variants are logged too |
 
 The preset deliberately has **no `num_fewshot` key**: a preset value is a global
@@ -155,7 +155,7 @@ runai submit --name postsft-v064 \
 
 W&B keys follow `log_results_to_wandb.py`'s `<task>/<metric>_<filter>` flattening:
 `final/math500/exact_match`, `final/math500/math_verify`,
-`final/humaneval_instruct/pass@1_create_test` (the task's filter is named
+`final/humaneval_instruct_fence/pass@1_create_test` (the task's filter is named
 `create_test`) and `final/ifeval/prompt_level_strict_acc`, plus their stderr and
 loose/instruction-level variants. Every `eval_harness.py` run with
 `--output_path` now also writes `<results stem>_samples.json` with the

@@ -95,8 +95,8 @@ presets:
   # executes generated code: eval_ckpt_rcp.sh exports HF_ALLOW_CODE_EVAL=1 for
   # this preset and eval_harness.py passes confirm_run_unsafe_code from it.
   postsft:
-    description: "Post-SFT generation benchmarks (paper Table 2): MATH-500 (Minerva 4-shot; strict=exact_match, flex=math_verify), HumanEval-instruct pass@1, IFEval prompt-level strict — per-task few-shot, chat template"
-    tasks: [math500, humaneval_instruct, ifeval]
+    description: "Post-SFT generation benchmarks (paper Table 2): MATH-500 (Minerva 4-shot; strict=exact_match, flex=math_verify), HumanEval-instruct pass@1 (generation stopped at the closing fence), IFEval prompt-level strict — per-task few-shot, chat template"
+    tasks: [math500, humaneval_instruct_fence, ifeval]
     max_length: 4096
     eval_mode: compressed
     batch_size: 1

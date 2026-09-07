@@ -44,7 +44,7 @@
 #                   is the quick perplexity: full wikitext + pinned 1000-doc
 #                   subsets of Pile/mC4/dC4, logged under subset_ppl/ (see
 #                   WANDB_PREFIX below). PRESET=postsft is the paper's Table 2
-#                   generation set (math500, humaneval_instruct, ifeval; each
+#                   generation set (math500, humaneval_instruct_fence, ifeval; each
 #                   task keeps its own few-shot). humaneval_instruct executes
 #                   model-written code, so this script exports
 #                   HF_ALLOW_CODE_EVAL=1 for that preset — set

@@ -1,0 +1,44 @@
+# humaneval_instruct with the closing code fence as a stop sequence.
+#
+# Why a local task: lm-eval 0.4.9's humaneval_instruct inherits the completion-
+# style stops of humaneval ("\nclass", "\ndef", ...) and its create_test filter
+# keeps everything up to the LAST ``` in the generation (utils.build_predictions_
+# instruct uses rfind). A chat model closes the code block, explains the
+# solution in prose and often opens a second block with examples, so the prose
+# ends up inside the program under test and every problem fails with a
+# SyntaxError: measured 0/164 on a Phi-3.5 finetune whose code was often
+# correct (159/164 generations contained a fence). Stopping at the first ```
+# hands the filter the function body alone, which is what the task intends.
+# Everything else — prompt, gen_prefix, scorer, filter — is the upstream task.
+task: humaneval_instruct_fence
+dataset_path: openai/openai_humaneval
+unsafe_code: true
+output_type: generate_until
+test_split: test
+doc_to_text: "Write a solution to the following problem and make sure that it passes the tests:\n```{{prompt}}"
+gen_prefix: "Here is the completed function:\n```python\n{{prompt}}\n"
+doc_to_target: "{{test}}\ncheck({{entry_point}})"
+metric_list:
+  - metric: !function humaneval_fence_utils.pass_at_k
+    aggregation: mean
+    higher_is_better: true
+    k: [1]
+generation_kwargs:
+  until:
+    - "```"
+    - "\nclass"
+    - "\ndef"
+    - "\n#"
+    - "\nif"
+    - "\nprint"
+  max_gen_toks: 1024
+  do_sample: false
+repeats: 1
+num_fewshot: 0
+filter_list:
+  - name: "create_test"
+    filter:
+      - function: "custom"
+        filter_fn: !function humaneval_fence_utils.build_predictions_instruct
+metadata:
+  version: 2.0
