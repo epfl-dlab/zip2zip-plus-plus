@@ -66,7 +66,19 @@ source "$VENV_DIR/bin/activate"
 pip install --quiet "lm-eval==0.4.9"
 
 # ---------- config from eval_presets.yaml (single source of truth) ----------
-MODEL="microsoft/Phi-3.5-mini-instruct"
+# MODEL=<hf id> evaluates any off-the-shelf HF model with the same preset
+# (paper "Original" rows); the default keeps the historical Phi validation.
+MODEL=${MODEL:-microsoft/Phi-3.5-mini-instruct}
+# SentencePiece tokenizers (Phi) need the slow tokenizer; byte-level BPE
+# families (Llama-3) ship no slow tokenizer, so only Phi gets the flag.
+case "$MODEL" in
+    microsoft/Phi-*) TOKENIZER_ARGS=${TOKENIZER_ARGS:-,use_fast_tokenizer=false} ;;
+    *)               TOKENIZER_ARGS=${TOKENIZER_ARGS:-} ;;
+esac
+MODEL_STEM=phi35
+if [ "$MODEL" != "microsoft/Phi-3.5-mini-instruct" ]; then
+    MODEL_STEM=$(basename "$MODEL")
+fi
 
 eval "$(python3 "$SCRIPT_DIR/load_preset.py" "$PRESET")"
 
@@ -82,11 +94,11 @@ if [ -n "$LIMIT" ]; then
 fi
 
 # ---------- lm-eval results output ----------
-RESULTS_DIR="$LOG_DIR/results_phi35_${PRESET}_${TIMESTAMP}"
+RESULTS_DIR="$LOG_DIR/results_${MODEL_STEM}_${PRESET}_${TIMESTAMP}"
 mkdir -p "$RESULTS_DIR"
 
 {
-echo "=== Phi-3.5-mini-instruct benchmark validation ==="
+echo "=== stock lm-eval benchmark run ($MODEL_STEM) ==="
 echo "  MODEL:       $MODEL"
 echo "  TASKS:       $TASKS"
 echo "  NUM_FEWSHOT: $NUM_FEWSHOT"
@@ -99,7 +111,7 @@ echo "==================================================="
 
 python -m lm_eval \
     --model hf \
-    --model_args "pretrained=$MODEL,max_length=$MAX_LENGTH,use_fast_tokenizer=false" \
+    --model_args "pretrained=$MODEL,max_length=$MAX_LENGTH${TOKENIZER_ARGS}" \
     --tasks "$TASKS" \
     ${NUM_FEWSHOT:+--num_fewshot "$NUM_FEWSHOT"} \
     --device cuda \
