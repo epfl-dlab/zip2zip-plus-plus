@@ -270,6 +270,21 @@ case "$MODEL_CONFIG" in
         ENCODER_N_HEADS=${ENCODER_N_HEADS:-32}
         ENCODER_INTERMEDIATE_SIZE=${ENCODER_INTERMEDIATE_SIZE:-12288}
         ;;
+    Phi3-medium)
+        # microsoft/Phi-3-medium-4k-instruct: same rule as Phi3.5-mini
+        # (encoder_dim == model dim, head_dim 128, 4x FFN), identical to the
+        # released epfl-dlab/zip2zip-Phi-3-medium-instruct-v0.1 encoder shape.
+        # 629M params per encoder, 1.26B for the untied pair.
+        ENCODER_DIM=${ENCODER_DIM:-5120}
+        ENCODER_N_HEADS=${ENCODER_N_HEADS:-40}
+        ENCODER_INTERMEDIATE_SIZE=${ENCODER_INTERMEDIATE_SIZE:-20480}
+        # The vocab guard in train.py cannot catch a forgotten Phi-3.5 default
+        # here (identical 32064 vocab), so refuse it explicitly.
+        case "$INIT_FROM_HF:$TOKENIZER" in
+            *Phi-3-medium-4k-instruct:*Phi-3-medium-4k-instruct) ;;
+            *) echo "FATAL: MODEL_CONFIG=Phi3-medium needs INIT_FROM_HF and TOKENIZER set to microsoft/Phi-3-medium-4k-instruct (got INIT_FROM_HF=$INIT_FROM_HF TOKENIZER=$TOKENIZER)" >&2; exit 1 ;;
+        esac
+        ;;
     1B)
         ENCODER_DIM=${ENCODER_DIM:-2048}
         ENCODER_N_HEADS=${ENCODER_N_HEADS:-32}

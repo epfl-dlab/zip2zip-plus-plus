@@ -476,6 +476,46 @@ zip2zip_llama_configs = {
             scaling="none",
         ),
     ),
+    # ~14.0B params: microsoft/Phi-3-medium-4k-instruct tensor shapes (dim=5120,
+    # 40 layers, GQA 40 q-heads / 10 kv-heads, head_dim=128, ffn=17920,
+    # vocab=32064, untied embeddings). RoPE theta=10000 unscaled is exact for the
+    # 4k checkpoint (rope_scaling is null there). Not modeled: the checkpoint's
+    # sliding_window=2047, inert for every training window and eval context this
+    # project uses (<= 2047 attended tokens); positions stay within its trained
+    # 4096 range. The launcher overrides the encoder geometry to 5120/40/20480
+    # (the released 14B model's encoder shape).
+    "Phi3-medium": Zip2ZipLlama3Model.Config(
+        dim=5120,
+        n_layers=40,
+        vocab_size=32064,
+        tie_word_embeddings=False,
+        max_codebook_size=4096,
+        max_subtokens=3,
+        encoder_dim=512,
+        encoder_n_layers=2,
+        encoder_n_heads=8,
+        encoder_intermediate_size=2048,
+        pad_token_id=32000,
+        tok_embeddings=Embedding.Config(init_std=5120 ** -0.5),
+        layer=Zip2ZipTransformerBlock.Config(
+            feed_forward=FeedForward.Config(
+                hidden_dim=17920,
+            ),
+            attention=GQAttention.Config(
+                n_heads=40,
+                n_kv_heads=10,
+                attn_backend="sdpa",
+                rope_backend="complex",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=5120 // 40,
+            max_seq_len=131072,
+            theta=10000,
+            backend="complex",
+            scaling="none",
+        ),
+    ),
     # ~3B params (dim=3072, 28 layers, head_dim=128)
     "3B": Zip2ZipLlama3Model.Config(
         dim=3072,
