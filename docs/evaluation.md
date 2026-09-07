@@ -54,7 +54,7 @@ python scripts/eval_harness.py \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--tasks` | arc_challenge, arc_easy, hellaswag, openbookqa, piqa, winogrande, commonsense_qa, medqa_4options | Comma-separated task list |
-| `--num_fewshot` | 0 | Few-shot examples |
+| `--num_fewshot` | per-task (`None`); presets may force a global value | Few-shot examples |
 | `--limit` | None | Per-task sample limit (for quick smoke runs) |
 | `--batch_size` | 1 | Eval batch size |
 | `--eval_mode` | compressed | `compressed` (LZW) or `base` (vanilla LM scoring) |
@@ -64,7 +64,7 @@ python scripts/eval_harness.py \
 
 ## Presets
 
-`scripts/eval_presets.yaml` centralizes tasks/num_fewshot/flags for four named presets,
+`scripts/eval_presets.yaml` centralizes tasks/num_fewshot/flags for the named presets,
 loaded via `--preset` (shared by `eval_harness.py` and `eval_hf_model.py` through
 `load_preset.py`) so there are no hardcoded duplicates across scripts. CLI flags still
 override preset values.
@@ -74,9 +74,96 @@ override preset values.
 | `default` | Full MC + generation benchmarks, 2-shot, chat template (paper Table 3 set + triviaqa) |
 | `perplexity` | Byte-level PPL on wikitext/pile/mc4/dc4, 1024-token rolling window |
 | `default_base` | Same as `default` but no chat template (from-scratch/non-instruct models) |
+| `perplexity_subset` | Quick PPL: full wikitext + pinned 1k-doc subsets of pile/mc4/dc4, logged under `subset_ppl/` |
+| `postsft` | Paper Table 2 generation set: MATH-500, HumanEval-instruct, IFEval — per-task few-shot, chat template |
 | `smoke` | 20 samples/task, no W&B — quick sanity check |
 
 `TASKS=...` env var (or `--tasks`) restricts a preset to one task without editing the YAML.
+
+### Post-SFT generation benchmarks (`postsft`, paper Table 2)
+
+`PRESET=postsft` scores the three generation benchmarks Table 2 adds on top of
+GSM8K (which stays in `default`): the stock lm-eval 0.4.9 tasks, or a
+one-dataset variant of one, run through the zip2zip adapter with the chat
+template on, greedy decoding, `max_length 4096`, seed 1234. It runs only through
+`eval_harness.py` / `eval_ckpt_rcp.sh`; restrict it with `TASKS=...` while
+keeping `PRESET=postsft` (under another preset the global `num_fewshot` would
+silently turn MATH-500 into a 2-shot run).
+
+| Task | What runs | Few-shot | Table 2 column |
+|------|-----------|----------|----------------|
+| `math500` | local YAML: `HuggingFaceH4/MATH-500` test split (500 problems, revision-pinned) scored by lm-eval's own `minerva_math` code — Minerva "Problem:/Solution:" prompt, answer normalisation and both scorers, reached via `scripts/lm_eval_tasks/math500_utils.py`; `max_gen_toks` 1024 (the harness default 256 truncates MATH solutions) | 4 fixed Minerva exemplars | strict = `exact_match`: the answer must sit in the Minerva sentence "Final Answer: The final answer is X. I hope it is correct." and be sympy-equivalent to the gold; flex = `math_verify`: `verify(parse(gold), parse(generation))`, i.e. the rightmost `\boxed{}`/math expression anywhere in the generation, checked symbolically. Gold for both = Minerva-normalised last `\boxed{}` of the reference solution (the dataset's `answer` column is rewritten with it) |
+| `humaneval_instruct` | stock task for chat models: user turn "Write a solution to the following problem and make sure that it passes the tests:" + fenced prompt, assistant turn pre-filled with the function header, generation cut at the closing fence, executed by HF `code_eval` | 0 | `pass@1` (greedy, one sample) |
+| `ifeval` | stock task, 541 prompts, no stop strings, `max_gen_toks` 1280 | 0 | `prompt_level_strict_acc` (Table 2's "prompt (s)"); loose and instruction-level variants are logged too |
+
+The preset deliberately has **no `num_fewshot` key**: a preset value is a global
+override in `simple_evaluate`, and these tasks have different protocols, so
+`eval_harness.py` and `eval_hf_model.py` default `--num_fewshot` to *per-task*
+(the MC and perplexity presets keep their explicit 2 and 0; `load_preset.py`
+exports an empty `NUM_FEWSHOT` for such presets and `validate_phi35_rcp.sh`
+then omits the flag).
+
+`max_gen_toks` through the zip2zip adapter counts **compressed** tokens in
+compressed mode — each may expand to several base tokens — and base tokens in
+`EVAL_MODE=base`. The budgets above are large enough that generations normally
+end at eos long before them, but a truncated generation is cut at a different
+base-token length in the two modes; state this next to any base/control row.
+
+`humaneval_instruct` executes model-written code. `eval_ckpt_rcp.sh` exports
+`HF_ALLOW_CODE_EVAL=1` for `PRESET=postsft` (or a `TASKS` list naming humaneval)
+and `eval_harness.py` passes lm-eval's `confirm_run_unsafe_code` from that same
+variable; `HF_ALLOW_CODE_EVAL=0` in the job env refuses instead of running. The
+code runs inside the eval job's container on the cluster, nowhere else.
+
+**Generation decoding fix that this preset exposed (2026-09-06).** The adapter
+used to decode generated ids standalone; SentencePiece tokenizers (Phi-3.5)
+then drop the word-boundary marker of the first piece, so a completion starting
+with four spaces of indentation came back with three and every HumanEval
+function failed with `IndentationError` (4 of 5 smoke generations). Generations
+are now decoded behind a fixed newline token and the newline cut back off, which
+restores the exact continuation; regex-scored tasks (gsm8k, triviaqa) are
+unaffected in their metrics, and BPE tokenizers (Llama-3) never stripped
+anything. `LEGACY_STRIPPED_GENERATION=1` (`--legacy_stripped_generation`)
+restores the old decode for bit-exact reproduction of pre-2026-09 samples; the
+results JSON records `preserve_leading_space`.
+
+**Environment.** These tasks need packages the shared `.venvs/lm-eval` must not
+get: lm-eval 0.4.9's `minerva_math.utils` asserts `antlr4-python3-runtime==4.11`
+at import time, and 4.11 breaks `omegaconf` (used by `eval_hf_model.py` /
+`eval_z2z_rcp.sh` from the same venv). A second venv is not an option either —
+the shared one carries a torch nightly a fresh venv would not see — so
+`eval_ckpt_rcp.sh` installs the extras with `pip --target` into
+`.venvs/lm-eval-postsft-extras` and prepends that directory to `PYTHONPATH` for
+postsft runs only: `langdetect==1.0.9`, `immutabledict==4.2.1`,
+`math-verify==0.7.0`, `antlr4-python3-runtime==4.11.0`. The shared venv is
+byte-identical for every other preset and for the pipeline. ifeval downloads
+nltk `punkt_tab` on first use.
+
+Typical use is a follow-up eval of an existing pipeline checkpoint, logged into
+its W&B run so the numbers sit next to `final/gsm8k/*`:
+
+```bash
+runai submit --name postsft-v064 \
+  --image ghcr.io/jkminder/dlab-runai-images/pytorch:master \
+  --gpu 1 --cpu 8 --memory 64Gi --pvc dlab-scratch:/mnt --large-shm --node-pools h100 \
+  --environment CKPT_DIR=/dlabscratch1/gentilin/zip2zip-outputs/<run>/step_8000 \
+  --environment TOKENIZER=microsoft/Phi-3.5-mini-instruct \
+  --environment PRESET=postsft \
+  --environment RESUME_WANDB_ID=<run id> --environment WANDB_STEP=8000 \
+  -- bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/eval_ckpt_rcp.sh
+```
+
+W&B keys follow `log_results_to_wandb.py`'s `<task>/<metric>_<filter>` flattening:
+`final/math500/exact_match`, `final/math500/math_verify`,
+`final/humaneval_instruct/pass@1_create_test` (the task's filter is named
+`create_test`) and `final/ifeval/prompt_level_strict_acc`, plus their stderr and
+loose/instruction-level variants. Every `eval_harness.py` run with
+`--output_path` now also writes `<results stem>_samples.json` with the
+per-sample prompts, generations and scores (the W&B sample tables are not
+written under `RESUME_WANDB_ID`), so paired per-problem comparisons stay
+possible, and the results JSON carries lm-eval's `versions` and `config`
+records. For a `MAX_CODEBOOK_SIZE=0` control checkpoint add `EVAL_MODE=base` as
+for every other preset. Smoke-test with `LIMIT=5` and no `RESUME_WANDB_ID` first.
 
 ### Repeated-window Wikitext stress tests
 

@@ -36,7 +36,9 @@ def main():
     p.add_argument("--model", default="epfl-dlab/zip2zip-Phi-3.5-mini-instruct-v0.1")
     p.add_argument("--tasks",
                    default="arc_challenge,arc_easy,hellaswag,openbookqa,piqa,winogrande,gsm8k")
-    p.add_argument("--num_fewshot", type=int, default=2)
+    p.add_argument("--num_fewshot", type=int, default=None,
+                   help="Global few-shot count forced on every task; presets "
+                        "set it explicitly. None keeps each task's own.")
     p.add_argument("--limit", type=float, default=None)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--max_length", type=int, default=4096)
@@ -97,6 +99,7 @@ def main():
         log_samples=not args.no_log_samples,
         apply_chat_template=getattr(args, 'apply_chat_template', True),
         fewshot_as_multiturn=getattr(args, 'fewshot_as_multiturn', True),
+        confirm_run_unsafe_code=os.environ.get("HF_ALLOW_CODE_EVAL") == "1",
     )
 
     print("\n" + "=" * 72)

@@ -1,0 +1,58 @@
+# MATH-500 (the 500-problem MATH subset of Lightman et al., 2023) scored with
+# lm-eval's minerva_math protocol, for the paper's post-SFT table.
+#
+# Why a local task: the pinned eval harness (lm-eval 0.4.9) ships MATH only as
+# the seven full minerva_math_* subjects (5,000 problems, ~10x the generation
+# time); MATH-500 is the faster and widely reported subset. Everything except
+# the dataset is minerva_math's own — the four fixed Minerva exemplars, the
+# "Problem: / Solution:" prompt, answer normalisation and both scorers — reached
+# through math500_utils.py, so the numbers come from the harness's code.
+#
+# Metrics (both produced by minerva_math.utils.process_results):
+#   exact_match  STRICT — the answer must be given in the Minerva sentence
+#                "Final Answer: The final answer is X. I hope it is correct."
+#                and be sympy-equivalent to the reference.
+#   math_verify  FLEX   — math_verify extracts the last \boxed{} / math
+#                expression anywhere in the generation and checks symbolic
+#                equivalence.
+#
+# Gold for both metrics is the Minerva-normalised last \boxed{} of the
+# reference SOLUTION (process_docs rewrites the dataset's `answer` column with
+# it, exactly as minerva_math does); the dataset's own answer string is not used.
+#
+# Deviations from minerva_math_*: dataset (revision-pinned) and max_gen_toks,
+# raised from the harness default of 256 to 1024 because MATH solutions are
+# long and 256 cuts many off before the final answer is written. Through the
+# zip2zip adapter max_gen_toks counts COMPRESSED tokens in compressed mode
+# (each may expand to several base tokens) and base tokens in base mode.
+tag:
+  - math_word_problems
+task: math500
+dataset_path: HuggingFaceH4/MATH-500
+dataset_kwargs:
+  revision: 6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be
+test_split: test
+process_docs: !function math500_utils.process_docs
+output_type: generate_until
+doc_to_text: !function math500_utils.doc_to_text
+process_results: !function math500_utils.process_results
+doc_to_target: "{{answer if few_shot is undefined else solution}}"
+generation_kwargs:
+  until:
+    - "Problem:"
+  do_sample: false
+  temperature: 0
+  max_gen_toks: 1024
+metric_list:
+  - metric: exact_match
+    aggregation: mean
+    higher_is_better: true
+  - metric: math_verify
+    aggregation: mean
+    higher_is_better: true
+num_fewshot: 4
+fewshot_config:
+  sampler: first_n
+  samples: !function math500_utils.list_fewshot_samples
+metadata:
+  version: 1.0

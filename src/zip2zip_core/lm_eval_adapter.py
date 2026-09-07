@@ -264,6 +264,7 @@ class Zip2ZipLM(LM):
         eval_max_subtokens: int | None = None,
         trim_stop_strings: bool = True,
         multi_view: bool = True,
+        preserve_leading_space: bool = True,
     ):
         super().__init__()
         if not torch.cuda.is_available() and device.startswith("cuda"):
@@ -375,6 +376,25 @@ class Zip2ZipLM(LM):
         self._batch_size = int(batch_size)
         self.hyper_causal_mask = bool(hyper_causal_mask)
         self.trim_stop_strings = bool(trim_stop_strings)
+        self.preserve_leading_space = bool(preserve_leading_space)
+        # One fixed newline token to decode generations behind (see
+        # _decode_generation). The LAST id of the tokenizer's encoding of "\n" is
+        # the newline piece itself: SentencePiece tokenizers put a word-boundary
+        # piece in front of it, BPE tokenizers encode it alone.
+        self._decode_prefix_ids: List[int] = []
+        self._decode_prefix_text = ""
+        try:
+            _nl = self.tokenizer.encode("\n", add_special_tokens=False)[-1:]
+            if _nl and self.tokenizer.decode(_nl, skip_special_tokens=True) == "\n":
+                self._decode_prefix_ids, self._decode_prefix_text = list(_nl), "\n"
+        except Exception:
+            pass
+        if not self.preserve_leading_space:
+            print("[zip2zip-lm-eval] legacy standalone decode of generations "
+                  "(a leading space is lost on SentencePiece tokenizers)")
+        elif not self._decode_prefix_ids:
+            print("[zip2zip-lm-eval] WARNING: no usable newline token — "
+                  "generations decode standalone, leading whitespace may be lost")
         # What the CHECKPOINT was trained with (provenance, never overridden).
         self.online_codebook_mask = bool(
             (self.train_args or {}).get("online_codebook_mask")
@@ -485,6 +505,8 @@ class Zip2ZipLM(LM):
             kwargs["trim_stop_strings"] = kwargs["trim_stop_strings"].lower() in ("1", "true", "yes")
         if "multi_view" in kwargs:
             kwargs["multi_view"] = kwargs["multi_view"].lower() in ("1", "true", "yes")
+        if "preserve_leading_space" in kwargs:
+            kwargs["preserve_leading_space"] = kwargs["preserve_leading_space"].lower() in ("1", "true", "yes")
         if additional_config:
             for k in ("batch_size", "device"):
                 if k not in kwargs and additional_config.get(k) is not None:
@@ -1391,6 +1413,28 @@ class Zip2ZipLM(LM):
                 text = text.split(term)[0]
         return text
 
+    def _decode_generation(self, gen_ids: List[int]) -> str:
+        """Decode generated ids as a CONTINUATION of the prompt.
+
+        tokenizer.decode() on a standalone id list treats its first piece as the
+        start of a text, and SentencePiece tokenizers (Phi-3.5, Llama-2) drop that
+        piece's word-boundary marker: a completion that begins with four spaces of
+        Python indentation comes back with three, so HumanEval raises
+        IndentationError on every otherwise-correct function (measured 2026-09-06:
+        4 of 5 smoke generations). Decoding behind a fixed newline token and
+        cutting it back off yields exactly the text the model produced after the
+        prompt. Byte-identical for pieces without a leading marker; on BPE
+        tokenizers (Llama-3) decode never stripped anything, so nothing changes.
+        preserve_leading_space=False keeps the pre-2026-09 standalone decode.
+        """
+        if not self.preserve_leading_space or not gen_ids or not self._decode_prefix_ids:
+            return self.tok_decode(gen_ids)
+        full = self.tok_decode(self._decode_prefix_ids + list(gen_ids))
+        head = self._decode_prefix_text
+        if full.startswith(head):
+            return full[len(head):]
+        return self.tok_decode(gen_ids)
+
     @torch.no_grad()
     def _generate_base(
         self,
@@ -1428,7 +1472,7 @@ class Zip2ZipLM(LM):
                 break
         self.compression_stats["gen_comp"] += len(gen_ids)
         self.compression_stats["gen_base"] += len(gen_ids)
-        return self._trim_stops(self.tok_decode(gen_ids), until)
+        return self._trim_stops(self._decode_generation(gen_ids), until)
 
     @torch.no_grad()
     def _generate_compressed(
@@ -1557,7 +1601,7 @@ class Zip2ZipLM(LM):
 
         self.compression_stats["gen_comp"] += n_gen_comp
         self.compression_stats["gen_base"] += len(gen_base_ids)
-        return self._trim_stops(self.tok_decode(gen_base_ids), until)
+        return self._trim_stops(self._decode_generation(gen_base_ids), until)
 
     def generate_until(self, requests) -> List[str]:
         out: List[str] = []

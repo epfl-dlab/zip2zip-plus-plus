@@ -87,6 +87,24 @@ presets:
     dtype: bfloat16
     seed: 1234
 
+  # Post-SFT generation benchmarks for the paper's Table 2 (its GSM8K column
+  # comes from `default`). No num_fewshot key on purpose: a preset value is a
+  # GLOBAL override in simple_evaluate, and these tasks have different
+  # protocols — math500 uses its 4 fixed Minerva exemplars, humaneval_instruct
+  # and ifeval are 0-shot — so each task keeps its own. humaneval_instruct
+  # executes generated code: eval_ckpt_rcp.sh exports HF_ALLOW_CODE_EVAL=1 for
+  # this preset and eval_harness.py passes confirm_run_unsafe_code from it.
+  postsft:
+    description: "Post-SFT generation benchmarks (paper Table 2): MATH-500 (Minerva 4-shot; strict=exact_match, flex=math_verify), HumanEval-instruct pass@1, IFEval prompt-level strict — per-task few-shot, chat template"
+    tasks: [math500, humaneval_instruct, ifeval]
+    max_length: 4096
+    eval_mode: compressed
+    batch_size: 1
+    dtype: bfloat16
+    seed: 1234
+    apply_chat_template: true
+    fewshot_as_multiturn: true
+
   default_base:
     description: "2-shot MC benchmarks for from-scratch (non-instruct) models — no chat template"
     tasks: [arc_challenge, arc_easy, hellaswag, openbookqa, piqa, winogrande, gsm8k, triviaqa]

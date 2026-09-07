@@ -6,8 +6,10 @@ Default tasks cover the standard pretraining suite:
     zip2zip_pile, zip2zip_mc4, zip2zip_dc4    (custom YAMLs, loglikelihood)
 
 Generation tasks are also supported (gsm8k, triviaqa, humaneval, mbpp, ifeval)
-but are opt-in via --tasks because they require generate_until and, for code
-tasks, HF_ALLOW_CODE_EVAL=1 in env plus confirm_run_unsafe_code (not wired up).
+but are opt-in via --tasks/--preset because they require generate_until. Code
+tasks execute model-written code: they need HF_ALLOW_CODE_EVAL=1 in the
+environment (eval_ckpt_rcp.sh exports it for the `postsft` preset), and
+lm-eval's confirm_run_unsafe_code is passed from that same variable.
 
 Usage:
     python scripts/eval_harness.py --ckpt_dir /path/to/step_6000
@@ -92,7 +94,11 @@ def main():
     p.add_argument("--tokenizer", default="meta-llama/Meta-Llama-3-8B")
     p.add_argument("--tasks", default=None,
                    help=f"Comma-separated. Default: {','.join(DEFAULT_TASKS)}")
-    p.add_argument("--num_fewshot", type=int, default=0)
+    p.add_argument("--num_fewshot", type=int, default=None,
+                   help="Global few-shot count forced on EVERY task (the MC and "
+                        "perplexity presets set it explicitly). Default None "
+                        "keeps each task's own protocol, e.g. math500's four "
+                        "fixed Minerva exemplars next to 0-shot ifeval.")
     p.add_argument("--limit", type=float, default=None,
                    help="Per-task sample limit for quick smoke runs.")
     p.add_argument("--max_length", "--max_seq_len", dest="max_length", type=int, default=4096,
@@ -128,6 +134,11 @@ def main():
                         "stop-string occurrence, as all evals did before 2026-08. "
                         "Only for bit-exact reproduction of those results — wrong "
                         "for text-scored tasks like triviaqa.")
+    p.add_argument("--legacy_stripped_generation", action="store_true",
+                   help="Decode generations standalone, as all evals did before "
+                        "2026-09: SentencePiece tokenizers (Phi) then lose one "
+                        "leading space, which breaks HumanEval indentation. Only "
+                        "for bit-exact reproduction of old generation samples.")
     p.add_argument("--disable_digit_ids", action="store_true",
                    help="Diagnostic: add digit tokens to disabled_ids so numbers "
                         "are never LZW-merged into hypertokens (compressed mode).")
@@ -190,6 +201,7 @@ def main():
         eval_max_subtokens=args.eval_max_subtokens,
         trim_stop_strings=not args.legacy_untrimmed_stops,
         multi_view=not args.no_multi_view,
+        preserve_leading_space=not args.legacy_stripped_generation,
     )
     # The adapter auto-enables digit protection for checkpoints trained with it
     # and auto-switches control checkpoints (max_codebook_size=0) to base mode —
@@ -213,6 +225,7 @@ def main():
     args.online_codebook_mask = lm.online_codebook_mask
     args.online_codebook_mask_active = lm.online_codebook_mask_active
     args.trim_stop_strings = lm.trim_stop_strings
+    args.preserve_leading_space = lm.preserve_leading_space
     args.multi_view = lm.multi_view
     # Distinguishes "inactive because base mode" from "inactive because this eval
     # deliberately asked for the legacy mask" — otherwise a results JSON cannot
@@ -259,8 +272,24 @@ def main():
         log_samples=not args.no_log_samples,
         apply_chat_template=getattr(args, 'apply_chat_template', False),
         fewshot_as_multiturn=getattr(args, 'fewshot_as_multiturn', False),
+        # Tasks flagged unsafe_code (humaneval*) execute generated code and are
+        # refused unless this is True; HF evaluate's code_eval independently
+        # refuses unless HF_ALLOW_CODE_EVAL=1. One env var drives both.
+        confirm_run_unsafe_code=os.environ.get("HF_ALLOW_CODE_EVAL") == "1",
     )
     eval_wall_seconds = time.perf_counter() - eval_start
+
+    # lm-eval lets a built-in task of the same name shadow an include_path
+    # YAML without warning; the paper's math500 protocol lives in the local
+    # YAML, so refuse a result that came from anything else.
+    math500_cfg = (results.get("configs") or {}).get("math500")
+    if math500_cfg is not None:
+        revision = str((math500_cfg.get("dataset_kwargs") or {}).get("revision", ""))
+        if not revision.startswith("6e4ed1a2"):
+            raise RuntimeError(
+                "math500 resolved to an unexpected task definition "
+                f"(dataset revision {revision!r}); scripts/lm_eval_tasks/math500.yaml was not used"
+            )
 
     # Multi-view perplexity: turn the adapter's per-task loglikelihood sums
     # into metrics by rescaling the harness-reported strict values (the
@@ -417,6 +446,11 @@ def main():
                 {
                     "results": results.get("results"),
                     "configs": results.get("configs"),
+                    # Task versions and the harness's own config record (model
+                    # args, harness/transformers versions): the protocol a paper
+                    # number was produced under must be readable from the JSON.
+                    "versions": results.get("versions"),
+                    "config": results.get("config"),
                     "compression": compression,
                     "multi_view": multi_view,
                     "eval_wall_seconds": eval_wall_seconds,
@@ -429,6 +463,24 @@ def main():
                 default=str,
             )
         print(f"Saved results JSON to {args.output_path}")
+        # Per-sample generations next to the results. With RESUME_WANDB_ID the
+        # launcher runs the harness with --no_wandb, so the W&B sample tables
+        # that gsm8k's paired (McNemar) analyses relied on are never written;
+        # without this file a follow-up eval's generations are gone for good.
+        # Generation tasks only: MC and perplexity samples have no downstream
+        # consumer and would add ~1e2 MB per default eval to the PVC.
+        configs = results.get("configs") or {}
+        gen_samples = {
+            task: rows
+            for task, rows in (results.get("samples") or {}).items()
+            if (configs.get(task) or {}).get("output_type") == "generate_until"
+        }
+        if not args.no_log_samples and gen_samples:
+            stem, _ = os.path.splitext(args.output_path)
+            samples_path = f"{stem}_samples.json"
+            with open(samples_path, "w") as f:
+                json.dump(gen_samples, f, default=str)
+            print(f"Saved per-sample generations to {samples_path}")
 
 
 if __name__ == "__main__":

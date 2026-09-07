@@ -43,7 +43,12 @@
 #   PRESET=...      Eval preset (default: default_base). PRESET=perplexity_subset
 #                   is the quick perplexity: full wikitext + pinned 1000-doc
 #                   subsets of Pile/mC4/dC4, logged under subset_ppl/ (see
-#                   WANDB_PREFIX below).
+#                   WANDB_PREFIX below). PRESET=postsft is the paper's Table 2
+#                   generation set (math500, humaneval_instruct, ifeval; each
+#                   task keeps its own few-shot). humaneval_instruct executes
+#                   model-written code, so this script exports
+#                   HF_ALLOW_CODE_EVAL=1 for that preset — set
+#                   HF_ALLOW_CODE_EVAL=0 to refuse and fail fast instead.
 #   LIMIT=20        Per-task sample limit for smoke tests. Refused together with
 #                   PRESET=perplexity_subset + RESUME_WANDB_ID under the default
 #                   prefix: a partial subset score must not enter the
@@ -53,6 +58,10 @@
 #                   evals before 2026-08 did. Only for bit-exact reproduction of
 #                   those results (pin the old task list via TASKS too — the
 #                   presets gained triviaqa); wrong for text-scored tasks.
+#   LEGACY_STRIPPED_GENERATION=1  Decode generations standalone, as all evals
+#                   before 2026-09 did: SentencePiece tokenizers (Phi) then drop
+#                   one leading space, which breaks HumanEval indentation. Only
+#                   for bit-exact reproduction of old generation samples.
 #   Z2Z_SCRATCH=...     Your PVC scratch dir (default: /dlabscratch1/gentilin)
 #   WANDB=1         Log results/samples/compression to W&B (default: off, JSON+log
 #                   only). Requires WANDB_API_KEY in the job env.
@@ -105,6 +114,20 @@ TOKENIZER=${TOKENIZER:-meta-llama/Meta-Llama-3-8B}
 PRESET=${PRESET:-default_base}
 LIMIT=${LIMIT:-}
 TASKS=${TASKS:-}
+# The postsft tasks (math500, humaneval_instruct, ifeval) need extra packages
+# that go into their own --target directory prepended to PYTHONPATH (see the venv block below); any preset/task list
+# naming them selects it.
+POSTSFT_DEPS=""
+case "$PRESET,${TASKS:-}" in
+    postsft,*|*humaneval*|*math500*|*ifeval*) POSTSFT_DEPS=1 ;;
+esac
+# humaneval_instruct runs the model's code through HF evaluate's code_eval, which
+# refuses unless HF_ALLOW_CODE_EVAL=1; eval_harness.py mirrors the same variable
+# into lm-eval's confirm_run_unsafe_code. Only the postsft preset (or an explicit
+# humaneval task list) turns it on — no other preset ever executes generated text.
+case "$PRESET,${TASKS:-}" in
+    postsft,*|*humaneval*) export HF_ALLOW_CODE_EVAL=${HF_ALLOW_CODE_EVAL:-1} ;;
+esac
 # EVAL_MODE=base for MAX_CODEBOOK_SIZE=0 control checkpoints (base-mode-only).
 EVAL_MODE=${EVAL_MODE:-}
 # EVAL_MAX_SUBTOKENS: eval-only LZW merge-size override. Unset follows meta.pt.
@@ -128,6 +151,10 @@ NO_ONLINE_CODEBOOK_MASK=${NO_ONLINE_CODEBOOK_MASK:-}
 # (no stop-string cut). "0" normalizes to off like the flags above.
 LEGACY_UNTRIMMED_STOPS=${LEGACY_UNTRIMMED_STOPS:-}
 [ "$LEGACY_UNTRIMMED_STOPS" = "0" ] && LEGACY_UNTRIMMED_STOPS=""
+# LEGACY_STRIPPED_GENERATION=1: decode generations standalone (pre-2026-09), which
+# loses one leading space on SentencePiece tokenizers. "0" normalizes to off.
+LEGACY_STRIPPED_GENERATION=${LEGACY_STRIPPED_GENERATION:-}
+[ "$LEGACY_STRIPPED_GENERATION" = "0" ] && LEGACY_STRIPPED_GENERATION=""
 WANDB=${WANDB:-0}
 WANDB_NAME=${WANDB_NAME:-}
 export WANDB_PROJECT=${WANDB_PROJECT:-llaza}
@@ -187,6 +214,7 @@ VARIANT_TAG="mode-${MODE_TAG}"
 [ -n "$DISABLE_MATHSYM_IDS" ] && VARIANT_TAG="${VARIANT_TAG}-nomathsym"
 [ -n "$NO_ONLINE_CODEBOOK_MASK" ] && VARIANT_TAG="${VARIANT_TAG}-legacycbmask"
 [ -n "$LEGACY_UNTRIMMED_STOPS" ] && VARIANT_TAG="${VARIANT_TAG}-untrimmedstops"
+[ -n "$LEGACY_STRIPPED_GENERATION" ] && VARIANT_TAG="${VARIANT_TAG}-strippedgen"
 if [ -n "$LIMIT" ]; then
     LIMIT_TAG=$(printf '%s' "$LIMIT" | tr -cs '[:alnum:]._-' '_')
     VARIANT_TAG="${VARIANT_TAG}-limit${LIMIT_TAG}"
@@ -216,6 +244,27 @@ pip install --quiet \
     "huggingface_hub" \
     "zip2zip-compression>=0.3.3" \
     wandb
+if [ -n "$POSTSFT_DEPS" ]; then
+    # The postsft tasks need packages the SHARED venv must not get: lm-eval 0.4.9's
+    # minerva_math.utils (which math500 delegates to) asserts
+    # antlr4-python3-runtime==4.11 at import time, and 4.11 breaks omegaconf
+    # ("Could not deserialize ATN"), which eval_hf_model.py / eval_z2z_rcp.sh
+    # import from that same venv (measured 2026-09-06). A second venv is not an
+    # option either: the shared one carries a torch nightly (varlen attention)
+    # a fresh --system-site-packages venv does not see. So the extras live in
+    # their own directory and are prepended to PYTHONPATH for THIS process only
+    # — antlr4 4.11 shadows the venv's 4.9.3 here and nowhere else. langdetect +
+    # immutabledict are ifeval's. Pinned so a re-created dir scores identically
+    # (4.11.0 = lm-eval's own [math] extra).
+    POSTSFT_EXTRAS_DIR=$Z2Z_SCRATCH/.venvs/lm-eval-postsft-extras
+    pip install --quiet --upgrade --target "$POSTSFT_EXTRAS_DIR" \
+        "langdetect==1.0.9" \
+        "immutabledict==4.2.1" \
+        "math-verify==0.7.0" \
+        "antlr4-python3-runtime==4.11.0"
+    export PYTHONPATH="$POSTSFT_EXTRAS_DIR${PYTHONPATH:+:$PYTHONPATH}"
+    echo "[eval_ckpt] postsft extras on PYTHONPATH: $POSTSFT_EXTRAS_DIR"
+fi
 
 # Verify the resume target EXISTS before spending an hour of GPU. The upload runs
 # LAST, so a wrong id used to surface only after the whole eval had finished — and
@@ -297,6 +346,7 @@ if [ -n "$CKPT_DIR" ]; then
         ${DISABLE_MATHSYM_IDS:+--disable_mathsym_ids} \
         ${NO_ONLINE_CODEBOOK_MASK:+--no_online_codebook_mask} \
         ${LEGACY_UNTRIMMED_STOPS:+--legacy_untrimmed_stops} \
+        ${LEGACY_STRIPPED_GENERATION:+--legacy_stripped_generation} \
         $WANDB_ARGS \
         $LIMIT_ARG \
         $TASKS_ARG
@@ -313,6 +363,7 @@ else
         ${DISABLE_MATHSYM_IDS:+--disable_mathsym_ids} \
         ${NO_ONLINE_CODEBOOK_MASK:+--no_online_codebook_mask} \
         ${LEGACY_UNTRIMMED_STOPS:+--legacy_untrimmed_stops} \
+        ${LEGACY_STRIPPED_GENERATION:+--legacy_stripped_generation} \
         $WANDB_ARGS \
         $LIMIT_ARG \
         $TASKS_ARG
