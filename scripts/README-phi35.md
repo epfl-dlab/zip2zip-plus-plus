@@ -106,5 +106,3 @@ All changes are gated/opt-in; existing Llama scripts (`train_1b_v1.sbatch`,
 ## Eval / comparison
 
 - In-framework: `scripts/eval_harness.py --tokenizer microsoft/Phi-3.5-mini-instruct`.
-- vs the released HF model: needs a Phi state-dict export adapter (not yet written) to
-  use `scripts/zip2zip_hf/eval_compare.py`. TODO if a same-harness comparison is needed.

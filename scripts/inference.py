@@ -40,6 +40,21 @@ DEFAULT_TOKENIZER = "bofenghuang/Meta-Llama-3-8B"
 
 DEFAULT_PROMPT = "The Eiffel Tower is located in"
 
+@dataclasses.dataclass
+class GenerationTrace:
+    """Exact structured output from the canonical core generation loop."""
+
+    text: str
+    colored_text: str
+    prompt_base_ids: list[int]
+    prompt_compressed_ids: list[int]
+    generated_base_ids: list[int]
+    raw_generated_ids: list[int]
+    generated_compressed_ids: list[int]
+    codebook: dict[int, list[int]]
+    stop_reason: str
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def load_model(
@@ -197,7 +212,7 @@ def load_prompts(prompt: str | None, prompt_file: str | None) -> list[str]:
 
 
 @torch.no_grad()
-def generate(
+def generate_trace(
     prompt: str,
     model: Zip2ZipLlama3Model,
     codebook_manager: CodebookManager,
@@ -207,7 +222,8 @@ def generate(
     max_new_tokens: int = 128,
     temperature: float = 0.0,
     device: str = "cuda",
-) -> tuple[str, str]:
+    verbose: bool = True,
+) -> GenerationTrace:
     """Generate compressed tokens and decode them back to base-token text.
 
     ``max_new_tokens`` counts sampled compressed tokens. A sampled hypertoken
@@ -252,6 +268,7 @@ def generate(
         logits = logits[0]
 
     generated_base_ids: list[int] = []
+    raw_generated_ids: list[int] = []
     generated_display_ids: list[int] = []
 
     def _color_decode_ids(ids: list[int]) -> str:
@@ -262,18 +279,22 @@ def generate(
         return render_colored_tokens(colored_tokens, hf_tokenizer)
 
     # ── Decode loop ──
+    stop_reason = "max_new_tokens"
     for step in range(max_new_tokens):
         last_logits = logits[0, -1, :]  # (vocab_size + max_codebook_size,)
         next_id = _sample_next(last_logits, temperature)
+        raw_generated_ids.append(next_id)
         if next_id < vocab_size:
             expansion = [next_id]
         else:
             expansion = list(codebook_dict.get(next_id, []))
             if not expansion:
-                print(
-                    f"[inference] sampled unavailable hyper-token {next_id}; "
-                    "stopping"
-                )
+                if verbose:
+                    print(
+                        f"[inference] sampled unavailable hyper-token {next_id}; "
+                        "stopping"
+                    )
+                stop_reason = "unavailable_hypertoken"
                 break
 
         stop_at = [
@@ -286,6 +307,7 @@ def generate(
             # A partially emitted hyper-token cannot be represented by its
             # compressed id in the visualization, so show the surviving bases.
             generated_display_ids.extend(expansion[:cut])
+            stop_reason = "eos"
             break
 
         generated_base_ids.extend(expansion)
@@ -315,7 +337,7 @@ def generate(
         if isinstance(logits, tuple):
             logits = logits[0]
 
-        if step % 2 == 0:
+        if verbose and step % 2 == 0:
             partial_colored = _color_decode_ids(generated_display_ids[-20:])
             ids_str = str(generated_base_ids[-10:])
             _, top10_ids = torch.topk(last_logits, 10)
@@ -328,7 +350,50 @@ def generate(
             print(f"           top10: {', '.join(top10_tokens)}")
 
     colored_output = _color_decode_ids(generated_display_ids)
-    return hf_tokenizer.decode(generated_base_ids, skip_special_tokens=True), colored_output
+    codebooks = codebook_manager.internal_codebook_manager.get_codebooks()
+    final_codebook = codebooks[0].to_dict() if codebooks else {}
+    return GenerationTrace(
+        text=hf_tokenizer.decode(generated_base_ids, skip_special_tokens=True),
+        colored_text=colored_output,
+        prompt_base_ids=[int(token) for token in base_ids],
+        prompt_compressed_ids=[int(token) for token in compressed_ids],
+        generated_base_ids=[int(token) for token in generated_base_ids],
+        raw_generated_ids=[int(token) for token in raw_generated_ids],
+        generated_compressed_ids=[int(token) for token in generated_display_ids],
+        codebook={
+            int(token_id): [int(token) for token in expansion]
+            for token_id, expansion in final_codebook.items()
+        },
+        stop_reason=stop_reason,
+    )
+
+
+def generate(
+    prompt: str,
+    model: Zip2ZipLlama3Model,
+    codebook_manager: CodebookManager,
+    lzw_compressor: LZWCompressor,
+    hf_tokenizer,
+    stop_token_ids: set[int],
+    max_new_tokens: int = 128,
+    temperature: float = 0.0,
+    device: str = "cuda",
+    verbose: bool = True,
+) -> tuple[str, str]:
+    """Backward-compatible text API built on :func:`generate_trace`."""
+    trace = generate_trace(
+        prompt,
+        model,
+        codebook_manager,
+        lzw_compressor,
+        hf_tokenizer,
+        stop_token_ids,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        device=device,
+        verbose=verbose,
+    )
+    return trace.text, trace.colored_text
 
 
 # ── main ──────────────────────────────────────────────────────────────────────

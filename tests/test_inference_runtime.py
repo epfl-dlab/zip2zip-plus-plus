@@ -275,3 +275,33 @@ def test_length4_created_during_decoding_becomes_selectable(inference_module):
 def test_temperature_zero_is_greedy(inference_module):
     logits = torch.tensor([-3.0, 1.0, 9.0, 2.0])
     assert inference_module._sample_next(logits, 0.0) == 2
+
+
+def test_generate_trace_records_exact_compressed_and_expanded_views(inference_module):
+    vocab_size = 8
+    manager = _FakeManager(vocab_size, [4, 5])
+    compressor = _FakeCompressor([1, vocab_size])
+    tokenizer = _FakeTokenizer([1, 4, 5, 4, 5])
+    model = _FakeModel([vocab_size, 2], vocab_size=vocab_size)
+
+    trace = inference_module.generate_trace(
+        "prompt",
+        model,
+        manager,
+        compressor,
+        tokenizer,
+        {tokenizer.eos_token_id},
+        max_new_tokens=4,
+        temperature=0.0,
+        device="cpu",
+        verbose=False,
+    )
+
+    assert trace.text == "4 5"
+    assert trace.prompt_base_ids == [1, 4, 5, 4, 5]
+    assert trace.prompt_compressed_ids == [1, 8]
+    assert trace.raw_generated_ids == [8, 2]
+    assert trace.generated_compressed_ids == [8]
+    assert trace.generated_base_ids == [4, 5]
+    assert trace.codebook[8] == [4, 5]
+    assert trace.stop_reason == "eos"
