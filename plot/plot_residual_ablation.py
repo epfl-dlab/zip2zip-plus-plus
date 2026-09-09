@@ -46,33 +46,35 @@ def plot_metric(ax, df, metric):
         final_value = smoothed.dropna().iloc[-1]
         metric_label = "loss" if metric == "loss" else "acc"
 
-        ax.plot(steps, values, color=color, linewidth=0.6, alpha=0.2)
         ax.plot(
             steps,
             smoothed,
             color=color,
-            linewidth=1.5,
+            linewidth=1.6,
             label=f"{label} ({metric_label}: {final_value:.3f})",
         )
 
     if metric == "loss":
-        ax.set_title("Training Loss", fontsize=11)
-        ax.set_ylabel("Loss", fontsize=10)
+        ax.set_title("Training Loss", fontsize=13)
+        ax.set_ylabel("Loss", fontsize=12)
         ax.set_ylim(1.0, 8.0)
     else:
-        ax.set_title("Training Accuracy", fontsize=11)
-        ax.set_ylabel("Accuracy", fontsize=10)
+        ax.set_title("Training Accuracy", fontsize=13)
+        ax.set_ylabel("Accuracy", fontsize=12)
         ax.set_ylim(0.0, 0.7)
 
-    ax.set_xlabel("Step", fontsize=10)
-    ax.legend(fontsize=8)
+    ax.set_xlabel("Step", fontsize=12)
+    ax.tick_params(axis="both", labelsize=10)
+    ax.legend(fontsize=9)
     ax.xaxis.set_major_formatter(
         ticker.FuncFormatter(lambda x, _: f"{int(x):,}")
     )
     ax.grid(True, linestyle="--", alpha=0.4)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
 
 
-fig, (ax_loss, ax_acc) = plt.subplots(1, 2, figsize=(11, 3.5))
+fig, (ax_loss, ax_acc) = plt.subplots(1, 2, figsize=(8.6, 3.8))
 
 plot_metric(ax_loss, DATASETS["loss"], "loss")
 plot_metric(ax_acc, DATASETS["acc"], "acc")
