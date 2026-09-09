@@ -134,10 +134,16 @@ def _load_zip2zip_checkpoint(
 
     cfg_key = train_args.get("model_config", "1B")
     cfg = zip2zip_llama_configs[cfg_key]
+    # Host-side and memory-mapped: the checkpoint is the full fp32 model (61 GB
+    # for a 14B decoder) and must not share the GPU with the fp32 module built
+    # below, which the old map_location=device did (2 x 61 GB > 80 GB). The
+    # LoRA fold therefore runs on the CPU; the pod needs host RAM for one fp32
+    # copy of the merged decoder weights (~55 GB at 14B, ~15 GB at 4B).
     sd = torch.load(
         os.path.join(ckpt_dir, "model.pt"),
-        map_location=str(device),
+        map_location="cpu",
         weights_only=True,
+        mmap=True,
     )
     sd = _strip_wrapper_prefixes(sd)
     sd = _fold_lora_weights(sd, train_args)
@@ -219,7 +225,10 @@ def _load_zip2zip_checkpoint(
                 f"checkpoint={checkpoint_max_subtokens} eval={eval_max_subtokens}"
             )
 
-    model = Zip2ZipLlama3Model(cfg)
+    # Build straight on the target device: a CPU build followed by .to(device)
+    # would hold a second fp32 copy of the model in host memory.
+    with torch.device(device):
+        model = Zip2ZipLlama3Model(cfg)
     if not restore_encoder_residual(model, train_args):
         # Behavior-only flag: there is no state-dict key that can restore it.
         # Missing this silently evaluates a no-residual checkpoint with the
