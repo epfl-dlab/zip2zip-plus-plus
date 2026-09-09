@@ -329,6 +329,35 @@ WANDB_ENTITY=${WANDB_ENTITY:-}
 HF_REPO=${HF_REPO:-}
 
 RESUME_FROM=${RESUME_FROM:-}
+# AUTO_RESUME=1: a Run:AI restart after a preemption re-runs this script from the
+# top; with this knob the run continues from the newest COMPLETE checkpoint in
+# OUTPUT_DIR (meta.pt is written last, so a dir without it was cut mid-save and
+# is skipped) instead of train.py starting a fresh run in "OUTPUT_DIR(1)". Pair it
+# with a fixed WANDB_ID so the W&B run continues too, and with NUM_WORKERS=0 (the
+# only setting under which the data position is restored). Ignored when
+# RESUME_FROM is set explicitly.
+AUTO_RESUME=${AUTO_RESUME:-}
+if [ -n "$AUTO_RESUME" ] && [ "$AUTO_RESUME" != "0" ] && [ -z "$RESUME_FROM" ]; then
+    _latest_complete=""
+    _latest_step=-1
+    for _d in "$OUTPUT_DIR"/step_*; do
+        [ -d "$_d" ] || continue
+        _n=${_d##*/step_}
+        case "$_n" in ''|*[!0-9]*) continue ;; esac
+        if [ -f "$_d/model.pt" ] && [ -f "$_d/meta.pt" ]; then
+            if [ "$_n" -gt "$_latest_step" ]; then _latest_step=$_n; _latest_complete=$_d; fi
+        else
+            echo "[finetune_rcp] AUTO_RESUME: skipping incomplete checkpoint $_d (no meta.pt)"
+        fi
+    done
+    if [ -n "$_latest_complete" ]; then
+        RESUME_FROM=$_latest_complete
+        echo "[finetune_rcp] AUTO_RESUME: resuming from $RESUME_FROM"
+    elif [ -d "$OUTPUT_DIR" ]; then
+        echo "FATAL: AUTO_RESUME=1 but $OUTPUT_DIR exists without a complete step_*/ checkpoint; delete it (or the truncated step dir) and resubmit." >&2
+        exit 1
+    fi
+fi
 RESET_STEP=${RESET_STEP:-}
 NO_ENCODER_RESIDUAL=${NO_ENCODER_RESIDUAL:-}
 DEBUG_FIRST_STEPS=${DEBUG_FIRST_STEPS:-0}
