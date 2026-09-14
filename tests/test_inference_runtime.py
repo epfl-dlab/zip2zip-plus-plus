@@ -128,6 +128,72 @@ class _FakeModel:
     forward = __call__
 
 
+def test_load_model_memory_maps_checkpoint_on_cpu_and_casts_before_load(
+    inference_module, monkeypatch
+):
+    cfg = inference_module.zip2zip_llama_configs["1B"]
+    train_args = {
+        "model_config": "1B",
+        "max_subtokens": cfg.max_subtokens,
+        "max_codebook_size": cfg.max_codebook_size,
+    }
+    load_calls = []
+    events = []
+
+    def fake_torch_load(path, **kwargs):
+        load_calls.append((path, kwargs))
+        if path.endswith("meta.pt"):
+            return {"args": train_args}
+        return {"weight": torch.ones(1)}
+
+    class FakeLoadedModel:
+        def __init__(self, loaded_cfg):
+            self.zip2zip_config = loaded_cfg
+            self.constructed_on = torch.empty(0).device.type
+
+        def to(self, *, device):
+            events.append(("to", str(device)))
+            return self
+
+        def _apply(self, fn):
+            events.append(("cast", fn(torch.ones(1)).dtype))
+            return self
+
+        def load_state_dict(self, state_dict, *, strict):
+            events.append(("load", strict, tuple(state_dict)))
+
+        def eval(self):
+            events.append(("eval",))
+            return self
+
+    monkeypatch.setattr(inference_module.torch, "load", fake_torch_load)
+    monkeypatch.setattr(inference_module, "Zip2ZipLlama3Model", FakeLoadedModel)
+    monkeypatch.setattr(
+        inference_module, "restore_encoder_residual", lambda *_: True
+    )
+
+    model, loaded_args = inference_module.load_model(
+        "/tmp/checkpoint",
+        "meta",
+        dtype=torch.bfloat16,
+    )
+
+    assert loaded_args == train_args
+    assert model.constructed_on == "meta"
+    assert load_calls[0][1] == {"map_location": "cpu", "weights_only": False}
+    assert load_calls[1][1] == {
+        "map_location": "cpu",
+        "weights_only": True,
+        "mmap": True,
+    }
+    assert events == [
+        ("to", "meta"),
+        ("cast", torch.bfloat16),
+        ("load", True, ("weight",)),
+        ("eval",),
+    ]
+
+
 class _DecodeCreatedEntryModel(_FakeModel):
     """Emit bases until a decode-created length-4 row becomes available."""
 

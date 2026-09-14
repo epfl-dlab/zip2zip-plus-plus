@@ -71,6 +71,7 @@ def load_model(
     max_merge_size: int | None = None,
     *,
     rope_mode: str = "checkpoint",
+    dtype: torch.dtype | None = None,
 ) -> tuple[Zip2ZipLlama3Model, dict]:
     meta = torch.load(f"{ckpt_dir}/meta.pt", map_location="cpu", weights_only=False)
     args = meta["args"]
@@ -87,8 +88,14 @@ def load_model(
         rope_cfg = _phi3_longrope_rope_config(cfg.rope, hf_config)
     elif rope_mode != "checkpoint":
         raise ValueError(f"unsupported inference RoPE mode: {rope_mode!r}")
+    # Keep the full fp32 checkpoint host-side and memory-mapped. Loading it on
+    # the GPU before constructing the model needs two full fp32 copies at peak
+    # and exceeds an 80 GB H100 for the 14B checkpoints.
     sd = torch.load(
-        f"{ckpt_dir}/model.pt", map_location=device, weights_only=True
+        f"{ckpt_dir}/model.pt",
+        map_location="cpu",
+        weights_only=True,
+        mmap=True,
     )
     sd = prepare_inference_state_dict(sd, args)
     # Encoder architecture overrides recorded in meta.pt (None in legacy metas
@@ -154,7 +161,10 @@ def load_model(
             "[inference] max merge size: "
             f"checkpoint={checkpoint_max_subtokens}, inference={max_merge_size}"
         )
-    model = Zip2ZipLlama3Model(cfg)
+    # Construct directly on the target device so there is no second full model
+    # copy in host memory. This mirrors the 14B-safe lm-eval loading path.
+    with torch.device(device):
+        model = Zip2ZipLlama3Model(cfg)
     print(
         "[inference] decoder RoPE: "
         f"base_positions={cfg.base_token_positions} "
@@ -165,8 +175,14 @@ def load_model(
     )
     if not restore_encoder_residual(model, args):
         print("[inference] hyper-encoder residual: disabled from meta.pt")
-    model = model.to(device)
+    model = model.to(device=device)
+    if dtype is not None and dtype != torch.float32:
+        # Preserve complex RoPE buffers while casting ordinary floating tensors.
+        model._apply(
+            lambda value: value.to(dtype) if value.is_floating_point() else value
+        )
     model.load_state_dict(sd, strict=True)
+    del sd
     model.eval()
     return model, args
 
@@ -499,15 +515,8 @@ def main():
         device,
         max_merge_size=cli.max_merge_size,
         rope_mode=cli.rope_mode,
+        dtype=torch.bfloat16 if device == "cuda" else None,
     )
-    # Cast to bf16 for faster inference, but parameters and REAL buffers only.
-    # A blanket .half()/.to(dtype) also converts the complex64 RoPE cache
-    # (freqs_cis) to a real dtype, silently discarding the imaginary part and
-    # destroying position encoding. Mirrors the eval adapter's cast.
-    if device == "cuda":
-        model._apply(
-            lambda t: t.to(torch.bfloat16) if t.is_floating_point() else t
-        )
     cfg = model.zip2zip_config
     print(f"  max_subtokens={cfg.max_subtokens}  max_codebook_size={cfg.max_codebook_size}")
 

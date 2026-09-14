@@ -161,11 +161,11 @@ def load_core_runtime(
     tokenizer_override: str | None,
 ) -> CoreRuntime:
     print(f"[load] checkpoint={ckpt_dir} device={device}")
-    model, train_args = load_model(str(ckpt_dir), device)
-
-    # Preserve the complex RoPE cache while casting ordinary floating tensors.
-    if device.startswith("cuda"):
-        model._apply(lambda value: value.to(torch.bfloat16) if value.is_floating_point() else value)
+    model, train_args = load_model(
+        str(ckpt_dir),
+        device,
+        dtype=torch.bfloat16 if device.startswith("cuda") else None,
+    )
 
     cfg = model.zip2zip_config
     tokenizer_name = tokenizer_override or train_args.get("tokenizer") or DEFAULT_TOKENIZER
