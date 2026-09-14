@@ -28,6 +28,7 @@ from torchtitan.models.common.rope import (
     apply_rotary_emb_cos_sin,
 )
 from torchtitan.models.common.utils import trunc_normal_
+from zip2zip_core.kv_cache import KVCache, RopeRegimeChanged
 from torchtitan.models.utils import get_dense_model_nparams_and_flops
 from torchtitan.tools.logging import logger
 
@@ -45,12 +46,18 @@ def build_two_axis_rope_inputs(
     *,
     batch_size: int,
     seq_len: int,
+    compressed_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build an interleaved two-axis complex RoPE cache.
 
     Even complex pairs use base-stream positions; odd pairs use compressed-token
     positions. Flattening the per-sample cache and returning synthetic lookup
     positions lets the unchanged Torchtitan attention consume the mixed cache.
+
+    ``compressed_offset`` is how many compressed tokens precede this call. It is
+    0 for a whole-sequence forward and equals the KV cache length during cached
+    generation, where the odd (compressed-index) axis must keep counting from
+    the cached prefix instead of restarting at 0.
     """
     if not torch.is_complex(freqs_cis) or freqs_cis.ndim != 2:
         raise ValueError("two_axis_rope requires a 2D complex RoPE cache")
@@ -60,10 +67,10 @@ def build_two_axis_rope_inputs(
             "two_axis_rope requires an even number of complex RoPE pairs "
             "(attention head_dim must be divisible by 4)"
         )
-    if freqs_cis.shape[0] < seq_len:
+    if freqs_cis.shape[0] < compressed_offset + seq_len:
         raise ValueError(
-            f"two_axis_rope needs at least {seq_len} compressed-position cache "
-            f"rows, got {freqs_cis.shape[0]}"
+            f"two_axis_rope needs at least {compressed_offset + seq_len} "
+            f"compressed-position cache rows, got {freqs_cis.shape[0]}"
         )
     if base_positions.shape == (1, seq_len):
         base_positions = base_positions.expand(batch_size, -1)
@@ -74,7 +81,11 @@ def build_two_axis_rope_inputs(
         )
 
     base_freqs = freqs_cis[base_positions]
-    compressed_freqs = freqs_cis[:seq_len].unsqueeze(0).expand(batch_size, -1, -1)
+    compressed_freqs = (
+        freqs_cis[compressed_offset : compressed_offset + seq_len]
+        .unsqueeze(0)
+        .expand(batch_size, -1, -1)
+    )
     use_base_axis = (
         torch.arange(n_complex_pairs, device=freqs_cis.device) % 2 == 0
     ).view(1, 1, n_complex_pairs)
@@ -96,6 +107,7 @@ def build_gated_rope_inputs(
     start_pair: int,
     batch_size: int,
     seq_len: int,
+    compressed_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build one layer's gated base/compressed RoPE cache.
 
@@ -108,13 +120,18 @@ def build_gated_rope_inputs(
     copied from the base-position cache unchanged. The inverse frequencies are
     recovered from cache row 1, whose phases are all in ``[0, 1]`` radians for
     the supported RoPE configurations, so no phase unwrapping is needed.
+
+    ``compressed_offset`` shifts the compressed-index axis by the number of
+    tokens already in the KV cache, so a cached decode step keeps the same
+    base/compressed delta it would have had in a whole-sequence forward.
     """
     if not torch.is_complex(freqs_cis) or freqs_cis.ndim != 2:
         raise ValueError("gated_compressed_rope requires a 2D complex RoPE cache")
-    if freqs_cis.shape[0] < max(2, seq_len):
+    if freqs_cis.shape[0] < max(2, compressed_offset + seq_len):
         raise ValueError(
             "gated_compressed_rope needs at least "
-            f"{max(2, seq_len)} RoPE cache rows, got {freqs_cis.shape[0]}"
+            f"{max(2, compressed_offset + seq_len)} RoPE cache rows, got "
+            f"{freqs_cis.shape[0]}"
         )
 
     n_complex_pairs = freqs_cis.shape[-1]
@@ -140,7 +157,10 @@ def build_gated_rope_inputs(
 
     base_freqs = freqs_cis[base_positions]
     compressed_positions = torch.arange(
-        seq_len, device=base_positions.device, dtype=base_positions.dtype
+        compressed_offset,
+        compressed_offset + seq_len,
+        device=base_positions.device,
+        dtype=base_positions.dtype,
     ).view(1, seq_len)
     delta_positions = compressed_positions - base_positions
 
@@ -634,6 +654,10 @@ class Zip2ZipTransformerBlock(TransformerBlock):
 
     def __init__(self, config: Config, *, layer_id: int, dim: int, n_layers: int):
         super().__init__()
+        # Kept under a namespaced attribute so the cached-attention path can
+        # address its own KVCache slot without colliding with anything
+        # TorchTitan may add to TransformerBlock later.
+        self.zip2zip_layer_id = layer_id
         self.attention = config.attention.build(dim=dim)
         assert config.feed_forward is not None
         self.feed_forward = config.feed_forward.build(dim=dim)
@@ -651,9 +675,20 @@ class Zip2ZipTransformerBlock(TransformerBlock):
         freqs_cis: torch.Tensor,
         attention_masks: AttentionMasksType | torch.Tensor | None,
         positions: torch.Tensor | None = None,
+        kv_cache=None,
     ):
         normed = self.attention_norm(x)
-        if isinstance(attention_masks, torch.Tensor):
+        if kv_cache is not None:
+            if isinstance(attention_masks, torch.Tensor):
+                raise ValueError(
+                    "dense tree attention and the KV cache are mutually "
+                    "exclusive: tree evaluation scores a whole packed forest in "
+                    "one forward and has no incremental prefix to cache"
+                )
+            attn_out = self._forward_cached_sdpa(
+                normed, freqs_cis, positions, kv_cache
+            )
+        elif isinstance(attention_masks, torch.Tensor):
             attn_out = self._forward_masked_sdpa(
                 normed, freqs_cis, attention_masks, positions
             )
@@ -664,6 +699,94 @@ class Zip2ZipTransformerBlock(TransformerBlock):
         h = x + attn_out
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
+
+    def _forward_cached_sdpa(
+        self,
+        x: torch.Tensor,
+        rope_cache: torch.Tensor,
+        positions: torch.Tensor | None,
+        kv_cache,
+    ) -> torch.Tensor:
+        """Run this block's GQA against a growing key/value cache.
+
+        Projections, QK norm and RoPE are applied to the NEW tokens only; the
+        rotated keys and values are appended to the cache and attention runs
+        against the whole history. Everything before the cache write is
+        identical to ``GQAttention.forward`` — the cache changes which keys are
+        recomputed, never how any one of them is built.
+
+        The attention call is split three ways because ``is_causal=True`` means
+        top-left alignment in SDPA, which is only the intended mask when the
+        query and key lengths match:
+
+        * empty cache (prefill): q_len == k_len, ``is_causal=True`` — bit-identical
+          to the uncached path, same kernel, same flags.
+        * one new token: q_len == 1 and the query is the newest position, so it
+          legitimately attends to every cached key. ``is_causal=True`` here would
+          instead expose only key 0, which is the classic silent-corruption bug
+          in hand-rolled decode loops.
+        * several new tokens onto a populated cache (chunked prefill): needs an
+          explicit bottom-right-aligned causal mask.
+        """
+        attention = self.attention
+        if attention.attn_backend != "sdpa":
+            raise ValueError(
+                "cached generation requires the SDPA backend, got "
+                f"{attention.attn_backend!r}"
+            )
+
+        batch_size, seq_len, _ = x.shape
+        q = attention.wq(x).view(batch_size, seq_len, -1, attention.head_dim)
+        k = attention.wk(x).view(batch_size, seq_len, -1, attention.head_dim)
+        v = attention.wv(x).view(batch_size, seq_len, -1, attention.head_dim)
+        if attention.q_norm is not None:
+            q = attention.q_norm(q)
+        if attention.k_norm is not None:
+            k = attention.k_norm(k)
+        if attention.use_rope:
+            if attention.rope_backend == "cos_sin":
+                q, k = apply_rotary_emb_cos_sin(q, k, rope_cache, positions)
+            else:
+                q, k = apply_rotary_emb_complex(
+                    q, k, freqs_cis=rope_cache, positions=positions
+                )
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        past_len = kv_cache.seq_len
+        k, v = kv_cache.update(self.zip2zip_layer_id, k, v)
+
+        scale_kwargs = (
+            {"scale": attention.scaling} if attention.scaling is not None else {}
+        )
+        if past_len == 0 or seq_len == 1:
+            output = attention.inner_attention(
+                q,
+                k,
+                v,
+                is_causal=past_len == 0,
+                enable_gqa=attention.enable_gqa,
+                **scale_kwargs,
+            ).transpose(1, 2)
+        else:
+            total_len = k.shape[2]
+            query_idx = torch.arange(
+                past_len, past_len + seq_len, device=x.device
+            ).unsqueeze(1)
+            key_idx = torch.arange(total_len, device=x.device).unsqueeze(0)
+            output = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=key_idx <= query_idx,
+                is_causal=False,
+                scale=attention.scaling,
+                enable_gqa=attention.enable_gqa,
+            ).transpose(1, 2)
+
+        output = output.contiguous().view(batch_size, seq_len, -1)
+        return attention.wo(output)
 
     def _forward_masked_sdpa(
         self,
@@ -880,6 +1003,12 @@ class Zip2ZipLlama3Model(Decoder):
                 )
         super().__init__(config)
         self.zip2zip_config = config
+        self.register_buffer(
+            "longrope_long_freqs_cis",
+            getattr(self.rope, "longrope_long_cache", None),
+            persistent=False,
+        )
+        self._longrope_regime: str | None = None
         head_dim = (
             getattr(config.layer.attention, "head_dim", None)
             or config.dim // config.layer.attention.n_heads
@@ -965,6 +1094,12 @@ class Zip2ZipLlama3Model(Decoder):
 
     def init_weights(self, **kwargs):
         super().init_weights(**kwargs)
+        long_cache = getattr(self.rope, "longrope_long_cache", None)
+        self.longrope_long_freqs_cis = (
+            long_cache.to(device=self.freqs_cis.device)
+            if long_cache is not None
+            else None
+        )
         if self.compressed_rope_gate is not None:
             nn.init.zeros_(self.compressed_rope_gate)
 
@@ -1041,8 +1176,63 @@ class Zip2ZipLlama3Model(Decoder):
         self._hyper_out_embeds_buf = None
         self._hyper_span_buf = None
 
+    def _select_rope_cache(
+        self,
+        tokens: torch.Tensor,
+        positions: torch.Tensor | None,
+        kv_cache: KVCache | None = None,
+    ) -> torch.Tensor:
+        """Select Phi-3 LongRoPE factors from the maximum semantic position.
+
+        With a KV cache the current forward only carries the new tokens, so the
+        implicit-position fallback has to count the cached prefix too, and the
+        chosen regime is pinned to the cache: the uncached path re-rotates every
+        key on every step, so a short->long switch there applies retroactively to
+        the whole prefix. Cached keys cannot follow, so a switch raises
+        RopeRegimeChanged instead of quietly mixing two factor sets.
+        """
+        rope_cfg = self.zip2zip_config.rope
+        if rope_cfg.scaling != "longrope":
+            return self.freqs_cis
+        if self.longrope_long_freqs_cis is None:
+            raise RuntimeError("LongRoPE mode is missing its long-factor cache")
+
+        if positions is not None:
+            max_position = int(positions.max().item())
+        elif kv_cache is not None:
+            max_position = kv_cache.seq_len + tokens.shape[1] - 1
+        else:
+            max_position = tokens.shape[1] - 1
+        use_long = (
+            max_position + 1 > rope_cfg.original_max_position_embeddings
+        )
+        regime = "long" if use_long else "short"
+        if kv_cache is not None:
+            if kv_cache.rope_regime is None:
+                kv_cache.rope_regime = regime
+            elif kv_cache.rope_regime != regime:
+                raise RopeRegimeChanged(
+                    "LongRoPE factor regime changed from "
+                    f"{kv_cache.rope_regime!r} to {regime!r} at base position "
+                    f"{max_position}: the cached keys were rotated with the "
+                    f"{kv_cache.rope_regime!r} factors. Drop the cache and "
+                    "re-prefill so every key uses the new regime."
+                )
+        if regime != self._longrope_regime:
+            print(
+                "[longrope] factor regime: "
+                f"{regime} (max_semantic_position={max_position}, "
+                "switch_after="
+                f"{rope_cfg.original_max_position_embeddings - 1})"
+            )
+            self._longrope_regime = regime
+        return self.longrope_long_freqs_cis if use_long else self.freqs_cis
+
     def _base_token_positions(
-        self, tokens: torch.Tensor, codebook: torch.Tensor | None = None
+        self,
+        tokens: torch.Tensor,
+        codebook: torch.Tensor | None = None,
+        offset: torch.Tensor | int | None = None,
     ) -> torch.Tensor:
         """Base-space (uncompressed-stream) RoPE positions for compressed tokens.
 
@@ -1051,6 +1241,11 @@ class Zip2ZipLlama3Model(Decoder):
         index of its LAST constituent: cumsum(spans) - 1. All-base rows reduce
         exactly to arange(T). Span source: the full codebook (training) or the
         persistent _hyper_span_buf (incremental inference).
+
+        ``offset`` continues the cumsum across a cached forward: a (B, 1) tensor
+        (or int) holding the next free base-space index, i.e. one past the last
+        position of the cached prefix. Without it a cached decode step would
+        restart at 0 and every generated token would land on top of the prompt.
         """
         vocab_size = self.zip2zip_config.vocab_size
         is_hyper = tokens >= vocab_size
@@ -1068,6 +1263,8 @@ class Zip2ZipLlama3Model(Decoder):
                 is_hyper, entry_spans.gather(1, entry_ids).clamp(min=1), spans
             )
         pos = spans.cumsum(dim=-1) - 1
+        if offset is not None:
+            pos = pos + offset
         cache_rows = self.freqs_cis.shape[0]
         if int(pos.max()) >= cache_rows:
             # Fail actionably instead of a CUDA device-side assert in the
@@ -1281,6 +1478,7 @@ class Zip2ZipLlama3Model(Decoder):
         hyper_causal_mask: bool = False,
         codebook_counts: torch.Tensor | None = None,
         logit_positions: torch.Tensor | None = None,
+        kv_cache: KVCache | None = None,
     ):
         """Forward pass with zip2zip compressed tokens.
 
@@ -1307,8 +1505,27 @@ class Zip2ZipLlama3Model(Decoder):
                 still computed for the full sequence; selection happens before
                 the vocabulary projections. Used by packed tree-attention
                 evaluation, where only branch-node distributions are consumed.
+            kv_cache: optional KVCache. When given, ``tokens`` holds only the
+                NEW tokens and attention runs against the cached prefix, so a
+                decode step costs one token instead of a full re-prefill. The
+                cache carries the base-space position offset and pins the
+                LongRoPE regime; see zip2zip_core.kv_cache.
         """
         positions_were_provided = positions is not None
+
+        if kv_cache is not None:
+            if codebook is not None:
+                raise ValueError(
+                    "kv_cache is an inference path: pass codebook_updates / "
+                    "codebook_updates_indices, not a full training codebook"
+                )
+            if self.training:
+                raise ValueError("kv_cache is inference-only; call model.eval()")
+            if attention_masks is not None:
+                raise ValueError(
+                    "kv_cache does not support explicit attention masks; "
+                    "causality comes from the cache order"
+                )
 
         if codebook_counts is not None:
             if codebook is None:
@@ -1330,7 +1547,11 @@ class Zip2ZipLlama3Model(Decoder):
                     tokens, codebook_updates, codebook_updates_indices
                 )
                 if self.zip2zip_config.base_token_positions and positions is None:
-                    positions = self._base_token_positions(tokens, codebook=None)
+                    positions = self._base_token_positions(
+                        tokens,
+                        codebook=None,
+                        offset=None if kv_cache is None else kv_cache.base_offset,
+                    )
             else:
                 # Plain/base-mode path: tokens ARE the uncompressed stream, so
                 # base-space positions == arange — the default (positions=None)
@@ -1340,29 +1561,57 @@ class Zip2ZipLlama3Model(Decoder):
                 hyper_out_embeds = None
 
         # === Transformer layers ===
-        layer_freqs_cis = self.freqs_cis
+        active_rope_cache = self._select_rope_cache(tokens, positions, kv_cache)
+        layer_freqs_cis = active_rope_cache
         layer_positions = positions
+        compressed_offset = 0 if kv_cache is None else kv_cache.seq_len
+        if kv_cache is not None and layer_positions is None:
+            # The historical paths that leave positions=None rely on the
+            # implicit arange inside the RoPE gather, which restarts at 0 for
+            # every forward. Under a cache the new tokens sit after the cached
+            # prefix, so their compressed-axis positions have to be spelled out.
+            # This deliberately does NOT write back into `positions`: the
+            # two-axis and gated-RoPE gates below key off whether the caller
+            # supplied semantic positions, and must keep their uncached answer.
+            layer_positions = torch.arange(
+                compressed_offset,
+                compressed_offset + tokens.shape[1],
+                device=tokens.device,
+                dtype=torch.long,
+            ).unsqueeze(0)
         # With implicit positions and no hypertokens the two coordinates are
         # identical. Keep that exact historical path (including positions=None
         # in plain/base mode) so the experiment is bit-identical on ordinary
         # uncompressed input. Explicit positions define the base axis and still
         # need mixing against compressed arange positions.
-        if (
-            self.zip2zip_config.two_axis_rope
-            and (
-                positions_were_provided
-                or bool((tokens >= self.zip2zip_config.vocab_size).any())
-            )
-        ):
+        two_axis_mixing = positions_were_provided or bool(
+            (tokens >= self.zip2zip_config.vocab_size).any()
+        )
+        if kv_cache is not None and self.zip2zip_config.two_axis_rope:
+            # The uncached forward evaluates this over the whole prefix, so the
+            # first hypertoken switches every earlier key onto the mixed cache
+            # retroactively. Cached keys are rotated once, so latch the prefill
+            # answer and refuse a False->True flip rather than mixing axes.
+            if kv_cache.two_axis_mixing is None:
+                kv_cache.two_axis_mixing = two_axis_mixing
+            elif two_axis_mixing and not kv_cache.two_axis_mixing:
+                raise RopeRegimeChanged(
+                    "the first hypertoken appeared after prefill, so two-axis "
+                    "RoPE turns on mid-stream while the cached keys were "
+                    "rotated on the single axis. Drop the cache and re-prefill."
+                )
+            two_axis_mixing = kv_cache.two_axis_mixing
+        if self.zip2zip_config.two_axis_rope and two_axis_mixing:
             if positions is None:
                 raise RuntimeError(
                     "two_axis_rope requires base-space positions for compressed input"
                 )
             layer_freqs_cis, layer_positions = build_two_axis_rope_inputs(
-                self.freqs_cis,
+                active_rope_cache,
                 positions,
                 batch_size=tokens.shape[0],
                 seq_len=tokens.shape[1],
+                compressed_offset=compressed_offset,
             )
             self.two_axis_forwards += 1
             if self.two_axis_forwards == 1:
@@ -1392,7 +1641,7 @@ class Zip2ZipLlama3Model(Decoder):
                     f"layers={self.zip2zip_config.gated_rope_start_layer}-"
                     f"{self.zip2zip_config.n_layers - 1} "
                     f"pairs={self.zip2zip_config.gated_rope_start_pair}-"
-                    f"{self.freqs_cis.shape[-1] - 1} "
+                    f"{active_rope_cache.shape[-1] - 1} "
                     f"gate_shape={tuple(self.compressed_rope_gate.shape)}"
                 )
 
@@ -1411,12 +1660,13 @@ class Zip2ZipLlama3Model(Decoder):
                         ]
                         current_freqs_cis, current_positions = (
                             build_gated_rope_inputs(
-                                self.freqs_cis,
+                                active_rope_cache,
                                 positions,
                                 gate_row,
                                 start_pair=self.zip2zip_config.gated_rope_start_pair,
                                 batch_size=tokens.shape[0],
                                 seq_len=tokens.shape[1],
+                                compressed_offset=compressed_offset,
                             )
                         )
                     if use_ac:
@@ -1435,7 +1685,17 @@ class Zip2ZipLlama3Model(Decoder):
                             current_freqs_cis,
                             attention_masks,
                             current_positions,
+                            kv_cache=kv_cache,
                         )
+
+        if kv_cache is not None:
+            # One commit for the whole forward: every layer wrote at the same
+            # offset. Carrying positions[:, -1:] + 1 (not seq_len) is what makes
+            # the next step's cumsum land after a multi-base-token hypertoken.
+            kv_cache.advance(
+                tokens.shape[1],
+                None if positions is None else positions[:, -1:] + 1,
+            )
 
         h = self.norm(h) if self.norm is not None else h
 

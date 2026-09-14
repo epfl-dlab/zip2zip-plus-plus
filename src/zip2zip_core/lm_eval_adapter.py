@@ -27,7 +27,7 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 from zip2zip_compression import (
     CodebookManager as RustCodebookManager,
     CompressionConfig,
@@ -42,6 +42,7 @@ from zip2zip_core.checkpoint import (
 )
 from zip2zip_core.data import online_codebook_counts, online_unavailable_targets
 from zip2zip_core.disabled_ids import base_disabled_ids, digit_ids
+from zip2zip_core.kv_cache import KVCache, RopeRegimeChanged
 from zip2zip_core.model import Zip2ZipLlama3Model, restore_encoder_residual
 from zip2zip_core.multi_view import (
     MultiViewAccumulator,
@@ -51,6 +52,7 @@ from zip2zip_core.multi_view import (
     multi_view_segmentations,
     segmentation_proper_prefixes,
 )
+from zip2zip_core.rope_adaptation import phi3_longrope_config
 
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
@@ -110,6 +112,8 @@ def _load_zip2zip_checkpoint(
     device: torch.device,
     dtype: torch.dtype,
     eval_max_subtokens: int | None = None,
+    rope_mode: str = "checkpoint",
+    rope_source: str | None = None,
 ):
     """Load a checkpoint produced by zip2zip_core.train.
 
@@ -149,6 +153,26 @@ def _load_zip2zip_checkpoint(
     sd = _fold_lora_weights(sd, train_args)
 
     overrides: dict = {}
+    if rope_mode == "phi3-longrope":
+        source = rope_source or train_args.get('init_from_hf')
+        if not source:
+            raise ValueError(
+                "rope_mode=\"phi3-longrope\" requires rope_source or "
+                "init_from_hf in meta.pt"
+            )
+        print(
+            "[zip2zip-lm-eval] loading official Phi3-LongRoPE config "
+            f"from {source}"
+        )
+        if rope_source:
+            print(
+                "[zip2zip-lm-eval] inference-only RoPE override: checkpoint "
+                f"base={train_args.get('init_from_hf')!r}, rope_source={source!r}"
+            )
+        hf_config = AutoConfig.from_pretrained(source)
+        overrides["rope"] = phi3_longrope_config(cfg.rope, hf_config)
+    elif rope_mode != "checkpoint":
+        raise ValueError(f"unsupported eval RoPE mode: {rope_mode!r}")
     for key in (
         "max_subtokens",
         "max_codebook_size",
@@ -274,6 +298,10 @@ class Zip2ZipLM(LM):
         trim_stop_strings: bool = True,
         multi_view: bool = True,
         preserve_leading_space: bool = True,
+        rope_mode: str = "checkpoint",
+        rope_source: str | None = None,
+        fail_on_truncation: bool = False,
+        use_kv_cache: bool = True,
     ):
         super().__init__()
         if not torch.cuda.is_available() and device.startswith("cuda"):
@@ -292,7 +320,12 @@ class Zip2ZipLM(LM):
             raise ValueError(f"eval_mode must be 'compressed' or 'base', got {eval_mode!r}")
 
         self.model, self.cfg, self.train_args = _load_zip2zip_checkpoint(
-            pretrained, self._device, self._dtype, eval_max_subtokens=eval_max_subtokens
+            pretrained,
+            self._device,
+            self._dtype,
+            eval_max_subtokens=eval_max_subtokens,
+            rope_mode=rope_mode,
+            rope_source=rope_source,
         )
         self.checkpoint_max_subtokens = int(
             (self.train_args or {}).get("max_subtokens", self.cfg.max_subtokens)
@@ -381,6 +414,13 @@ class Zip2ZipLM(LM):
         print(f"[zip2zip-lm-eval] disabled_ids ({len(disabled_ids)}): {disabled_ids[:16]}"
               f"{'...' if len(disabled_ids) > 16 else ''}")
         self._max_length = int(max_length)
+        self.rope_mode = rope_mode
+        self.rope_source = (
+            rope_source or (self.train_args or {}).get("init_from_hf")
+            if rope_mode == "phi3-longrope"
+            else None
+        )
+        self.fail_on_truncation = bool(fail_on_truncation)
         self.eval_mode = eval_mode
         self._batch_size = int(batch_size)
         self.hyper_causal_mask = bool(hyper_causal_mask)
@@ -463,7 +503,14 @@ class Zip2ZipLM(LM):
         # (e.g. scripts/eval_harness.py) after simple_evaluate returns.
         # in_*: full (context + continuation) sequences fed for scoring.
         # gen_*: tokens emitted by generate_until.
-        self.compression_stats = {"in_comp": 0, "in_base": 0, "gen_comp": 0, "gen_base": 0}
+        self.compression_stats = {
+            "in_comp": 0,
+            "in_base": 0,
+            "gen_comp": 0,
+            "gen_base": 0,
+        }
+        if self.fail_on_truncation:
+            self.compression_stats["truncated_requests"] = 0
         # Multi-view (segmentation-marginalized) perplexity, accumulated per
         # rolling-perplexity task and read back via multi_view_summary(). Exact
         # complete-segmentation scoring is the primary metric; the historical
@@ -479,6 +526,20 @@ class Zip2ZipLM(LM):
                 online_replay_tokens=0,
                 online_replay_seconds=0.0,
             )
+
+        # Generation without a cache re-runs the whole prefix per sampled
+        # token, which is what made the long-context presets unusable: a 32K
+        # prompt with 128 generated tokens costs 128 prefills. Off is kept as
+        # the reference implementation for A/B checks.
+        self.use_kv_cache = bool(use_kv_cache)
+        if self.use_kv_cache:
+            # Non-zero means a RoPE decision flipped mid-generation and the
+            # prefix had to be re-rotated. Correct, but worth seeing.
+            self.compression_stats["kv_cache_reprefills"] = 0
+        print(
+            "[zip2zip-lm-eval] generation KV cache: "
+            + ("on" if self.use_kv_cache else "OFF — full re-prefill per token")
+        )
 
         self._compressor_kwargs = dict(
             initial_vocab_size=self.cfg.vocab_size,
@@ -516,6 +577,10 @@ class Zip2ZipLM(LM):
             kwargs["multi_view"] = kwargs["multi_view"].lower() in ("1", "true", "yes")
         if "preserve_leading_space" in kwargs:
             kwargs["preserve_leading_space"] = kwargs["preserve_leading_space"].lower() in ("1", "true", "yes")
+        if "fail_on_truncation" in kwargs:
+            kwargs["fail_on_truncation"] = kwargs["fail_on_truncation"].lower() in ("1", "true", "yes")
+        if "use_kv_cache" in kwargs:
+            kwargs["use_kv_cache"] = kwargs["use_kv_cache"].lower() in ("1", "true", "yes")
         if additional_config:
             for k in ("batch_size", "device"):
                 if k not in kwargs and additional_config.get(k) is not None:
@@ -1274,6 +1339,12 @@ class Zip2ZipLM(LM):
 
             # Left-truncate, never drop continuation tokens.
             if len(full_ids) > self._max_length:
+                if self.fail_on_truncation:
+                    self.compression_stats["truncated_requests"] += 1
+                    raise ValueError(
+                        "input would be left-truncated during long-context eval: "
+                        f"{len(full_ids)} tokens > max_length={self._max_length}"
+                    )
                 drop = len(full_ids) - self._max_length
                 drop = min(drop, max(0, len(ctx_ids) - 1))  # leave at least 1 ctx token
                 if drop > 0:
@@ -1444,6 +1515,71 @@ class Zip2ZipLM(LM):
             return full[len(head):]
         return self.tok_decode(gen_ids)
 
+    def _new_kv_cache(self, prompt_len: int, max_gen_toks: int):
+        """Cache sized for exactly this request, or None when disabled."""
+        if not self.use_kv_cache:
+            return None
+        return KVCache(len(self.model.layers), prompt_len + max_gen_toks + 1)
+
+    def _generation_forward(
+        self,
+        seq: List[int],
+        cache,
+        updates: torch.Tensor | None = None,
+        updates_indices: list[list[int]] | None = None,
+    ) -> torch.Tensor:
+        """Logits for `seq`, feeding only the tokens the cache does not hold.
+
+        Two savings, both invisible to the result: attention reuses the cached
+        prefix, and the vocabulary projection is restricted to the final
+        position. The latter matters on its own — projecting a 32K prefill over
+        a 32K-row vocabulary materializes a multi-gigabyte logits tensor that
+        generation never reads past `[0, -1]`.
+
+        RopeRegimeChanged means a RoPE decision that the uncached path re-makes
+        from the whole prefix on every step has just flipped (LongRoPE short ->
+        long, or the first hypertoken switching on two-axis RoPE), so the cached
+        keys carry the superseded rotation. Recovery is to drop the cache and
+        re-prefill — precisely what the uncached path does implicitly every
+        step. The replay passes no codebook updates because the model raises
+        after embedding and before the first layer: this step's entries are
+        already installed in the model's own inference buffers, which a KV cache
+        reset does not touch, and re-sending them would double-write.
+        """
+        compressed = updates is not None
+
+        def run(tokens: List[int], upd, upd_idx, cache_arg) -> torch.Tensor:
+            x = torch.tensor(
+                tokens, dtype=torch.long, device=self._device
+            ).unsqueeze(0)
+            kwargs: dict = {}
+            if compressed:
+                kwargs["codebook_updates"] = upd
+                kwargs["codebook_updates_indices"] = upd_idx
+            if cache_arg is not None:
+                kwargs["kv_cache"] = cache_arg
+                if x.shape[1] > 1:
+                    kwargs["logit_positions"] = torch.tensor(
+                        [x.shape[1] - 1], dtype=torch.long, device=self._device
+                    )
+            with torch.autocast(device_type=self._device.type, dtype=self._dtype):
+                out = self.model(x, **kwargs)
+            return out[0] if isinstance(out, tuple) else out
+
+        if cache is None:
+            return run(seq, updates, updates_indices, None)
+        try:
+            return run(seq[cache.seq_len :], updates, updates_indices, cache)
+        except RopeRegimeChanged:
+            cache.reset()
+            self.compression_stats["kv_cache_reprefills"] += 1
+            empty = torch.empty(
+                (1, 0, self.cfg.max_subtokens),
+                dtype=torch.long,
+                device=self._device,
+            )
+            return run(seq, empty, [[]], cache)
+
     @torch.no_grad()
     def _generate_base(
         self,
@@ -1458,15 +1594,24 @@ class Zip2ZipLM(LM):
         """Vanilla LM generation: feed base tokens, no codebook, base-vocab logits."""
         max_ctx = max(1, self._max_length - max_gen_toks)
         if len(ctx_ids) > max_ctx:
+            if self.fail_on_truncation:
+                self.compression_stats["truncated_requests"] += 1
+                raise ValueError(
+                    "base prompt would be left-truncated during long-context eval: "
+                    f"{len(ctx_ids)} tokens > available context={max_ctx} "
+                    f"(max_length={self._max_length}, max_gen_toks={max_gen_toks})"
+                )
             ctx_ids = ctx_ids[-max_ctx:]
 
         seq = list(ctx_ids)
         gen_ids: List[int] = []
-        for _ in range(max_gen_toks):
-            x = torch.tensor(seq, dtype=torch.long, device=self._device).unsqueeze(0)
-            with torch.autocast(device_type=self._device.type, dtype=self._dtype):
-                out = self.model(x)
-            logits = out[0] if isinstance(out, tuple) else out
+        # One prefill, then one token per step. The loop keeps the uncached
+        # shape — the forward that produces the logits for step i happens at the
+        # end of step i-1 — so both paths run the same number of forwards and
+        # break on the same token.
+        cache = self._new_kv_cache(len(seq), max_gen_toks)
+        logits = self._generation_forward(seq, cache)
+        for step in range(max_gen_toks):
             last = logits[0, -1, : self.cfg.vocab_size].float()
             tok = self._sample_next(last, do_sample, temperature, top_p, top_k)
             if tok in self._stop_token_ids:
@@ -1479,6 +1624,9 @@ class Zip2ZipLM(LM):
                     break
             if len(seq) >= self._max_length:
                 break
+            if step + 1 >= max_gen_toks:
+                break
+            logits = self._generation_forward(seq, cache)
         self.compression_stats["gen_comp"] += len(gen_ids)
         self.compression_stats["gen_base"] += len(gen_ids)
         return self._trim_stops(self._decode_generation(gen_ids), until)
@@ -1499,7 +1647,9 @@ class Zip2ZipLM(LM):
         For each step we expand the sampled compressed token into its base-token
         span, advance an LZW manager with those base tokens to get the new codebook
         entries the model needs, and append the (compressed) token to the model
-        input. No KV cache: the model is re-run on the full prefix each step.
+        input. With the KV cache on, only that one new compressed token is fed;
+        the codebook entries it creates still have to be installed before the
+        forward that consumes it, exactly as in the uncached loop.
         """
         cfg = self.cfg
         V = cfg.vocab_size
@@ -1510,10 +1660,39 @@ class Zip2ZipLM(LM):
             ctx_ids, padding="do_not_pad", truncation=False
         )
 
-        # If the compressed prompt is too long, drop base tokens from the left
-        # and recompress until we have room for max_gen_toks new tokens.
-        while len(compressed) > max_ctx and len(ctx_ids) > 1:
-            drop = max(1, len(ctx_ids) // 8)
+        # ``max_length`` is a model-position limit. Older checkpoints position
+        # compressed tokens by their compressed index, while base-position
+        # checkpoints position a hypertoken at the end of its expanded base
+        # span. At 128K those are materially different limits: checking only
+        # len(compressed) can let a base-space RoPE gather run past the official
+        # Phi-3.5 capacity even though the compressed stream is much shorter.
+        def prompt_position_length() -> int:
+            return len(ctx_ids) if cfg.base_token_positions else len(compressed)
+
+        if prompt_position_length() > max_ctx:
+            if self.fail_on_truncation:
+                self.compression_stats["truncated_requests"] += 1
+                position_space = (
+                    "base-space" if cfg.base_token_positions else "compressed-space"
+                )
+                raise ValueError(
+                    "compressed prompt would be left-truncated during long-context eval: "
+                    f"{prompt_position_length()} {position_space} tokens "
+                    f"from {len(ctx_ids)} base / {len(compressed)} compressed tokens "
+                    f"> available context={max_ctx} "
+                    f"(max_length={self._max_length}, max_gen_toks={max_gen_toks})"
+                )
+
+        # If the prompt is too long, drop base tokens from the left and
+        # recompress until its active position space leaves the requested
+        # generation reserve. In base-position mode the exact excess is known;
+        # in compressed-position mode recompression makes it data-dependent.
+        while prompt_position_length() > max_ctx and len(ctx_ids) > 1:
+            drop = (
+                prompt_position_length() - max_ctx
+                if cfg.base_token_positions
+                else max(1, len(ctx_ids) // 8)
+            )
             ctx_ids = ctx_ids[drop:]
             compressor = LZWCompressor(**self._compressor_kwargs)
             compressed, _, _ = compressor.encode(
@@ -1539,23 +1718,23 @@ class Zip2ZipLM(LM):
             entry = flat[0][row * S : (row + 1) * S]
             hyper_to_base[V + slot] = self._strip_pad(entry)
 
+        # Resets the hyper-embedding buffers only. Those live on the model and
+        # survive a KV cache reset, which is why a forced re-prefill can replay
+        # the prefix without re-installing any codebook entry.
         self.model.reset_inference_cache()
 
         updates_t = self._manager_updates_to_tensor(flat[0], seed_indices)
         updates_indices = [seed_indices]
 
-        x = torch.tensor(compressed, dtype=torch.long, device=self._device).unsqueeze(0)
-        with torch.autocast(device_type=self._device.type, dtype=self._dtype):
-            out = self.model(
-                x,
-                codebook_updates=updates_t,
-                codebook_updates_indices=updates_indices,
-            )
-        logits = out[0] if isinstance(out, tuple) else out
+        cache = self._new_kv_cache(len(compressed), max_gen_toks)
+        logits = self._generation_forward(
+            compressed, cache, updates_t, updates_indices
+        )
 
         gen_base_ids: List[int] = []
         n_gen_comp = 0  # sampled compressed tokens that emitted >= 1 base token
-        for _ in range(max_gen_toks):
+        position_length = prompt_position_length()
+        for step in range(max_gen_toks):
             last = logits[0, -1].float()  # (V + max_codebook_size,)
             next_tok = self._sample_next(last, do_sample, temperature, top_p, top_k)
 
@@ -1567,6 +1746,14 @@ class Zip2ZipLM(LM):
                     # Model produced an unused hyper slot; treat as stop.
                     break
 
+            # A predicted hypertoken occupies one compressed position but may
+            # span several base-space positions. Refuse the whole model token
+            # if it would cross the advertised context capacity; never return a
+            # partial hypertoken and never rely on a CUDA RoPE indexing error.
+            position_span = len(expansion) if cfg.base_token_positions else 1
+            if position_length + position_span > self._max_length:
+                break
+
             stop_at = [i for i, t in enumerate(expansion) if t in self._stop_token_ids]
             if stop_at:
                 cut = stop_at[0]
@@ -1577,13 +1764,18 @@ class Zip2ZipLM(LM):
 
             gen_base_ids.extend(expansion)
             n_gen_comp += 1
+            position_length += position_span
 
             if until:
                 text = self.tok_decode(gen_base_ids)
                 if any(s in text for s in until):
                     break
 
-            if len(compressed) + 1 > self._max_length:
+            # The just-predicted token is a valid final token at the capacity
+            # boundary, but feeding it back would ask for one more prediction.
+            if position_length >= self._max_length:
+                break
+            if step + 1 >= max_gen_toks:
                 break
 
             # Advance LZW state with the newly-emitted base tokens.
@@ -1597,16 +1789,9 @@ class Zip2ZipLM(LM):
             updates_indices = [new_idx_list]
 
             compressed.append(next_tok)
-            x = torch.tensor(
-                compressed, dtype=torch.long, device=self._device
-            ).unsqueeze(0)
-            with torch.autocast(device_type=self._device.type, dtype=self._dtype):
-                out = self.model(
-                    x,
-                    codebook_updates=updates_t,
-                    codebook_updates_indices=updates_indices,
-                )
-            logits = out[0] if isinstance(out, tuple) else out
+            logits = self._generation_forward(
+                compressed, cache, updates_t, updates_indices
+            )
 
         self.compression_stats["gen_comp"] += n_gen_comp
         self.compression_stats["gen_base"] += len(gen_base_ids)
