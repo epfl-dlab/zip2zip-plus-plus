@@ -8,6 +8,8 @@ Usage:
     python scripts/inference.py --prompt "1 + 1 =" --max-new-tokens 32 --ckpt-dir /path/to/ckpt
     python scripts/inference.py --prompt-file prompts.json --output-file generations.jsonl \
         --instruct --ckpt-dir /path/to/ckpt
+    python scripts/inference.py --prompt-file prompts.json --ckpt-dir /path/to/ckpt \
+        --rope-mode phi3-longrope
 """
 
 import argparse
@@ -20,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "ext", "torchtitan"))
 
 import torch
-from transformers import AutoTokenizer, GenerationConfig
+from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 from zip2zip_compression import LZWCompressor
 
 from zip2zip_core.checkpoint import (
@@ -31,6 +33,7 @@ from zip2zip_core.codebook import CodebookManager
 from zip2zip_core.configs import zip2zip_llama_configs
 from zip2zip_core.disabled_ids import compute_disabled_ids
 from zip2zip_core.model import Zip2ZipLlama3Model, restore_encoder_residual
+from zip2zip_core.rope_adaptation import phi3_longrope_config
 from zip2zip_core.viz import colorize_by_ngram, render_colored_tokens
 
 
@@ -57,14 +60,33 @@ class GenerationTrace:
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+def _phi3_longrope_rope_config(rope_cfg, hf_config):
+    """Backward-compatible wrapper around the shared adaptation helper."""
+    return phi3_longrope_config(rope_cfg, hf_config)
+
+
 def load_model(
     ckpt_dir: str,
     device: str,
     max_merge_size: int | None = None,
+    *,
+    rope_mode: str = "checkpoint",
 ) -> tuple[Zip2ZipLlama3Model, dict]:
     meta = torch.load(f"{ckpt_dir}/meta.pt", map_location="cpu", weights_only=False)
     args = meta["args"]
     cfg = zip2zip_llama_configs[args["model_config"]]
+    rope_cfg = None
+    if rope_mode == "phi3-longrope":
+        source = args.get("init_from_hf")
+        if not source:
+            raise ValueError(
+                "--rope-mode phi3-longrope requires init_from_hf in meta.pt"
+            )
+        print(f"[inference] loading Phi3-LongRoPE config from {source}")
+        hf_config = AutoConfig.from_pretrained(source)
+        rope_cfg = _phi3_longrope_rope_config(cfg.rope, hf_config)
+    elif rope_mode != "checkpoint":
+        raise ValueError(f"unsupported inference RoPE mode: {rope_mode!r}")
     sd = torch.load(
         f"{ckpt_dir}/model.pt", map_location=device, weights_only=True
     )
@@ -117,6 +139,8 @@ def load_model(
         token_type_loss_weight=float(args.get("token_type_loss_weight") or 0.0),
         **enc_overrides,
     )
+    if rope_cfg is not None:
+        overrides["rope"] = rope_cfg
     cfg = dataclasses.replace(cfg, **overrides)
     checkpoint_max_subtokens = int(cfg.max_subtokens)
     if max_merge_size is not None and max_merge_size != checkpoint_max_subtokens:
@@ -444,6 +468,16 @@ def main():
         default=0.0,
         help="0 = greedy; positive values enable categorical sampling.",
     )
+    parser.add_argument(
+        "--rope-mode",
+        choices=("checkpoint", "phi3-longrope"),
+        default="checkpoint",
+        help=(
+            "RoPE geometry used for inference. 'checkpoint' preserves the "
+            "model config; 'phi3-longrope' restores the official factors "
+            "from init_from_hf."
+        ),
+    )
     cli = parser.parse_args()
     if cli.temperature < 0:
         parser.error("--temperature must be non-negative")
@@ -461,7 +495,10 @@ def main():
 
     print("Loading model...")
     model, train_args = load_model(
-        cli.ckpt_dir, device, max_merge_size=cli.max_merge_size
+        cli.ckpt_dir,
+        device,
+        max_merge_size=cli.max_merge_size,
+        rope_mode=cli.rope_mode,
     )
     # Cast to bf16 for faster inference, but parameters and REAL buffers only.
     # A blanket .half()/.to(dtype) also converts the complex64 RoPE cache

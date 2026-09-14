@@ -105,6 +105,25 @@ presets:
     apply_chat_template: true
     fewshot_as_multiturn: true
 
+  # RULER is materialized for every requested length through TaskManager metadata.
+  # 131072 is the official model capacity. RULER constructs every prompt with
+  # the task's output-token reserve already included in the requested length.
+  longcontext_ruler:
+    description: "RULER full 13-task suite at 4K/8K/16K/32K/64K/128K, Phi-3 official LongRoPE, greedy, no truncation"
+    tasks: [ruler]
+    num_fewshot: 0
+    ruler_lengths: "4096,8192,16384,32768,65536,131072"
+    max_length: 131072
+    eval_mode: compressed
+    rope_mode: phi3-longrope
+    fail_on_truncation: true
+    force_greedy: true
+    batch_size: 1
+    dtype: bfloat16
+    seed: 1234
+    apply_chat_template: true
+    fewshot_as_multiturn: false
+
   default_base:
     description: "2-shot MC benchmarks for from-scratch (non-instruct) models — no chat template"
     tasks: [arc_challenge, arc_easy, hellaswag, openbookqa, piqa, winogrande, gsm8k, triviaqa]

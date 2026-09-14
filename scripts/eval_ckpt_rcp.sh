@@ -114,6 +114,15 @@ TOKENIZER=${TOKENIZER:-meta-llama/Meta-Llama-3-8B}
 PRESET=${PRESET:-default_base}
 LIMIT=${LIMIT:-}
 TASKS=${TASKS:-}
+RULER_LENGTHS=${RULER_LENGTHS:-}
+ROPE_SOURCE=${ROPE_SOURCE:-}
+
+# RULER downloads NLTK punkt data on first use; keep that cache under .cache
+# instead of creating $Z2Z_SCRATCH/nltk_data.
+if [ "$PRESET" = "longcontext_ruler" ] || [[ ",${TASKS}," == *,ruler,* ]]; then
+    export NLTK_DATA=${NLTK_DATA:-$Z2Z_SCRATCH/.cache/nltk}
+    mkdir -p "$NLTK_DATA"
+fi
 # The postsft tasks (math500, humaneval_instruct, ifeval) need extra packages
 # that go into their own --target directory prepended to PYTHONPATH (see the venv block below); any preset/task list
 # naming them selects it.
@@ -298,6 +307,15 @@ LIMIT_ARG=""
 if [ -n "$LIMIT" ]; then
     LIMIT_ARG="--limit $LIMIT"
 fi
+RULER_LENGTHS_ARG=""
+if [ -n "$RULER_LENGTHS" ]; then
+    RULER_LENGTHS_ARG="--ruler_lengths $RULER_LENGTHS"
+fi
+ROPE_SOURCE_ARG=""
+if [ -n "$ROPE_SOURCE" ]; then
+    ROPE_SOURCE_ARG="--rope_source $ROPE_SOURCE"
+fi
+
 TASKS_ARG=""
 if [ -n "$TASKS" ]; then
     TASKS_ARG="--tasks $TASKS"
@@ -325,6 +343,8 @@ echo "  TOKENIZER:   $TOKENIZER"
 echo "  PRESET:      $PRESET"
 echo "  TASKS:       ${TASKS:-<preset default>}"
 echo "  LIMIT:       ${LIMIT:-<full>}"
+echo "  RULER_LEN:   ${RULER_LENGTHS:-<preset default>}"
+echo "  ROPE_SOURCE: ${ROPE_SOURCE:-<checkpoint base>}"
 echo "  VARIANT:     $VARIANT_TAG"
 echo "  EVAL_MS:     ${EVAL_MAX_SUBTOKENS:-<checkpoint>}"
 echo "  WANDB:       $WANDB${WANDB_NAME:+ (name: eval-$WANDB_NAME)}${WANDB_PROJECT:+ (project: $WANDB_PROJECT)}"
@@ -349,6 +369,8 @@ if [ -n "$CKPT_DIR" ]; then
         ${LEGACY_STRIPPED_GENERATION:+--legacy_stripped_generation} \
         $WANDB_ARGS \
         $LIMIT_ARG \
+        $RULER_LENGTHS_ARG \
+        $ROPE_SOURCE_ARG \
         $TASKS_ARG
 else
     python scripts/eval_harness.py \
@@ -366,6 +388,8 @@ else
         ${LEGACY_STRIPPED_GENERATION:+--legacy_stripped_generation} \
         $WANDB_ARGS \
         $LIMIT_ARG \
+        $RULER_LENGTHS_ARG \
+        $ROPE_SOURCE_ARG \
         $TASKS_ARG
 fi
 

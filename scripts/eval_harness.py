@@ -55,6 +55,72 @@ DEFAULT_PPL_TASKS_BUILTIN = ["wikitext"]
 DEFAULT_PPL_TASKS_CUSTOM = ["zip2zip_pile", "zip2zip_mc4", "zip2zip_dc4"]
 DEFAULT_TASKS = DEFAULT_MC_TASKS #+ DEFAULT_PPL_TASKS_BUILTIN + DEFAULT_PPL_TASKS_CUSTOM
 
+_RULER_HOTPOT_MIRROR = (
+    "https://huggingface.co/datasets/namlh2004/hotpotqa/resolve/"
+    "7e54db4656209750ff487f6fdf8e39a66dba136b/"
+    "hotpot_dev_distractor_v1.json"
+)
+
+
+def _use_ruler_hotpot_mirror() -> None:
+    """Backport the pinned lm-eval 0.4.13 mirror to the 0.4.9 task."""
+    from functools import cache
+    from pathlib import Path
+
+    from lm_eval import utils as lm_eval_utils
+    from lm_eval.tasks.ruler import qa_utils
+
+    def pin_callback(callback):
+        namespace = callback.__globals__
+        current = namespace["read_hotpotqa"]
+        if getattr(current, "_z2z_hf_mirror", False):
+            return
+        original = getattr(current, "__wrapped__", current)
+
+        @cache
+        def read_hotpotqa():
+            return original(_RULER_HOTPOT_MIRROR)
+
+        setattr(read_hotpotqa, "_z2z_hf_mirror", _RULER_HOTPOT_MIRROR)
+        namespace["read_hotpotqa"] = read_hotpotqa
+
+    # Keep direct package imports correct as well.
+    pin_callback(qa_utils.get_hotpotqa)
+
+    # lm-eval 0.4.9 does not reuse that imported module when resolving a
+    # YAML !function. It executes qa_utils.py into a fresh module namespace,
+    # so patch each freshly loaded Hotpot callback at the loader boundary.
+    current_import = lm_eval_utils.import_function
+    if not getattr(current_import, "_z2z_ruler_hotpot_hook", False):
+        original_import = current_import
+
+        def import_function(loader, node, yaml_path):
+            callback = original_import(loader, node, yaml_path)
+            if (
+                Path(yaml_path).name == "qa_hotpot.yaml"
+                and callback.__name__ == "get_hotpotqa"
+            ):
+                pin_callback(callback)
+            return callback
+
+        setattr(import_function, "_z2z_ruler_hotpot_hook", True)
+        lm_eval_utils.import_function = import_function
+    print(f"[eval_harness] RULER HotpotQA source: {_RULER_HOTPOT_MIRROR}")
+
+
+def _parse_ruler_lengths(value: str | None) -> list[int]:
+    if not value:
+        return []
+    lengths = [int(item.strip()) for item in value.split(",") if item.strip()]
+    if not lengths or any(length <= 0 for length in lengths):
+        raise ValueError(f"invalid RULER lengths: {value!r}")
+    if lengths != sorted(set(lengths)):
+        raise ValueError(
+            "RULER lengths must be unique and strictly increasing, got "
+            f"{lengths}"
+        )
+    return lengths
+
 
 def _resolve_ckpt_dir(args: argparse.Namespace) -> str:
     if args.hf_repo:
@@ -111,6 +177,28 @@ def main():
     p.add_argument("--eval_mode", default="compressed", choices=["compressed", "base"],
                    help="'compressed': LZW-compress text, score compressed positions "
                         "(matches training distribution). 'base': vanilla LM scoring.")
+    p.add_argument("--rope_mode", default="checkpoint",
+                   choices=["checkpoint", "phi3-longrope"],
+                   help="Inference-only RoPE adaptation. phi3-longrope loads the "
+                        "official factors from the checkpoint meta.pt init_from_hf model.")
+    p.add_argument("--rope_source", default=None,
+                   help="Optional HF config used only as the source of LongRoPE "
+                        "factors. Model weights and tokenizer still come from the "
+                        "checkpoint. Intended for explicit inference-only "
+                        "extrapolation, e.g. Phi-3-medium-128k factors on a "
+                        "Phi-3-medium-4k checkpoint.")
+    p.add_argument("--fail_on_truncation", action="store_true",
+                   help="Abort instead of silently left-truncating an overlength request.")
+    p.add_argument("--no_kv_cache", action="store_true",
+                   help="Generate by re-running the full prefix for every sampled "
+                        "token instead of caching keys and values. The pre-2026-09 "
+                        "behaviour; keep it only for A/B checks, it costs one "
+                        "prefill per generated token.")
+    p.add_argument("--ruler_lengths", default=None,
+                   help="Comma-separated RULER lengths, e.g. "
+                        "4096,8192,16384,32768,65536,131072.")
+    p.add_argument("--force_greedy", action="store_true",
+                   help="Override task sampling settings with deterministic greedy decoding.")
     p.add_argument("--eval_max_subtokens", type=int, default=None,
                    help="Eval-only override for LZW max_subtokens. Unset follows "
                         "the checkpoint meta.pt; changing it is supported for "
@@ -202,6 +290,10 @@ def main():
         trim_stop_strings=not args.legacy_untrimmed_stops,
         multi_view=not args.no_multi_view,
         preserve_leading_space=not args.legacy_stripped_generation,
+        rope_mode=args.rope_mode,
+        rope_source=args.rope_source,
+        fail_on_truncation=args.fail_on_truncation,
+        use_kv_cache=not args.no_kv_cache,
     )
     # The adapter auto-enables digit protection for checkpoints trained with it
     # and auto-switches control checkpoints (max_codebook_size=0) to base mode —
@@ -227,6 +319,10 @@ def main():
     args.trim_stop_strings = lm.trim_stop_strings
     args.preserve_leading_space = lm.preserve_leading_space
     args.multi_view = lm.multi_view
+    args.rope_mode = lm.rope_mode
+    args.rope_source = lm.rope_source
+    args.fail_on_truncation = lm.fail_on_truncation
+    args.use_kv_cache = lm.use_kv_cache
     # Distinguishes "inactive because base mode" from "inactive because this eval
     # deliberately asked for the legacy mask" — otherwise a results JSON cannot
     # be audited for which regime produced its numbers.
@@ -237,6 +333,10 @@ def main():
     print(f"[eval_harness] checkpoint:   {ckpt_dir}")
     print(f"[eval_harness] tasks:        {tasks}")
     print(f"[eval_harness] eval_mode:    {args.eval_mode}")
+    print(f"[eval_harness] rope_mode:    {args.rope_mode}")
+    print(f"[eval_harness] rope_source:  {args.rope_source or '<checkpoint base>'}")
+    print(f"[eval_harness] fail truncation: {args.fail_on_truncation}")
+    print(f"[eval_harness] kv cache:     {args.use_kv_cache}")
     print(
         f"[eval_harness] max_subtokens: checkpoint="
         f"{args.checkpoint_max_subtokens} eval={args.eval_max_subtokens}"
@@ -254,7 +354,25 @@ def main():
     )
     print(f"[eval_harness] include_path: {include_path}")
 
-    task_manager = TaskManager(include_path=include_path) if include_path else TaskManager()
+    ruler_lengths = _parse_ruler_lengths(args.ruler_lengths)
+    task_metadata = None
+    if ruler_lengths:
+        _use_ruler_hotpot_mirror()
+        task_metadata = {
+            "max_seq_lengths": ruler_lengths,
+            "tokenizer": lm.tokenizer.name_or_path,
+        }
+        print(f"[eval_harness] RULER lengths: {ruler_lengths}")
+    if task_metadata is not None:
+        task_manager = TaskManager(
+            include_path=include_path, metadata=task_metadata
+        )
+    else:
+        task_manager = (
+            TaskManager(include_path=include_path)
+            if include_path
+            else TaskManager()
+        )
 
     eval_start = time.perf_counter()
     results = simple_evaluate(
@@ -272,6 +390,11 @@ def main():
         log_samples=not args.no_log_samples,
         apply_chat_template=getattr(args, 'apply_chat_template', False),
         fewshot_as_multiturn=getattr(args, 'fewshot_as_multiturn', False),
+        **(
+            {"gen_kwargs": {"do_sample": False, "temperature": 0.0}}
+            if args.force_greedy
+            else {}
+        ),
         # Tasks flagged unsafe_code (humaneval*) execute generated code and are
         # refused unless this is True; HF evaluate's code_eval independently
         # refuses unless HF_ALLOW_CODE_EVAL=1. One env var drives both.
