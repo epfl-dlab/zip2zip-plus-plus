@@ -25,6 +25,11 @@ def _release_args() -> dict:
         "hyper_encoder_type": "flat",
         "max_subtokens": 4,
         "disable_digit_ids": True,
+        "token_type_loss_weight": 0.05,
+        "zero_init_encoder_output": True,
+        "no_encoder_residual": False,
+        "encoder_n_layers": 2,
+        "warmstart_steps": 0,
         "max_codebook_size": 4096,
     }
 
@@ -61,10 +66,32 @@ def test_release_metadata_accepts_all_four_models(
     assert read_release_metadata(_checkpoint(tmp_path, args)) == args
 
 def test_release_metadata_rejects_non_zip2zippp_recipe(tmp_path):
+
     args = _release_args()
     args["base_token_positions"] = False
     ckpt_dir = _checkpoint(tmp_path, args)
     with pytest.raises(ValueError, match="base_token_positions=False"):
+        read_release_metadata(ckpt_dir)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("token_type_loss_weight", 0.0),
+        ("zero_init_encoder_output", False),
+        ("no_encoder_residual", True),
+        ("encoder_n_layers", 4),
+        ("warmstart_steps", 200),
+        ("share_hyper_encoder_weights", True),
+        ("online_codebook_mask", True),
+        ("base_view_replay_prob", 0.25),
+    ],
+)
+def test_release_metadata_rejects_non_v064_ablation(tmp_path, key, value):
+    args = _release_args()
+    args[key] = value
+    ckpt_dir = _checkpoint(tmp_path, args)
+    with pytest.raises(ValueError, match=key):
         read_release_metadata(ckpt_dir)
 
 

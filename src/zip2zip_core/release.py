@@ -67,6 +67,11 @@ def read_release_metadata(ckpt_dir: Path) -> dict:
         "hyper_encoder_type": "flat",
         "max_subtokens": 4,
         "disable_digit_ids": True,
+        "token_type_loss_weight": 0.05,
+        "zero_init_encoder_output": True,
+        "no_encoder_residual": False,
+        "encoder_n_layers": 2,
+        "warmstart_steps": 0,
     }
     mismatches = [
         f"{key}={train_args.get(key)!r} (expected {value!r})"
@@ -76,6 +81,17 @@ def read_release_metadata(ckpt_dir: Path) -> dict:
     for unsupported in ("two_axis_rope", "gated_compressed_rope"):
         if train_args.get(unsupported, False):
             mismatches.append(f"{unsupported}=True (unsupported)")
+    for unsupported in ("share_hyper_encoder_weights", "online_codebook_mask"):
+        if train_args.get(unsupported, False):
+            mismatches.append(f"{unsupported}=True (not in v0.6.4)")
+    base_view_replay_prob = float(
+        train_args.get("base_view_replay_prob", 0.0) or 0.0
+    )
+    if base_view_replay_prob != 0.0:
+        mismatches.append(
+            f"base_view_replay_prob={base_view_replay_prob!r} (expected 0.0)"
+        )
+
     if not isinstance(train_args.get("max_codebook_size"), int) or train_args[
         "max_codebook_size"
     ] <= 0:
