@@ -13,7 +13,7 @@ Published repositories keep their inference artifacts on the `hf` revision:
 ```python
 from zip2zip import Zip2ZipModel, Zip2ZipTokenizer
 
-repo_id = "epfl-dlab/<model-repo>"
+repo_id = "epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct"
 tokenizer = Zip2ZipTokenizer.from_pretrained(repo_id, revision="hf")
 model = Zip2ZipModel.from_pretrained(
     repo_id, revision="hf", device_map="auto", dtype="auto"

@@ -29,6 +29,29 @@ EXPECTED_VOCAB_SIZES = {
     "Phi3-medium": 32064,
 }
 
+# Hub license identifiers of the base models. The derived weights inherit
+# them (Llama 3.2 Community License, MIT for Phi-3), so the card must say so.
+RELEASE_LICENSES = {
+    "1B": "llama3.2",
+    "3B": "llama3.2",
+    "Phi3.5-mini": "mit",
+    "Phi3-medium": "mit",
+}
+
+# Remote files the inference revision may hold only if this export re-adds
+# them: training files that must never be there, and weight files whose layout
+# (single file vs shards) can change between exports. upload_folder drops the
+# delete for any path the folder uploads in the same commit, so this removes
+# stale files only. meta.pt is deliberately not listed: export copies it next
+# to the inference files and the runtime reads it to restore the encoder flags.
+INFERENCE_REVISION_DELETE_PATTERNS = [
+    "model.pt",
+    "optimizer.pt",
+    "model.safetensors",
+    "model-*.safetensors",
+    "model.safetensors.index.json",
+]
+
 
 def checkpoint_step(ckpt_dir: Path) -> int:
     """Return the step encoded by a canonical ``step_N`` directory name."""
@@ -134,9 +157,20 @@ def validate_export(export_dir: Path, train_args: dict) -> None:
     index = export_dir / "model.safetensors.index.json"
     if not decoder.is_file() and not index.is_file():
         raise FileNotFoundError("export has neither decoder weights nor a shard index")
-    for required_file in ("config.json", "zip2zip_encoders.safetensors"):
+    for required_file in (
+        "config.json",
+        "generation_config.json",
+        "tokenizer_config.json",
+        "zip2zip_encoders.safetensors",
+    ):
         if not (export_dir / required_file).is_file():
             raise FileNotFoundError(f"export is missing {required_file}")
+    with open(export_dir / "tokenizer_config.json", encoding="utf-8") as file:
+        if not json.load(file).get("pad_token"):
+            raise ValueError(
+                "exported tokenizer has no pad_token; the runtime would fall "
+                "back to eos and mask every chat turn separator"
+            )
 
     from safetensors import safe_open
 
@@ -181,8 +215,12 @@ def validate_export(export_dir: Path, train_args: dict) -> None:
 
 def render_model_card(repo_id: str, step: int, train_args: dict) -> str:
     """Build the model card shared by the training and inference revisions."""
+    license_id = RELEASE_LICENSES[train_args["model_config"]]
+    attribution = "\nBuilt with Llama.\n" if license_id == "llama3.2" else ""
     return f"""---
 library_name: zip2zip
+license: {license_id}
+pipeline_tag: text-generation
 base_model: {train_args['init_from_hf']}
 tags:
   - zip2zip
@@ -195,7 +233,7 @@ tags:
 Zip2Zip++ checkpoint based on `{train_args['init_from_hf']}` (training step
 {step}). The repository keeps the original training checkpoint on `main` and
 the user-facing, self-contained inference export on `{INFERENCE_REVISION}`.
-
+{attribution}
 ## Usage
 
 ```bash
@@ -259,8 +297,18 @@ def publish_release(
     train_args: dict,
     *,
     api=None,
+    private: bool | None = None,
+    recreate_inference_branch: bool = False,
+    collection: str | None = None,
 ) -> None:
-    """Publish raw training files to ``main`` and inference files to ``hf``."""
+    """Publish raw training files to ``main`` and inference files to ``hf``.
+
+    ``private`` applies only when this call creates the repository; flip it
+    public by hand after inspecting both revisions. ``recreate_inference_branch``
+    rebuilds ``hf`` from the root commit first (for repositories published
+    before ``hf`` was rooted correctly). ``collection`` is a Hub collection slug
+    the model repository is added to after both revisions are up.
+    """
     if api is None:
         from huggingface_hub import HfApi
 
@@ -273,6 +321,7 @@ def publish_release(
         step=step,
         label="Zip2Zip++ training checkpoint",
         api=api,
+        private=private,
     )
 
     # Do not modify the local checkpoint just to add public documentation.
@@ -287,6 +336,8 @@ def publish_release(
             commit_message=f"Step {step} (Zip2Zip++ model card)",
         )
 
+    # The inference revision tip must hold exactly the export: drop stale
+    # training and weight files. Its history is cleaned only when recreated.
     upload_folder(
         repo_id,
         str(export_dir),
@@ -294,4 +345,12 @@ def publish_release(
         step=step,
         label="Zip2Zip++ inference export",
         api=api,
+        delete_patterns=INFERENCE_REVISION_DELETE_PATTERNS,
+        recreate_branch=recreate_inference_branch,
     )
+
+    if collection:
+        api.add_collection_item(
+            collection, item_id=repo_id, item_type="model", exists_ok=True
+        )
+        print(f"Added {repo_id} to collection {collection}")

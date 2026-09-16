@@ -1,7 +1,7 @@
 """Sanity-check exported HF config against training metadata.
 
 Examples:
-  python scripts/zip2zip_hf/check_export_consistency.py --repo epfl-dlab/<model-repo>
+  python scripts/zip2zip_hf/check_export_consistency.py --repo epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct
   python scripts/zip2zip_hf/check_export_consistency.py --export_dir /path/to/export
 """
 

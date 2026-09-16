@@ -59,7 +59,7 @@ Build and inspect an export locally:
 ```bash
 python scripts/push_checkpoint.py \
     --ckpt-dir /path/to/checkpoints/step_8000 \
-    --repo-id epfl-dlab/<model-repo> \
+    --repo-id epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct \
     --output-dir /path/to/export
 ```
 
@@ -68,7 +68,7 @@ Publish after inspection:
 ```bash
 python scripts/push_checkpoint.py \
     --ckpt-dir /path/to/checkpoints/step_8000 \
-    --repo-id epfl-dlab/<model-repo> \
+    --repo-id epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct \
     --upload
 ```
 
@@ -84,7 +84,7 @@ Users must load the `hf` revision:
 ```python
 from zip2zip import Zip2ZipModel, Zip2ZipTokenizer
 
-repo_id = "epfl-dlab/<model-repo>"
+repo_id = "epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct"
 tokenizer = Zip2ZipTokenizer.from_pretrained(repo_id, revision="hf")
 model = Zip2ZipModel.from_pretrained(
     repo_id, revision="hf", device_map="auto", dtype="auto"
@@ -110,3 +110,9 @@ the paper live in the `ext/zip2zip-hyperenc_probe` submodule. See its
 - [Export and interoperability](docs/export.md)
 - [Release workflow](docs/workflow.md)
 - [Project structure](docs/structure.md)
+
+## License
+
+zip2zip-core is released under the MIT License (see [LICENSE](LICENSE)). The
+vendored submodules keep their own licenses: `ext/zip2zip` (Apache-2.0),
+`ext/zip2zip-compression` (MIT), `ext/torchtitan` (BSD-3-Clause).

@@ -23,7 +23,7 @@ Build and validate locally first:
 ```bash
 python scripts/push_checkpoint.py \
     --ckpt-dir /path/to/step_8000 \
-    --repo-id epfl-dlab/<model-repo> \
+    --repo-id epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct \
     --output-dir /path/to/export
 ```
 
@@ -32,7 +32,7 @@ Publish both revisions:
 ```bash
 python scripts/push_checkpoint.py \
     --ckpt-dir /path/to/step_8000 \
-    --repo-id epfl-dlab/<model-repo> \
+    --repo-id epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct \
     --upload
 ```
 
@@ -42,7 +42,13 @@ No network write occurs without `--upload`. When uploading, the command:
 2. exports and validates all decoder and encoder keys locally;
 3. uploads the original checkpoint directory to `main`;
 4. writes a model card explaining the two revisions; and
-5. uploads the self-contained inference export to `hf`.
+5. uploads the self-contained inference export to `hf`, deleting any
+   `model.pt`/`optimizer.pt` that revision may still carry, so `hf` holds
+   exactly the export.
+
+The `hf` branch is created from the repository's root commit, never from
+`main`, so it cannot inherit training files. Re-running the command against an
+existing repository is safe: unchanged files produce no new commit.
 
 The upload step is separate from training. It does not alter checkpoint saving,
 resuming, or the optional background checkpoint upload in `zip2zip_core.train`.
@@ -56,7 +62,12 @@ The release path requires:
 - a self-contained base model (`base_model_name_or_path: "."`);
 - both input and output encoder weights;
 - the exact Transformers decoder key set;
-- a 128256 base vocabulary for Llama or 32064 for Phi; and
+- a 128256 base vocabulary for Llama or 32064 for Phi;
+- `generation_config.json` copied from the base model (Phi-3 stops on `<|end|>`
+  only through it);
+- a tokenizer with an explicit `pad_token` equal to the core `pad_token_id`
+  (`<|end_of_text|>` for Llama, `<|endoftext|>` for Phi), because the runtime
+  masks pad ids and would otherwise fall back to eos; and
 - all shards referenced by `model.safetensors.index.json`.
 
 This check happens before either revision is uploaded.
@@ -115,7 +126,7 @@ The inference files live on `hf`, not the default `main` revision:
 ```python
 from zip2zip import Zip2ZipModel, Zip2ZipTokenizer
 
-repo_id = "epfl-dlab/<model-repo>"
+repo_id = "epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct"
 tokenizer = Zip2ZipTokenizer.from_pretrained(repo_id, revision="hf")
 model = Zip2ZipModel.from_pretrained(
     repo_id, revision="hf", device_map="auto", dtype="auto"

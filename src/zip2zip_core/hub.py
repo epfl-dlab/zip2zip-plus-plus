@@ -5,6 +5,33 @@ from __future__ import annotations
 import os
 
 
+def _ensure_branch(api, repo_id: str, branch: str, *, recreate: bool = False) -> None:
+    """Create ``branch`` from the repository's root commit if it does not exist.
+
+    ``create_branch`` defaults to the head of ``main``. For the release layout
+    that is exactly wrong: ``hf`` would inherit ``model.pt``/``optimizer.pt``
+    from the checkpoint upload that runs first. Starting from the root commit
+    (the ``.gitattributes`` created with the repo) gives an empty branch.
+
+    ``recreate`` deletes an existing branch first, so its history no longer
+    carries files inherited before this logic existed. Deleting files with
+    ``delete_patterns`` cleans only the branch tip.
+    """
+    refs = api.list_repo_refs(repo_id)
+    exists = any(ref.name == branch for ref in refs.branches)
+    if exists and not recreate:
+        return
+    if exists:
+        print(f"Recreating branch {branch} of {repo_id} from the root commit...")
+        api.delete_branch(repo_id, branch=branch)
+    commits = api.list_repo_commits(repo_id, revision="main")
+    if not commits:
+        raise RuntimeError(f"{repo_id} has no commits on main; cannot root {branch}")
+    # Newest first, so the last entry is the initial commit.
+    root_commit = commits[-1].commit_id
+    api.create_branch(repo_id, branch=branch, revision=root_commit, exist_ok=True)
+
+
 def upload_folder(
     repo_id: str,
     folder_path: str,
@@ -12,22 +39,28 @@ def upload_folder(
     step: int | None = None,
     label: str = "checkpoint",
     api=None,
+    *,
+    delete_patterns: list[str] | None = None,
+    private: bool | None = None,
+    recreate_branch: bool = False,
 ):
     """Upload a folder to a HuggingFace Hub repo branch.
 
-    Creates the repo and branch if they don't exist.
+    Creates the repo and branch if they don't exist. ``delete_patterns`` removes
+    matching remote files that the folder does not re-add, in the same commit,
+    so a branch can be made to hold exactly the folder's contents. ``private``
+    applies only when this call creates the repo. ``recreate_branch`` rebuilds a
+    non-main branch from the root commit before uploading.
     """
     if api is None:
         from huggingface_hub import HfApi
         api = HfApi()
 
-    api.create_repo(repo_id, exist_ok=True)
+    create_kwargs = {} if private is None else {"private": private}
+    api.create_repo(repo_id, exist_ok=True, **create_kwargs)
 
     if branch != "main":
-        try:
-            api.create_branch(repo_id, branch=branch)
-        except Exception:
-            pass
+        _ensure_branch(api, repo_id, branch, recreate=recreate_branch)
 
     commit_msg = f"Step {step} ({label})" if step is not None else label
     print(f"Pushing {label} to {repo_id} (branch: {branch})...")
@@ -37,6 +70,7 @@ def upload_folder(
         path_in_repo=".",
         revision=branch,
         commit_message=commit_msg,
+        delete_patterns=delete_patterns,
     )
     print(f"Done: {repo_id} branch={branch}")
 

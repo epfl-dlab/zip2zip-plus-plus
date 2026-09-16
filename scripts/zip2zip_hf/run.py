@@ -2,7 +2,7 @@
 
 Example:
     python scripts/zip2zip_hf/run.py \
-        --repo epfl-dlab/<model-repo> \
+        --repo epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct \
         --prompt "Hello world"
 """
 

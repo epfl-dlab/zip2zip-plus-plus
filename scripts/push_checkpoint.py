@@ -34,6 +34,24 @@ def main() -> None:
         action="store_true",
         help="Upload main and hf revisions after export validation.",
     )
+    parser.add_argument(
+        "--private",
+        action="store_true",
+        help="Create the repository private (no effect on an existing repo); "
+        "make it public by hand after inspecting both revisions.",
+    )
+    parser.add_argument(
+        "--recreate-inference-branch",
+        action="store_true",
+        help="Delete and recreate the hf branch from the root commit before "
+        "uploading, so its history stops carrying training files.",
+    )
+    parser.add_argument(
+        "--collection",
+        default=None,
+        help="Hub collection slug (e.g. epfl-dlab/zip2zip-<id>) to add the "
+        "model repository to after publishing.",
+    )
     args = parser.parse_args()
 
     from zip2zip_core.release import export_release, publish_release
@@ -66,6 +84,9 @@ def main() -> None:
                 args.repo_id,
                 step,
                 train_args,
+                private=True if args.private else None,
+                recreate_inference_branch=args.recreate_inference_branch,
+                collection=args.collection,
             )
     finally:
         if temporary_export is not None:

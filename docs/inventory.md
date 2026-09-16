@@ -7,10 +7,10 @@ final repository IDs when the releases are created.
 
 | Release | Base model | HF repository |
 |---|---|---|
-| Zip2Zip++ Llama 1B | `meta-llama/Llama-3.2-1B-Instruct` | TBD |
-| Zip2Zip++ Llama 3B | `meta-llama/Llama-3.2-3B-Instruct` | TBD |
-| Zip2Zip++ Phi 4B | `microsoft/Phi-3.5-mini-instruct` | TBD |
-| Zip2Zip++ Phi 14B | `microsoft/Phi-3-medium-4k-instruct` | TBD |
+| Zip2Zip++ Llama 1B | `meta-llama/Llama-3.2-1B-Instruct` | [epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct](https://huggingface.co/epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct) |
+| Zip2Zip++ Llama 3B | `meta-llama/Llama-3.2-3B-Instruct` | [epfl-dlab/zip2zip-pp-Llama-3.2-3B-Instruct](https://huggingface.co/epfl-dlab/zip2zip-pp-Llama-3.2-3B-Instruct) |
+| Zip2Zip++ Phi 4B | `microsoft/Phi-3.5-mini-instruct` | [epfl-dlab/zip2zip-pp-Phi-3.5-mini-instruct](https://huggingface.co/epfl-dlab/zip2zip-pp-Phi-3.5-mini-instruct) |
+| Zip2Zip++ Phi 14B | `microsoft/Phi-3-medium-4k-instruct` | [epfl-dlab/zip2zip-pp-Phi-3-medium-4k-instruct](https://huggingface.co/epfl-dlab/zip2zip-pp-Phi-3-medium-4k-instruct) |
 
 Each repository uses `main` for the original training checkpoint and `hf` for
 the inference export.

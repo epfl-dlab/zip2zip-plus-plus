@@ -41,7 +41,7 @@ python scripts/eval_harness.py \
 ```bash
 python scripts/push_checkpoint.py \
     --ckpt-dir /path/to/checkpoints/step_8000 \
-    --repo-id epfl-dlab/<model-repo> \
+    --repo-id epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct \
     --output-dir /path/to/export
 ```
 
@@ -53,7 +53,7 @@ supported Zip2Zip++ recipes and the export is complete.
 ```bash
 python scripts/push_checkpoint.py \
     --ckpt-dir /path/to/checkpoints/step_8000 \
-    --repo-id epfl-dlab/<model-repo> \
+    --repo-id epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct \
     --upload
 ```
 
@@ -69,7 +69,7 @@ hf    -> validated, self-contained inference model
 ```python
 from zip2zip import Zip2ZipModel, Zip2ZipTokenizer
 
-repo_id = "epfl-dlab/<model-repo>"
+repo_id = "epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct"
 tokenizer = Zip2ZipTokenizer.from_pretrained(repo_id, revision="hf")
 model = Zip2ZipModel.from_pretrained(repo_id, revision="hf")
 ```

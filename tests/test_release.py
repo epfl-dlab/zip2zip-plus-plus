@@ -9,6 +9,8 @@ import torch
 
 from zip2zip_core.release import (
     INFERENCE_REVISION,
+    INFERENCE_REVISION_DELETE_PATTERNS,
+    RELEASE_LICENSES,
     checkpoint_step,
     publish_release,
     read_release_metadata,
@@ -110,13 +112,29 @@ def test_publish_keeps_main_training_and_hf_inference(monkeypatch, tmp_path):
     uploads = []
 
     def fake_upload_folder(repo_id, folder_path, **kwargs):
-        uploads.append((repo_id, Path(folder_path), kwargs["branch"]))
+        uploads.append(
+            (
+                repo_id,
+                Path(folder_path),
+                kwargs["branch"],
+                kwargs.get("delete_patterns"),
+            )
+        )
+        forwarded.append(
+            {key: kwargs.get(key) for key in ("private", "recreate_branch")}
+        )
 
     class FakeApi:
         def upload_file(self, **kwargs):
             uploads.append(
-                (kwargs["repo_id"], Path("README.md"), kwargs["revision"])
+                (kwargs["repo_id"], Path("README.md"), kwargs["revision"], None)
             )
+
+        def add_collection_item(self, collection, **kwargs):
+            collections.append((collection, kwargs))
+
+    forwarded = []
+    collections = []
 
     monkeypatch.setattr("zip2zip_core.release.upload_folder", fake_upload_folder)
     publish_release(
@@ -129,7 +147,82 @@ def test_publish_keeps_main_training_and_hf_inference(monkeypatch, tmp_path):
     )
 
     assert uploads == [
-        ("epfl-dlab/example", ckpt_dir, "main"),
-        ("epfl-dlab/example", Path("README.md"), "main"),
-        ("epfl-dlab/example", export_dir, INFERENCE_REVISION),
+        ("epfl-dlab/example", ckpt_dir, "main", None),
+        ("epfl-dlab/example", Path("README.md"), "main", None),
+        (
+            "epfl-dlab/example",
+            export_dir,
+            INFERENCE_REVISION,
+            INFERENCE_REVISION_DELETE_PATTERNS,
+        ),
     ]
+    assert "model.pt" in INFERENCE_REVISION_DELETE_PATTERNS
+    assert "optimizer.pt" in INFERENCE_REVISION_DELETE_PATTERNS
+    assert "meta.pt" not in INFERENCE_REVISION_DELETE_PATTERNS
+    # private reaches only the repo-creating main upload; the hf upload is not
+    # asked to recreate its branch; no collection was requested.
+    assert forwarded == [
+        {"private": None, "recreate_branch": None},
+        {"private": None, "recreate_branch": False},
+    ]
+    assert collections == []
+
+
+def test_publish_options_reach_the_hub_calls(monkeypatch, tmp_path):
+    ckpt_dir = _checkpoint(tmp_path)
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    calls = []
+
+    def fake_upload_folder(repo_id, folder_path, **kwargs):
+        calls.append((kwargs["branch"], kwargs.get("private"), kwargs.get("recreate_branch")))
+
+    class FakeApi:
+        def upload_file(self, **kwargs):
+            pass
+
+        def add_collection_item(self, collection, **kwargs):
+            calls.append(("collection", collection, kwargs))
+
+    monkeypatch.setattr("zip2zip_core.release.upload_folder", fake_upload_folder)
+    publish_release(
+        ckpt_dir,
+        export_dir,
+        "epfl-dlab/example",
+        8000,
+        _release_args(),
+        api=FakeApi(),
+        private=True,
+        recreate_inference_branch=True,
+        collection="epfl-dlab/zip2zip-abc",
+    )
+
+    assert calls == [
+        ("main", True, None),
+        (INFERENCE_REVISION, None, True),
+        (
+            "collection",
+            "epfl-dlab/zip2zip-abc",
+            {"item_id": "epfl-dlab/example", "item_type": "model", "exists_ok": True},
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("model_config", "license_id", "built_with_llama"),
+    [
+        ("1B", "llama3.2", True),
+        ("3B", "llama3.2", True),
+        ("Phi3.5-mini", "mit", False),
+        ("Phi3-medium", "mit", False),
+    ],
+)
+def test_model_card_declares_base_model_license(
+    model_config, license_id, built_with_llama
+):
+    args = _release_args() | {"model_config": model_config}
+    card = render_model_card("epfl-dlab/example", 8000, args)
+    assert RELEASE_LICENSES[model_config] == license_id
+    assert f"license: {license_id}" in card
+    assert "pipeline_tag: text-generation" in card
+    assert ("Built with Llama" in card) is built_with_llama

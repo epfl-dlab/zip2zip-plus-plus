@@ -25,7 +25,7 @@ Publish only through the guarded command:
 ```bash
 python scripts/push_checkpoint.py \
     --ckpt-dir /path/to/step_8000 \
-    --repo-id epfl-dlab/<model-repo> \
+    --repo-id epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct \
     --upload
 ```
 

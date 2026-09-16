@@ -304,6 +304,35 @@ def _validate_hf_decoder_state_dict(sd: dict, n_layers: int) -> None:
         )
 
 
+def _pin_pad_token(tok, model_config: str) -> None:
+    """Give the exported tokenizer the pad id the checkpoint trained with.
+
+    The ext runtime pads codebook entries with tokenizer.pad_token_id and builds
+    the attention mask as (id != pad_token_id); with no pad set it falls back to
+    eos. For Llama-3.2-Instruct eos is <|eot_id|>, so every chat turn separator
+    would be masked out and shift the base-space positions. Core pads with
+    Config.pad_token_id (<|end_of_text|> for Llama, <|endoftext|> for Phi).
+    """
+    from zip2zip_core.configs import zip2zip_llama_configs
+
+    cfg = zip2zip_llama_configs.get(model_config)
+    if cfg is None:
+        print(f"  no core config named {model_config!r}; leaving pad_token as is")
+        return
+    pad_id = cfg.pad_token_id
+    if tok.pad_token_id == pad_id:
+        return
+    pad_token = tok.convert_ids_to_tokens(pad_id)
+    if not isinstance(pad_token, str):
+        raise ValueError(f"pad id {pad_id} is not a token of {base_model_name(tok)}")
+    print(f"  pad_token {tok.pad_token!r} -> {pad_token!r} (id {pad_id}, core Config.pad_token_id)")
+    tok.pad_token = pad_token
+
+
+def base_model_name(tok) -> str:
+    return getattr(tok, "name_or_path", tok.__class__.__name__)
+
+
 def _fuse_llama_to_phi3(hf_llama_sd: dict, n_layers: int) -> dict:
     """Convert HF Llama projection keys to the fused Phi-3 layout."""
     out = {
@@ -480,8 +509,23 @@ def export(
         hf_config.sliding_window = None
         if hasattr(hf_config, "original_max_position_embeddings"):
             hf_config.original_max_position_embeddings = 4096
+        # The Phi-3 repos advertise remote code (configuration_phi3.py,
+        # modeling_phi3.py) that this export does not ship; the native
+        # transformers implementation is what loads it, so do not point
+        # trust_remote_code=True users at missing files.
+        hf_config.__dict__.pop("auto_map", None)
     hf_config.torch_dtype = torch.bfloat16
     hf_config.save_pretrained(output_dir)
+
+    # Generation defaults live in the base repo's generation_config.json, not in
+    # config.json: Phi-3 stops on <|end|> (32007) only through that file. Copy
+    # it so the export stops where the base model stops.
+    from transformers import GenerationConfig
+    try:
+        gen_config = GenerationConfig.from_pretrained(base_model)
+    except (OSError, ValueError):
+        gen_config = GenerationConfig.from_model_config(hf_config)
+    gen_config.save_pretrained(output_dir)
 
     print(f"Saving decoder in <= {max_shard_size} bfloat16 shards ...")
     _save_sharded_safetensors(
@@ -531,6 +575,7 @@ def export(
         )
         initial_vocab_size = vocab_size
         print(f"  initial_vocab_size={initial_vocab_size}, disabled_ids count={len(disabled_ids)}")
+        _pin_pad_token(tok, model_config)
         print(f"Saving tokenizer to {output_dir} ...")
         tok.save_pretrained(output_dir)
 

@@ -15,7 +15,7 @@ Usage:
     python scripts/eval_harness.py --ckpt_dir /path/to/step_6000
     python scripts/eval_harness.py --ckpt_dir /path/to/step_6000 \\
         --tasks gsm8k,humaneval,mbpp,ifeval
-    python scripts/eval_harness.py --hf_repo epfl-dlab/<model-repo> --hf_revision main
+    python scripts/eval_harness.py --hf_repo epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct --hf_revision main
 
 The checkpoint's `meta.pt` is read to recover the model config, max_subtokens,
 max_codebook_size, and other architectural fields, so passing the right model
