@@ -23,7 +23,8 @@ zip2zip-core/
 └── ext/
     ├── torchtitan/
     ├── zip2zip/
-    └── zip2zip-compression/
+    ├── zip2zip-compression/
+    └── zip2zip-hyperenc_probe/
 ```
 
 ## Responsibility split
@@ -33,6 +34,9 @@ zip2zip-core/
 - `zip2zip` owns the lightweight user-facing tokenizer, model loader, and
   generation runtime.
 - `zip2zip-compression` owns the LZW state machine shared by both paths.
+- `zip2zip-hyperenc_probe` owns the paper's hyper-encoder embedding probes
+  (substitution and sequence probes) and the reproduction of their figures;
+  see [ext/zip2zip-hyperenc_probe/README.md](../ext/zip2zip-hyperenc_probe/README.md).
 
 Training checkpoints remain independent from the release layer. The trainer can
 save and resume locally or upload step revisions through `hub.py`; the guarded

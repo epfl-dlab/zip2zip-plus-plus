@@ -93,6 +93,12 @@ model = Zip2ZipModel.from_pretrained(
 
 See [Export and interoperability](docs/export.md) for format details.
 
+## Paper reproduction
+
+The hyper-encoder embedding probes (substitution and sequence probes) used in
+the paper live in the `ext/zip2zip-hyperenc_probe` submodule. See its
+[README](ext/zip2zip-hyperenc_probe/README.md) for reproduction commands.
+
 ## Documentation
 
 - [Installation](docs/installation.md)
