@@ -25,7 +25,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ckpt_dir", required=True, help="zip2zip-core checkpoint directory (contains model.pt)")
     p.add_argument("--output_dir", required=True, help="Destination directory for ext/zip2zip format")
-    p.add_argument("--base_model", required=True,
+    p.add_argument("--base_model", default=None,
                    help="HuggingFace base model name, e.g. meta-llama/Llama-3.1-8B")
     p.add_argument("--model_config", default=None,
                    help="zip2zip-core model config key (e.g. '1B'). "
@@ -48,6 +48,7 @@ def main():
                    help="Force encoder residual on. Default: restore from meta.pt.")
     p.add_argument("--no_residual", dest="residual", action="store_false")
     p.add_argument("--causal", action="store_true", default=False)
+    p.add_argument("--max_shard_size", default="5GB")
     args = p.parse_args()
 
     export(
@@ -61,6 +62,7 @@ def main():
         disable_digit_ids=args.disable_digit_ids,
         residual=args.residual,
         causal=args.causal,
+        max_shard_size=args.max_shard_size,
     )
 
 

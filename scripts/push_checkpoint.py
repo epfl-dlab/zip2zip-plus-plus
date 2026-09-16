@@ -1,172 +1,75 @@
-"""Push a local checkpoint directory to HuggingFace Hub.
+"""Export and optionally publish one of the four Zip2Zip++ checkpoints.
 
-Automatically detects checkpoint format and pushes to the appropriate branch:
-  - Training (model.pt)    → main branch (core format, for resume)
-  - Exported (safetensors) → hf branch (for inference)
+The Hugging Face repository layout is:
 
-For training checkpoints, also auto-exports to HF format and pushes to the hf branch.
+* ``main``: original zip2zip-core training checkpoint (resume/reproduction)
+* ``hf``: self-contained, user-facing zip2zip inference weights
 
-Usage:
-    python scripts/push_checkpoint.py \
-        --ckpt_dir /mnt/scratch/checkpoints/ft/step_2000 \
-        --repo_id epfl-dlab/Llaza-3.2-1B-v0.1
-
-    # Override auto-export metadata for scratch-trained checkpoints:
-    python scripts/push_checkpoint.py \
-        --ckpt_dir /mnt/scratch/checkpoints/ft/step_2000 \
-        --repo_id epfl-dlab/Llaza-3.2-1B-v0.1 \
-        --export_base_model meta-llama/Llama-3.2-1B \
-        --export_model_config 1B
-
-    # Skip auto-export:
-    python scripts/push_checkpoint.py \
-        --ckpt_dir /mnt/scratch/checkpoints/ft/step_2000 \
-        --repo_id epfl-dlab/Llaza-3.2-1B-v0.1 \
-        --no_export
+No upload happens unless ``--upload`` is passed.
 """
 
+from __future__ import annotations
+
 import argparse
-import os
-import re
 import sys
 import tempfile
+from pathlib import Path
 
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(_ROOT, "src"))
-sys.path.insert(0, os.path.join(_ROOT, "ext", "torchtitan"))
+_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_ROOT / "src"))
+sys.path.insert(0, str(_ROOT / "ext" / "torchtitan"))
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Push a local checkpoint to HuggingFace Hub")
-    parser.add_argument("--ckpt_dir", type=str, required=True,
-                        help="Path to checkpoint directory")
-    parser.add_argument("--repo_id", type=str, required=True,
-                        help="HuggingFace repo ID (e.g. epfl-dlab/Llaza-3.2-1B-v0.1)")
-    parser.add_argument("--step", type=int, default=None,
-                        help="Step number. Default: extracted from ckpt_dir name (e.g. step_6000 -> 6000)")
-    parser.add_argument("--branch", type=str, default=None,
-                        help="Target branch: 'main' for training checkpoints, 'hf' for exported safetensors. "
-                             "Default: auto-detected from directory contents.")
-    parser.add_argument("--no_export", action="store_true",
-                        help="Skip auto-export to HF format for training checkpoints.")
-    parser.add_argument("--export_base_model", type=str, default=None,
-                        help="Override base model used for auto-export when meta.pt has no 'init_from_hf' "
-                             "(e.g. meta-llama/Llama-3.2-1B).")
-    parser.add_argument("--export_model_config", type=str, default=None,
-                        help="Override model_config used for auto-export when meta.pt is missing or ambiguous "
-                             "(e.g. 1B, 1B_legacy, 3B).")
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--ckpt-dir", "--ckpt_dir", dest="ckpt_dir", type=Path, required=True
+    )
+    parser.add_argument("--repo-id", "--repo_id", dest="repo_id", required=True)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--max-shard-size", default="5GB")
+    parser.add_argument(
+        "--upload",
+        action="store_true",
+        help="Upload main and hf revisions after export validation.",
+    )
     args = parser.parse_args()
 
-    ckpt_dir = os.path.abspath(args.ckpt_dir)
-    if not os.path.isdir(ckpt_dir):
-        raise FileNotFoundError(f"Checkpoint directory not found: {ckpt_dir}")
+    from zip2zip_core.release import export_release, publish_release
 
-    step = args.step
-    if step is None:
-        match = re.search(r"step_(\d+)", os.path.basename(ckpt_dir))
-        if match:
-            step = int(match.group(1))
-        else:
-            raise ValueError(
-                f"Could not extract step from '{os.path.basename(ckpt_dir)}'. "
-                "Pass --step explicitly."
+    ckpt_dir = args.ckpt_dir.resolve()
+    if args.output_dir is None and not args.upload:
+        parser.error("pass --output-dir for a local export, or pass --upload")
+
+    temporary_export = None
+    if args.output_dir is None:
+        temporary_export = tempfile.TemporaryDirectory(
+            prefix="zip2zippp_release_"
+        )
+        export_dir = Path(temporary_export.name)
+    else:
+        export_dir = args.output_dir.resolve()
+
+    try:
+        step, train_args = export_release(
+            ckpt_dir,
+            export_dir,
+            args.repo_id,
+            max_shard_size=args.max_shard_size,
+        )
+        print(f"Validated Zip2Zip++ export: {export_dir}")
+        if args.upload:
+            publish_release(
+                ckpt_dir,
+                export_dir,
+                args.repo_id,
+                step,
+                train_args,
             )
-
-    files = set(os.listdir(ckpt_dir))
-    is_exported = "zip2zip_config.json" in files and "model.safetensors" in files
-    is_training = "model.pt" in files and "meta.pt" in files
-
-    if args.branch is None:
-        if is_training and not is_exported:
-            args.branch = "main"
-        elif is_exported and not is_training:
-            args.branch = "hf"
-        else:
-            raise ValueError(
-                f"Cannot auto-detect branch from {ckpt_dir}. "
-                "Pass --branch main (training) or --branch hf (exported)."
-            )
-        print(f"Auto-detected branch: {args.branch}")
-
-    from zip2zip_core.hub import upload_folder
-    from zip2zip_core.model_card import write_model_card
-    from huggingface_hub import HfApi
-
-    api = HfApi()
-    api.create_repo(args.repo_id, exist_ok=True)
-
-    # Generate model card for training checkpoints
-    train_args = {}
-    if is_training:
-        import torch
-        meta = torch.load(os.path.join(ckpt_dir, "meta.pt"), map_location="cpu", weights_only=False)
-        train_args = meta.get("args", {})
-        write_model_card(os.path.join(ckpt_dir, "README.md"), args.repo_id, step, train_args)
-
-    # Upload the checkpoint
-    upload_folder(args.repo_id, ckpt_dir, branch=args.branch, step=step,
-                  label="exported" if args.branch == "hf" else "training checkpoint", api=api)
-
-    # Auto-export training checkpoints to hf branch
-    if is_training and not args.no_export and args.branch != "hf":
-        from zip2zip_core.export import export
-
-        base_model = args.export_base_model or train_args.get("init_from_hf")
-        model_config = args.export_model_config or train_args.get("model_config")
-        if not base_model:
-            print(
-                "WARNING: meta.pt missing 'init_from_hf' and no --export_base_model was provided "
-                "— skipping auto-export."
-            )
-            return
-
-        # export() only knows the generic HF-Llama layout (Llama3StateDictAdapter,
-        # separate q/k/v + gate/up projections). Phi3ForCausalLM stores FUSED
-        # qkv_proj/gate_up_proj -- exporting a Phi checkpoint through this path
-        # produces a model.safetensors with the wrong key layout for the
-        # base_model_name_or_path it declares, which Zip2ZipModel.from_pretrained
-        # then silently fails to load (or loads with random decoder weights).
-        # scripts/zip2zip_hf/export_phi.py does the required q/k/v and gate/up
-        # fusion; run it by hand first, then re-run this script with the
-        # already-exported directory (--branch hf, --no_export is implied since
-        # is_exported will be true) to just upload it.
-        if "phi" in str(model_config).lower() or "phi" in str(base_model).lower():
-            raise ValueError(
-                f"Refusing to auto-export what looks like a Phi checkpoint "
-                f"(model_config={model_config!r}, base_model={base_model!r}) — "
-                "export() does not fuse qkv_proj/gate_up_proj the way Phi3ForCausalLM "
-                "requires. Run scripts/zip2zip_hf/export_phi.py --ckpt_dir ... "
-                "--output_dir ... yourself first, then re-run this script pointed "
-                "at that output_dir (it will be auto-detected as already-exported "
-                "and just uploaded, not re-exported)."
-            )
-
-        with tempfile.TemporaryDirectory(prefix="zip2zip_export_") as export_dir:
-            print(f"\n{'='*60}")
-            print(f"Auto-exporting to HF format...")
-            print(f"{'='*60}")
-            if args.export_base_model or args.export_model_config:
-                print(
-                    "Using export overrides: "
-                    f"base_model={base_model}, model_config={model_config}"
-                )
-            export(
-                ckpt_dir=ckpt_dir,
-                output_dir=export_dir,
-                base_model=base_model,
-                model_config=model_config,
-                max_codebook_size=train_args.get("max_codebook_size", 4096),
-                # NOTE:
-                # `hyper_causal_mask` controls training-time logit masking only.
-                # It is NOT the hyper-encoder architecture flag.
-                # Export causal encoder mode only when explicitly present.
-                causal=train_args.get("encoder_causal", False),
-                residual=not train_args.get("no_encoder_residual", False),
-            )
-            write_model_card(os.path.join(export_dir, "README.md"), args.repo_id, step, train_args)
-            upload_folder(args.repo_id, export_dir, branch="hf", step=step,
-                          label="exported HF format", api=api)
+    finally:
+        if temporary_export is not None:
+            temporary_export.cleanup()
 
 
 if __name__ == "__main__":

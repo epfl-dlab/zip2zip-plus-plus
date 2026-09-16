@@ -897,7 +897,7 @@ def _split_phi3_to_llama(hf_sd, config):
     Phi-3 stores fused ``self_attn.qkv_proj`` and ``mlp.gate_up_proj``; the
     torchtitan decoder (and Llama3StateDictAdapter) expects separate q/k/v and
     gate/up. This is the exact inverse of ``_fuse_llama_to_phi3`` in
-    ``scripts/zip2zip_hf/export_phi.py`` — split here, then ``from_hf`` applies
+    ``zip2zip_core.export._fuse_llama_to_phi3`` — split here, then ``from_hf`` applies
     the RoPE reverse-permute, mirroring how export fuses *after* ``to_hf``.
     """
     n_layers = config.n_layers
@@ -1582,7 +1582,7 @@ def main():
     # derived from the active tokenizer so this is correct for Llama, Phi, etc.
     # (For Llama-3.1 this reproduces the reserved 128000-128255 range.)
     # Single source of truth in zip2zip_core.disabled_ids -- eval (lm_eval_adapter)
-    # and HF export (export_phi.py / export.py) must derive the exact same set.
+    # and HF export (export.py) must derive the exact same set.
     from transformers import AutoTokenizer
     from zip2zip_core.disabled_ids import compute_disabled_ids, digit_ids as _digit_ids_fn
 

@@ -179,8 +179,8 @@ bit-identical. The hyper-encoder can be tied (one encoder for both the input-emb
 and output-logit roles) or untied (`UNTIED_HYPER_ENCODER=1` builds the released model's
 separate pair: input reads `tok_embeddings`, output reads `lm_head`) — canonical since
 v0.5 (see below). Untied checkpoints export to the released `ext/zip2zip` HF format via
-either `export.py` or `scripts/zip2zip_hf/export_phi.py` — both write `output_encoder.*`
-and `tie_encoders=False` for untied checkpoints. `scripts/finetune_phi35_from_hf_instruct.sbatch` is the
+`zip2zip_core.export` — it writes `output_encoder.*` and `tie_encoders=False`
+for untied checkpoints. `scripts/finetune_phi35_from_hf_instruct.sbatch` is the
 CSCS-SLURM counterpart (same `train.py` flags, different job launcher).
 
 `scripts/tokenize_sft_phi_rcp.sh` prepares the required Phi-tokenized `epfl-dlab/zip2zip-1B`

@@ -1,8 +1,8 @@
 """Single source of truth for which token ids the LZW compressor must never
 merge into a hyper-token codebook entry.
 
-Training (train.py), eval (lm_eval_adapter.py), and HF export (export_phi.py /
-export.py) all have to agree on this set for a checkpoint's whole lifecycle --
+Training (train.py), eval (lm_eval_adapter.py), and HF export (export.py) all
+have to agree on this set for a checkpoint's whole lifecycle --
 computing it independently in each place is exactly how the train/eval
 mismatch bugs documented in docs/evaluation.md happened (chat-turn markers,
 then digits). Always derive it here instead of re-deriving it locally.

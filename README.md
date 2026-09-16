@@ -1,9 +1,13 @@
 # zip2zip-core
 
-Pretraining zip2zip language models (codename: **Llaza**) with inference-time adaptive tokenization via LZW compression (hypertokens).
+Training, evaluation, and release tooling for **Zip2Zip++**, a language-model
+architecture with inference-time adaptive tokenization via LZW hypertokens.
 
+This repository contains the distributed training implementation and the data
+pipeline. The user-facing Hugging Face runtime lives in
+[zip2zip](https://github.com/epfl-dlab/zip2zip).
 
-## Quick Start
+## Setup
 
 ```bash
 git clone --recurse-submodules https://github.com/epfl-dlab/zip2zip-core.git
@@ -11,52 +15,92 @@ cd zip2zip-core
 uv sync
 ```
 
-```bash
-# Pre-tokenize
-uv run python scripts/pretokenize.py --output_dir /path/to/tokens
+## Data and training
 
-# Train (single node, 4 GPUs)
+The Llaza datasets and their preprocessing pipeline remain the canonical input
+pipeline for the project:
+
+```bash
+uv run python scripts/pretokenize.py \
+    --dataset epfl-dlab/llaza-20B \
+    --output_dir /path/to/tokens
+
 uv run torchrun --nproc_per_node=4 -m zip2zip_core.train \
     --data_dir /path/to/tokens \
     --output_dir /path/to/checkpoints \
-    --max_subtokens 2 --wandb --wandb_name my-run
-
-# Evaluate
-python scripts/eval_harness.py --ckpt_dir /path/to/step_6000 --resume_wandb_id none
-
-# Push to HF Hub (auto-exports to zip2zip format)
-python scripts/push_checkpoint.py --ckpt_dir /path/to/step_6000 --repo_id epfl-dlab/Llaza-3.2-1B-v0.1
-
-# Scratch-trained checkpoints can override auto-export metadata:
-python scripts/push_checkpoint.py \
-  --ckpt_dir /path/to/step_6000 \
-  --repo_id epfl-dlab/Llaza-3.2-1B-v0.1 \
-  --export_base_model meta-llama/Llama-3.2-1B \
-  --export_model_config 1B
+    --model_config 1B \
+    --init_from_hf meta-llama/Llama-3.2-1B-Instruct \
+    --max_subtokens 4
 ```
 
-## Llaza and zip2zip
+See [Data Pipeline](docs/data.md) and [Finetuning](docs/finetuning.md) for the
+full preprocessing and training options. Checkpoint saving, resuming, and the
+optional background upload used by training are unchanged.
 
-We have two codebases:
+## Evaluate
 
-- **[zip2zip-core](https://github.com/epfl-dlab/zip2zip-core)** (this repo) — pretraining and finetuning framework (torchtitan-based, distributed training, curriculum learning)
-- **[zip2zip](https://github.com/epfl-dlab/zip2zip)** — inference library (`pip install zip2zip`), HuggingFace-compatible API, lm-evaluation-harness integration
+```bash
+python scripts/eval_harness.py \
+    --ckpt_dir /path/to/checkpoints/step_8000 \
+    --resume_wandb_id none
+```
 
-Models trained here are exported to zip2zip format via `scripts/zip2zip_hf/export_to_zip2zip.py` (or automatically when using `scripts/push_checkpoint.py`, including scratch-trained checkpoints when `--export_base_model` and `--export_model_config` are provided).
+See [Evaluation](docs/evaluation.md) for the available tasks and modes.
+
+## Release a Zip2Zip++ checkpoint
+
+The release command accepts only the four supported Zip2Zip++ recipes: Llama
+3.2 1B/3B and Phi-3 4B/14B. It validates the checkpoint, produces a
+self-contained sharded Hugging Face export, and validates the exported key set
+before any upload.
+
+Build and inspect an export locally:
+
+```bash
+python scripts/push_checkpoint.py \
+    --ckpt-dir /path/to/checkpoints/step_8000 \
+    --repo-id epfl-dlab/<model-repo> \
+    --output-dir /path/to/export
+```
+
+Publish after inspection:
+
+```bash
+python scripts/push_checkpoint.py \
+    --ckpt-dir /path/to/checkpoints/step_8000 \
+    --repo-id epfl-dlab/<model-repo> \
+    --upload
+```
+
+Each model repository uses the same revision contract:
+
+| Revision | Contents | Intended use |
+|---|---|---|
+| `main` | Original `model.pt`, `meta.pt`, and checkpoint files | Resume and reproduction with zip2zip-core |
+| `hf` | Config, tokenizer, encoders, and sharded safetensors | Inference with `zip2zip` |
+
+Users must load the `hf` revision:
+
+```python
+from zip2zip import Zip2ZipModel, Zip2ZipTokenizer
+
+repo_id = "epfl-dlab/<model-repo>"
+tokenizer = Zip2ZipTokenizer.from_pretrained(repo_id, revision="hf")
+model = Zip2ZipModel.from_pretrained(
+    repo_id, revision="hf", device_map="auto", dtype="auto"
+)
+```
+
+See [Export and interoperability](docs/export.md) for format details.
 
 ## Documentation
 
-- [Installation](docs/installation.md) — prerequisites, setup, extras
-- [Data Pipeline](docs/data.md) — pre-tokenization, LZW compression, codebook remapping, training modes
-- [Pretraining](docs/pretraining.md) — single-node, multi-node SLURM, curriculum training, W&B logging
-- [Finetuning](docs/finetuning.md) — finetuning from pretrained Llama weights, `--init_from_hf`
-- [Evaluation](docs/evaluation.md) — lm-evaluation-harness, W&B integration
-- [Compression Modeling](docs/compression_modeling.md) — the LZW transducer sweep: task, Phi model ladder, training, sequence-level eval
-- [Inference](docs/inference.md) — HF-based inference via `zip2zip`, torchtitan-based inference (in dev)
-- [Profiling](docs/profiling.md) — profiling training with `torch.profiler`
-- [Export & Interop](docs/export.md) — exporting to zip2zip HF format, state dict mapping, loading
-- [Workflow](docs/workflow.md) — end-to-end: train → eval → publish to HF Hub
-- [Workspace](docs/workspace.md) — W&B project, HuggingFace Hub, checkpoint management
-- [Project Structure](docs/structure.md) — codebase layout and module descriptions
-- [Model Inventory](docs/inventory.md) — trained models, checkpoints, datasets
-- [Roadmap](docs/roadmap.md) — planned features and next steps
+- [Installation](docs/installation.md)
+- [Data pipeline](docs/data.md)
+- [Pretraining](docs/pretraining.md)
+- [Finetuning](docs/finetuning.md)
+- [Evaluation](docs/evaluation.md)
+- [Inference](docs/inference.md)
+- [Export and interoperability](docs/export.md)
+- [Release workflow](docs/workflow.md)
+- [Project structure](docs/structure.md)

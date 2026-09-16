@@ -1,58 +1,45 @@
-# Project Structure
+# Project structure
 
-```
+```text
 zip2zip-core/
 ├── src/zip2zip_core/
-│   ├── model.py                 # Zip2ZipLlama3Model, HyperEncoder
-│   ├── configs.py               # Model configurations (debugmodel, 1B, 3B, ...)
-│   ├── data.py                  # Dataset, collation, dataloader
-│   ├── train.py                 # DDP/FSDP training loop
-│   ├── export.py                # Export to ext/zip2zip HF format
-│   ├── hub.py                   # HuggingFace Hub upload utilities
-│   ├── model_card.py            # Auto-generated model cards
-│   ├── project.py               # Centralized W&B/HF config
-│   ├── lm_eval_adapter.py       # lm-evaluation-harness adapter
-│   └── parallelize.py           # FSDP parallelization strategy
+│   ├── model.py          # Training model and hyper-encoders
+│   ├── configs.py        # Llama and Phi model configurations
+│   ├── data.py           # Llaza/token-shard data pipeline
+│   ├── train.py          # Distributed training, save, and resume
+│   ├── export.py         # Llama/Phi conversion to zip2zip format
+│   ├── release.py        # Four-model validation and main/hf publishing
+│   ├── hub.py            # Shared Hugging Face upload helpers
+│   └── lm_eval_adapter.py
 ├── scripts/
-│   ├── pretokenize.py           # Data preprocessing
-│   ├── finetune.sh              # Finetuning from Llama weights
-│   ├── eval_harness.py          # lm-evaluation-harness with W&B logging
-│   ├── eval_lm.sh               # Internal eval (loss/ppl/accuracy)
-│   ├── push_checkpoint.py       # Push + auto-export to HF Hub
-│   ├── train.sbatch             # SLURM job script
-│   ├── test_checkpoint.py       # Quick checkpoint sanity check
+│   ├── pretokenize.py
+│   ├── push_checkpoint.py # Guarded Zip2Zip++ release CLI
+│   ├── inference.py
+│   ├── eval_harness.py
 │   └── zip2zip_hf/
-│       ├── export_to_zip2zip.py # Export CLI wrapper
-│       ├── batch_export.sh      # Batch export multiple checkpoints
-│       ├── run.py               # Quick inference test
-│       └── debug_hyper.py       # Diagnostic: base vs hyper logits
-├── ext/
-│   ├── torchtitan/              # Git submodule — PyTorch distributed training framework
-│   ├── zip2zip/                 # Git submodule — inference library (pip install zip2zip)
-│   └── zip2zip-compression/     # Git submodule — Rust LZW compression library
-├── docs/                        # Documentation
-└── CLAUDE.md                    # AI assistant context
+│       └── export_to_zip2zip.py # Lower-level development exporter
+├── tests/
+├── docs/
+└── ext/
+    ├── torchtitan/
+    ├── zip2zip/
+    └── zip2zip-compression/
 ```
 
-## Key modules
+## Responsibility split
 
-### `src/zip2zip_core/`
+- `zip2zip-core` owns data preparation, training, raw checkpoints, evaluation,
+  conversion, and release validation.
+- `zip2zip` owns the lightweight user-facing tokenizer, model loader, and
+  generation runtime.
+- `zip2zip-compression` owns the LZW state machine shared by both paths.
 
-| Module | Description |
-|--------|-------------|
-| `model.py` | `Zip2ZipLlama3Model` — extends Llama3 decoder with HyperEncoder + bilinear output head. `HyperEncoder` maps variable-length base-token sequences into single embeddings. |
-| `configs.py` | Model size configurations: debugmodel (2M), 20M, 50M, 150M, 400M, 1B, 3B. Llama 3.2 variants included. |
-| `data.py` | `Zip2ZipDataset` — pre-tokenized `.npy` shards with on-the-fly LZW compression. Supports `lm` and `compress` modes. |
-| `train.py` | Full training loop with FSDP, gradient accumulation, curriculum support, W&B logging, background HF upload. |
-| `export.py` | `export()` — converts torchtitan state dict to HF safetensors + zip2zip_config.json. |
-| `hub.py` | `upload_folder()` and `push_checkpoint()` — HF Hub upload with model card generation and wandb integration. |
-| `project.py` | `WANDB_ENTITY`, `WANDB_PROJECT`, `HF_ORG` — shared project constants. |
-| `parallelize.py` | FSDP setup: bfloat16 params, fp32 reduce, activation checkpointing. No tensor parallelism (HyperEncoder requires full model per rank). |
+Training checkpoints remain independent from the release layer. The trainer can
+save and resume locally or upload step revisions through `hub.py`; the guarded
+release CLI reads a completed checkpoint without modifying it.
 
-### `ext/`
+## Hugging Face layout
 
-| Submodule | Description |
-|-----------|-------------|
-| `torchtitan` | Provides `Decoder`, `TransformerBlock`, `Embedding`, RoPE, attention modules — the base Llama3 architecture. |
-| `zip2zip` | Inference library with HF-compatible API (`Zip2ZipModel`, `Zip2ZipTokenizer`), lm-eval integration. |
-| `zip2zip-compression` | Rust LZW compression: `LZWCompressor`, `Codebook`, `CodebookManager`. Used in training data pipeline and inference. |
+Production Zip2Zip++ repositories use `main` for the original training
+checkpoint and `hf` for the self-contained inference export. This distinction
+is enforced in `release.py` and covered by tests.

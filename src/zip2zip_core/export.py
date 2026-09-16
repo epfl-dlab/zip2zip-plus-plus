@@ -96,12 +96,7 @@ def _encoder_residual_from_meta(ckpt_dir: str) -> bool:
 
 
 def refuse_base_token_positions(ckpt_dir: str) -> None:
-    """Hard-fail on exporting unsupported decoder RoPE position schemes.
-
-    The ext/zip2zip HF runtime assigns one RoPE position per compressed token;
-    a checkpoint trained with base-space or two-axis positions would load fine
-    and silently score with the wrong geometry. Export support is a separate task.
-    """
+    """Hard-fail on RoPE schemes outside the zip2zip++ release contract."""
     train_args = _train_args_from_meta(ckpt_dir)
     if train_args and train_args.get("gated_compressed_rope"):
         raise NotImplementedError(
@@ -117,13 +112,15 @@ def refuse_base_token_positions(ckpt_dir: str) -> None:
             "compute wrong attention geometry. Evaluate it through the in-core "
             "adapter instead."
         )
-    if train_args and train_args.get("base_token_positions"):
-        raise NotImplementedError(
-            "this checkpoint was trained with --base_token_positions; the "
-            "ext/zip2zip HF runtime has no base-position path, so an export "
-            "would silently compute wrong attention geometry. Evaluate it "
-            "through the in-core adapter instead."
-        )
+
+
+def _position_mode_from_meta(ckpt_dir: str) -> str:
+    refuse_base_token_positions(ckpt_dir)
+    return (
+        "base_token_end"
+        if _train_args_from_meta(ckpt_dir).get("base_token_positions")
+        else "compressed"
+    )
 
 
 def _disable_digit_ids_from_meta(ckpt_dir: str) -> bool:
@@ -307,6 +304,76 @@ def _validate_hf_decoder_state_dict(sd: dict, n_layers: int) -> None:
         )
 
 
+def _fuse_llama_to_phi3(hf_llama_sd: dict, n_layers: int) -> dict:
+    """Convert HF Llama projection keys to the fused Phi-3 layout."""
+    out = {
+        key: hf_llama_sd[key]
+        for key in ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight")
+    }
+    for layer_id in range(n_layers):
+        prefix = f"model.layers.{layer_id}."
+        out[f"{prefix}self_attn.qkv_proj.weight"] = torch.cat(
+            [
+                hf_llama_sd[f"{prefix}self_attn.q_proj.weight"],
+                hf_llama_sd[f"{prefix}self_attn.k_proj.weight"],
+                hf_llama_sd[f"{prefix}self_attn.v_proj.weight"],
+            ],
+            dim=0,
+        )
+        out[f"{prefix}self_attn.o_proj.weight"] = hf_llama_sd[
+            f"{prefix}self_attn.o_proj.weight"
+        ]
+        out[f"{prefix}mlp.gate_up_proj.weight"] = torch.cat(
+            [
+                hf_llama_sd[f"{prefix}mlp.gate_proj.weight"],
+                hf_llama_sd[f"{prefix}mlp.up_proj.weight"],
+            ],
+            dim=0,
+        )
+        for name in (
+            "mlp.down_proj.weight",
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+        ):
+            out[f"{prefix}{name}"] = hf_llama_sd[f"{prefix}{name}"]
+    return out
+
+
+def _save_sharded_safetensors(
+    state_dict: dict,
+    output_dir: str,
+    *,
+    max_shard_size: str = "5GB",
+    dtype: torch.dtype = torch.bfloat16,
+) -> None:
+    """Write a standard HF checkpoint without materializing a full cast copy."""
+    from huggingface_hub import split_torch_state_dict_into_shards
+    from safetensors.torch import save_file
+
+    split = split_torch_state_dict_into_shards(
+        state_dict,
+        filename_pattern="model{suffix}.safetensors",
+        max_shard_size=max_shard_size,
+    )
+    for filename, tensor_names in split.filename_to_tensors.items():
+        shard = {
+            name: state_dict[name].to(dtype=dtype).contiguous()
+            for name in tensor_names
+        }
+        save_file(shard, os.path.join(output_dir, filename))
+        print(f"  saved {filename} ({len(shard)} tensors)")
+        del shard
+
+    if split.is_sharded:
+        with open(os.path.join(output_dir, "model.safetensors.index.json"), "w") as f:
+            json.dump(
+                {"metadata": split.metadata, "weight_map": split.tensor_to_filename},
+                f,
+                indent=2,
+                sort_keys=True,
+            )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -314,7 +381,7 @@ def _validate_hf_decoder_state_dict(sd: dict, n_layers: int) -> None:
 def export(
     ckpt_dir: str,
     output_dir: str,
-    base_model: str,
+    base_model: str | None = None,
     model_config: str | None = None,
     encoder_n_heads: int | None = None,
     max_codebook_size: int = 4096,
@@ -322,6 +389,7 @@ def export(
     disable_digit_ids: bool | None = None,
     residual: bool | None = None,
     causal: bool = False,
+    max_shard_size: str = "5GB",
 ):
     """Export a zip2zip-core checkpoint to ext/zip2zip HF format.
 
@@ -345,12 +413,23 @@ def export(
         causal: Use causal masking in encoder (default False)
     """
     os.makedirs(output_dir, exist_ok=True)
+    train_args = _train_args_from_meta(ckpt_dir)
+    base_model = base_model or train_args.get("init_from_hf")
+    model_config = model_config or train_args.get("model_config")
+    if not base_model:
+        raise ValueError(
+            "meta.pt does not record init_from_hf; pass base_model explicitly"
+        )
+    if not model_config:
+        raise ValueError(
+            "meta.pt does not record model_config; pass model_config explicitly"
+        )
 
     # ---- Load checkpoint -----------------------------------------------
-    refuse_base_token_positions(ckpt_dir)
+    position_mode = _position_mode_from_meta(ckpt_dir)
     model_pt = os.path.join(ckpt_dir, "model.pt")
     print(f"Loading {model_pt} ...")
-    sd = torch.load(model_pt, map_location="cpu", weights_only=True)
+    sd = torch.load(model_pt, map_location="cpu", weights_only=True, mmap=True)
     if any("base_layer" in k for k in sd):
         print("  Merging LoRA adapters with scaling=alpha/rank from meta.pt")
     sd = _prepare_export_state_dict(sd, ckpt_dir)
@@ -361,8 +440,9 @@ def export(
     decoder_sd, encoder_sd, output_encoder_sd = _split_state_dict(sd)
     untied = bool(output_encoder_sd)
     enc_info = _infer_encoder_config(sd)
-
     vocab_size = sd["tok_embeddings.weight"].shape[0]
+    del sd
+
     print(f"  vocab_size={vocab_size}, encoder hidden={enc_info['hidden_size']}, "
           f"model_dim={enc_info['model_hidden_size']}, "
           f"max_subtokens={enc_info['max_subtokens']}, "
@@ -376,20 +456,43 @@ def export(
     hf_decoder_sd = adapter.to_hf(decoder_sd)
     _validate_hf_decoder_state_dict(hf_decoder_sd, llama_cfg.n_layers)
 
-    # ---- Save model.safetensors ----------------------------------------
-    try:
-        from safetensors.torch import save_file
-    except ImportError:
-        raise ImportError("pip install safetensors")
+    is_phi = (
+        str(model_config).lower().startswith("phi")
+        or "phi" in str(base_model).lower()
+    )
+    if is_phi:
+        print("Fusing decoder projections for Phi3ForCausalLM ...")
+        hf_decoder_sd = _fuse_llama_to_phi3(hf_decoder_sd, llama_cfg.n_layers)
 
-    model_out = os.path.join(output_dir, "model.safetensors")
-    print(f"Saving {model_out} ...")
-    # clone() breaks weight-tying between embed_tokens and lm_head so safetensors
-    # doesn't complain about shared memory (they map to separate tensors on disk)
-    save_file({k: v.contiguous().clone() for k, v in hf_decoder_sd.items()}, model_out)
+    # A v2 release is self-contained: standard config/tokenizer + decoder
+    # shards live beside zip2zip_config.json, so AutoModel can load them directly.
+    from transformers import AutoConfig
+    hf_config = AutoConfig.from_pretrained(base_model)
+    hf_config.vocab_size = vocab_size
+    hf_config.tie_word_embeddings = llama_cfg.tie_word_embeddings
+    hf_config.max_position_embeddings = llama_cfg.rope.max_seq_len
+    hf_config.rope_theta = llama_cfg.rope.theta
+    if is_phi:
+        # These core checkpoints were trained with unscaled complex RoPE.
+        # In particular, inheriting Phi-3.5-mini's upstream LongRoPE vectors
+        # here would silently change every decoder layer after export.
+        hf_config.rope_scaling = None
+        hf_config.sliding_window = None
+        if hasattr(hf_config, "original_max_position_embeddings"):
+            hf_config.original_max_position_embeddings = 4096
+    hf_config.torch_dtype = torch.bfloat16
+    hf_config.save_pretrained(output_dir)
+
+    print(f"Saving decoder in <= {max_shard_size} bfloat16 shards ...")
+    _save_sharded_safetensors(
+        hf_decoder_sd,
+        output_dir,
+        max_shard_size=max_shard_size,
+        dtype=torch.bfloat16,
+    )
 
     # ---- Save encoders.safetensors -------------------------------------
-    encoders_out = os.path.join(output_dir, "encoders.safetensors")
+    encoders_out = os.path.join(output_dir, "zip2zip_encoders.safetensors")
     print(f"Saving {encoders_out} ...")
     # input_encoder.* always; output_encoder.* only when untied (tie_encoders
     # is then False and the ext runtime scores logits with the output encoder).
@@ -400,7 +503,11 @@ def export(
         )
     print(f"  tie_encoders={not untied} (input_encoder + "
           f"{'output_encoder' if untied else 'no output_encoder'})")
-    save_file(enc_prefixed, encoders_out)
+    from safetensors.torch import save_file
+    save_file(
+        {key: value.to(dtype=torch.bfloat16).contiguous() for key, value in enc_prefixed.items()},
+        encoders_out,
+    )
 
     # ---- Build zip2zip_config.json -------------------------------------
     n_heads = _resolve_encoder_n_heads(ckpt_dir, enc_info["hidden_size"], encoder_n_heads)
@@ -416,16 +523,21 @@ def export(
         print(f"Loading tokenizer from {base_model} to compute disabled_ids ...")
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(base_model)
+        # The model vocabulary is authoritative. Phi-3 reserves rows up to
+        # 32063 while its tokenizer currently exposes only 32011 entries;
+        # using len(tokenizer) would shift every exported hypertoken by 53.
         disabled_ids = compute_disabled_ids(
-            tok, len(tok), disable_digit_ids=disable_digit_ids
+            tok, vocab_size, disable_digit_ids=disable_digit_ids
         )
-        initial_vocab_size = len(tok)
+        initial_vocab_size = vocab_size
         print(f"  initial_vocab_size={initial_vocab_size}, disabled_ids count={len(disabled_ids)}")
         print(f"Saving tokenizer to {output_dir} ...")
         tok.save_pretrained(output_dir)
 
     config = {
-        "base_model_name_or_path": base_model,
+        "format_version": 2,
+        "base_model_name_or_path": ".",
+        "position_mode": position_mode,
         "encoder_type": "res_latent_attn",
         "encoder": {
             "hidden_size": enc_info["hidden_size"],
@@ -459,7 +571,18 @@ def export(
         print(f"  copied meta.pt (for check_export_consistency.py)")
 
     print("\nDone. Output:")
-    for fn in ("zip2zip_config.json", "model.safetensors", "encoders.safetensors"):
+    output_files = [
+        "zip2zip_config.json",
+        *sorted(
+            fn
+            for fn in os.listdir(output_dir)
+            if fn == "model.safetensors"
+            or fn == "model.safetensors.index.json"
+            or (fn.startswith("model-") and fn.endswith(".safetensors"))
+        ),
+        "zip2zip_encoders.safetensors",
+    ]
+    for fn in output_files:
         path = os.path.join(output_dir, fn)
         size_mb = os.path.getsize(path) / 1e6
         print(f"  {fn:30s} {size_mb:8.1f} MB")

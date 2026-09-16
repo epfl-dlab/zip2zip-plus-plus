@@ -1,7 +1,7 @@
 """Sanity-check exported HF config against training metadata.
 
 Examples:
-  python scripts/zip2zip_hf/check_export_consistency.py --repo epfl-dlab/candidate-Llaza-MS4-flat-20BT
+  python scripts/zip2zip_hf/check_export_consistency.py --repo epfl-dlab/<model-repo>
   python scripts/zip2zip_hf/check_export_consistency.py --export_dir /path/to/export
 """
 
@@ -22,7 +22,7 @@ def _load_from_repo(repo: str, revision: str) -> tuple[dict, dict]:
     with open(cfg_path) as f:
         cfg = json.load(f)
 
-    # export.py / export_phi.py now copy meta.pt alongside the exported
+    # export.py copies meta.pt alongside the exported
     # weights, so newer "hf"-branch pushes have it directly at `revision`.
     # Older exports (pushed before that) only ever had it on "main" (the
     # training-checkpoint branch) -- fall back there so both still work.
