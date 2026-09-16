@@ -44,8 +44,8 @@ Run names are auto-generated as `eval-{ckpt_name}` or `eval-{repo}-{revision}`.
 
 ```bash
 python scripts/eval_harness.py \
-    --hf_repo epfl-dlab/Llaza-3.2-1B-v0.1 \
-    --hf_revision step_6000 \
+    --hf_repo epfl-dlab/<model-repo> \
+    --hf_revision main \
     --resume_wandb_id none
 ```
 
@@ -396,7 +396,7 @@ cd ext/zip2zip
 pip install -e ".[eval]"
 
 python bench/run_harness_pretrained.py \
-    epfl-dlab/Llaza-3.2-1B-MS2F-4K-v0.1 \
+    epfl-dlab/<model-repo> \
     --revision hf \
     --tasks hellaswag piqa winogrande \
     --limit 200

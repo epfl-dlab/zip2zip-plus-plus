@@ -1,30 +1,29 @@
-# Model Inventory
+# Model and data inventory
 
-Trained models and checkpoints hosted on [HuggingFace Hub](https://huggingface.co/epfl-dlab).
+## Zip2Zip++ release targets
 
-## Production models
+The guarded release path supports exactly four base-model families. Fill in the
+final repository IDs when the releases are created.
 
-| Model | Base | max_subtokens | HF Repo | Notes |
-|-------|------|---------------|---------|-------|
-| — | — | — | — | TODO |
+| Release | Base model | HF repository |
+|---|---|---|
+| Zip2Zip++ Llama 1B | `meta-llama/Llama-3.2-1B-Instruct` | TBD |
+| Zip2Zip++ Llama 3B | `meta-llama/Llama-3.2-3B-Instruct` | TBD |
+| Zip2Zip++ Phi 4B | `microsoft/Phi-3.5-mini-instruct` | TBD |
+| Zip2Zip++ Phi 14B | `microsoft/Phi-3-medium-4k-instruct` | TBD |
 
-## Candidate models (from training runs)
-
-| Model | Base | max_subtokens | HF Repo | W&B Run | Notes |
-|-------|------|---------------|---------|---------|-------|
-| — | — | — | — | — | TODO |
+Each repository uses `main` for the original training checkpoint and `hf` for
+the inference export.
 
 ## Datasets
 
+The Llaza data assets and preprocessing support are intentionally retained.
+
 | Dataset | Tokens | URL |
-|---------|--------|-----|
+|---|---:|---|
 | llaza-200B | 200B | [epfl-dlab/llaza-200B](https://huggingface.co/datasets/epfl-dlab/llaza-200B) |
 | llaza-20B | 20B | [epfl-dlab/llaza-20B](https://huggingface.co/datasets/epfl-dlab/llaza-20B) |
 | llaza-1B | 1B | [epfl-dlab/llaza-1B](https://huggingface.co/datasets/epfl-dlab/llaza-1B) |
 
-## Naming conventions
-
-- **Production**: `epfl-dlab/Llaza-{base}-{config}-{version}` (e.g. `epfl-dlab/Llaza-3.2-1B-MS2F-4K-v0.1`)
-- **Candidate**: `epfl-dlab/candidate-{run_name}` (auto-generated during training)
-
-Each repo has two branches: `main` (torchtitan training checkpoint) and `hf` (exported HF format for inference).
+Candidate repositories produced during training are development artifacts and
+are not part of the four-model public release contract.

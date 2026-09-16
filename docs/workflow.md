@@ -1,85 +1,75 @@
-# Workflow: Train → Evaluate → Publish
+# Train, evaluate, and publish Zip2Zip++
 
-A typical end-to-end workflow for training a model, evaluating it, and publishing to HuggingFace Hub.
+## 1. Prepare data
 
-## 1. Train
+The project continues to use the Llaza preprocessing pipeline:
+
+```bash
+python scripts/pretokenize.py \
+    --dataset epfl-dlab/llaza-20B \
+    --output_dir /path/to/tokens
+```
+
+See [Data Pipeline](data.md) for sharding, tokenizer, and compression options.
+
+## 2. Train
 
 ```bash
 uv run torchrun --nproc_per_node=4 -m zip2zip_core.train \
     --data_dir /path/to/tokens \
     --output_dir /path/to/checkpoints \
     --model_config 1B \
-    --max_subtokens 2 \
-    --steps 6000 \
-    --wandb --wandb_name llaza_1b_ms2
+    --init_from_hf meta-llama/Llama-3.2-1B-Instruct \
+    --max_subtokens 4 \
+    --wandb --wandb_name zip2zippp-1b
 ```
 
-Note the W&B run ID from the output (e.g. `8d11iyds`), or find it on the [W&B dashboard](https://wandb.ai/epfl-dlab/llaza).
+Training still supports local checkpoint save/resume and optional background
+uploads of step revisions. The production release command does not replace or
+modify those functions.
 
-## 2. Evaluate (log to the same W&B run)
+## 3. Evaluate
 
 ```bash
 python scripts/eval_harness.py \
-    --ckpt_dir /path/to/checkpoints/step_6000 \
-    --resume_wandb_id 8d11iyds
+    --ckpt_dir /path/to/checkpoints/step_8000 \
+    --resume_wandb_id none
 ```
 
-This runs lm-evaluation-harness benchmarks and logs metrics + per-sample results back into the same W&B run, so training and eval data live together.
-
-## 3. Publish to HuggingFace Hub
-
-If the results look good, push the checkpoint. This auto-exports to HF format on the `hf` branch:
+## 4. Build and inspect the release
 
 ```bash
 python scripts/push_checkpoint.py \
-    --ckpt_dir /path/to/checkpoints/step_6000 \
-    --repo_id epfl-dlab/Llaza-3.2-1B-MS2-v0.1
+    --ckpt-dir /path/to/checkpoints/step_8000 \
+    --repo-id epfl-dlab/<model-repo> \
+    --output-dir /path/to/export
 ```
 
-What happens:
-1. Generates a model card from training args
-2. Uploads training checkpoint to `main` branch
-3. Auto-exports to HF format (safetensors + zip2zip_config.json)
-4. Uploads exported model to `hf` branch
+The command fails before upload unless the checkpoint matches one of the four
+supported Zip2Zip++ recipes and the export is complete.
 
-Skip auto-export with `--no_export` if you only want the training checkpoint.
-
-If the checkpoint was trained from scratch and `meta.pt` has no `init_from_hf`, you can still keep the one-command flow by overriding the export metadata:
+## 5. Publish
 
 ```bash
 python scripts/push_checkpoint.py \
-    --ckpt_dir /path/to/checkpoints/step_6000 \
-    --repo_id epfl-dlab/Llaza-3.2-1B-MS2-v0.1 \
-    --export_base_model meta-llama/Llama-3.2-1B \
-    --export_model_config 1B
+    --ckpt-dir /path/to/checkpoints/step_8000 \
+    --repo-id epfl-dlab/<model-repo> \
+    --upload
 ```
 
-## 4. Verify
+The resulting revisions are:
+
+```text
+main  -> original training checkpoint
+hf    -> validated, self-contained inference model
+```
+
+## 6. Verify the public revision
 
 ```python
-from zip2zip import Zip2ZipModel
+from zip2zip import Zip2ZipModel, Zip2ZipTokenizer
 
-model = Zip2ZipModel.from_pretrained(
-    "epfl-dlab/Llaza-3.2-1B-MS2-v0.1", revision="hf"
-)
-```
-
-## Summary
-
-```
-train (--wandb)
-  │
-  ├── W&B run created (run_id: 8d11iyds)
-  └── checkpoint saved to /path/to/step_6000
-          │
-          ▼
-eval_harness.py --resume_wandb_id 8d11iyds
-  │
-  └── metrics + samples logged to same W&B run
-          │
-          ▼
-push_checkpoint.py --repo_id epfl-dlab/Llaza-...
-  │
-  ├── main branch  ← training checkpoint (model.pt)
-  └── hf branch    ← exported HF format (safetensors)
+repo_id = "epfl-dlab/<model-repo>"
+tokenizer = Zip2ZipTokenizer.from_pretrained(repo_id, revision="hf")
+model = Zip2ZipModel.from_pretrained(repo_id, revision="hf")
 ```

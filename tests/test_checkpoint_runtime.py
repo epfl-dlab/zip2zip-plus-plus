@@ -18,6 +18,7 @@ from zip2zip_core.export import (
     _prepare_export_state_dict,
     _validate_hf_decoder_state_dict,
     refuse_base_token_positions,
+    _position_mode_from_meta,
 )
 from zip2zip_core.train import _clean_state_dict
 
@@ -127,6 +128,14 @@ def test_gated_rope_export_is_refused(tmp_path):
     )
     with pytest.raises(NotImplementedError, match="gated_compressed_rope"):
         refuse_base_token_positions(str(tmp_path))
+
+
+def test_base_token_positions_export_as_v2_position_mode(tmp_path):
+    torch.save(
+        {"args": {"base_token_positions": True}},
+        tmp_path / "meta.pt",
+    )
+    assert _position_mode_from_meta(str(tmp_path)) == "base_token_end"
 
 
 def test_export_lora_requires_and_uses_checkpoint_metadata(tmp_path):
