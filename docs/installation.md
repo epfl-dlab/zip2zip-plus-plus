@@ -11,7 +11,7 @@
 Clone with submodules:
 
 ```bash
-git clone --recurse-submodules https://github.com/epfl-dlab/zip2zip-plus-plus.git
+git clone --recurse-submodules https://github.com/Saibo-creator/zip2zip-plus-plus.git
 cd zip2zip-plus-plus
 ```
 
