@@ -7,6 +7,6 @@
 [submodule "ext/zip2zip"]
 	path = ext/zip2zip
 	url = https://github.com/epfl-dlab/zip2zip.git
-[submodule "ext/zip2zip-hyperenc_probe"]
-	path = ext/zip2zip-hyperenc_probe
+[submodule "ext/zip2zip-plus-plus-hyperenc-probe"]
+	path = ext/zip2zip-plus-plus-hyperenc-probe
 	url = https://github.com/mxx28/zip2zip-plus-plus-hyperenc-probe.git

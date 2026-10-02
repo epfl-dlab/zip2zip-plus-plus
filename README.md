@@ -116,8 +116,8 @@ See [Export and interoperability](docs/export.md) for format details.
 ## Paper reproduction
 
 The hyper-encoder embedding probes (substitution and sequence probes) used in
-the paper live in the `ext/zip2zip-hyperenc_probe` submodule. See its
-[README](ext/zip2zip-hyperenc_probe/README.md) for reproduction commands.
+the paper live in the `ext/zip2zip-plus-plus-hyperenc-probe` submodule. See its
+[README](ext/zip2zip-plus-plus-hyperenc-probe/README.md) for reproduction commands.
 
 ## Documentation
 
