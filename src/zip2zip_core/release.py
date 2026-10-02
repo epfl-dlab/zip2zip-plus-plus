@@ -255,8 +255,8 @@ output = model.generate(**inputs, max_new_tokens=100)
 print(tokenizer.decode(output[0], skip_special_tokens=True))
 ```
 
-Use `main` only with zip2zip-core when resuming training or reproducing the
-export. It is not a Transformers/zip2zip inference revision.
+Use `main` only with [zip2zip-plus-plus](https://github.com/epfl-dlab/zip2zip-plus-plus)
+when resuming training or reproducing the export. It is not a Transformers/zip2zip inference revision.
 """
 
 
