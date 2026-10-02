@@ -62,7 +62,7 @@ presets:
     fewshot_as_multiturn: true
 
   perplexity:
-    description: "Byte-level perplexity on four corpora (matches paper Table 3, 1024-token window)"
+    description: "Byte-level perplexity on WikiText, Pile, and English C4 variants (1024-token window; corpus mapping in docs/evaluation.md)"
     tasks: [wikitext, zip2zip_pile, zip2zip_mc4, zip2zip_dc4]
     num_fewshot: 0
     max_length: 1024
@@ -78,7 +78,7 @@ presets:
   # the tasks differ. eval_ckpt_rcp.sh logs these runs under subset_ppl/ so
   # subset numbers never share a panel with full-corpus numbers.
   perplexity_subset:
-    description: "Quick perplexity: full wikitext + pinned 1k-doc subsets of Pile/mC4/dC4 (1024-token window, logged under subset_ppl/)"
+    description: "Quick perplexity: full WikiText + pinned 1k-doc subsets of Pile and English C4 variants (1024-token window, logged under subset_ppl/)"
     tasks: [wikitext, zip2zip_pile_sub1k, zip2zip_mc4_sub1k, zip2zip_dc4_sub1k]
     num_fewshot: 0
     max_length: 1024
