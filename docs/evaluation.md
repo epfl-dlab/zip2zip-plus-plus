@@ -97,9 +97,9 @@ override preset values.
 | Preset | Use case |
 |--------|----------|
 | `default` | Full MC + generation benchmarks, 2-shot, chat template (paper Table 3 set + triviaqa) |
-| `perplexity` | Byte-level PPL on WikiText, Pile, and two English C4 variants; 1024-token rolling window |
+| `perplexity` | Byte-level PPL on WikiText, Pile, mC4 (C4/en), and dC4 (C4/en.noblocklist), using the configured validation files; 1024-token rolling window |
 | `default_base` | Same as `default` but no chat template (from-scratch/non-instruct models) |
-| `perplexity_subset` | Quick PPL: full WikiText + pinned 1k-doc subsets of Pile and the same English C4 variants, logged under `subset_ppl/` |
+| `perplexity_subset` | Paper's corpus/subset setup: full WikiText + fixed 1,000-doc subsets of Pile, mC4 (C4/en), and dC4 (C4/en.noblocklist); seed 1234, 1024-token window, logged under `subset_ppl/` |
 | `postsft` | Paper Table 2 generation set: MATH-500, HumanEval-instruct, IFEval — per-task few-shot, chat template |
 | `smoke` | 20 samples/task, no W&B — quick sanity check |
 
@@ -107,20 +107,22 @@ override preset values.
 
 ### Perplexity corpus names and comparison protocol
 
-The C4 task IDs are historical aliases. Both use `allenai/c4`, with these exact
+The paper uses **mC4 (C4/en)** and **dC4 (C4/en.noblocklist)**, the latter
+without bad-word filtering. Both tasks load `allenai/c4`, with these exact
 validation files:
 
-| Task ID | Validation file |
-|---|---|
-| `zip2zip_mc4` | `en/c4-validation.00000-of-00008.json.gz` |
-| `zip2zip_dc4` | `en.noblocklist/c4-validation.00000-of-00008.json.gz` |
+| Paper name | Task ID | Validation file |
+|---|---|---|
+| mC4 (C4/en) | `zip2zip_mc4` | `en/c4-validation.00000-of-00008.json.gz` |
+| dC4 (C4/en.noblocklist) | `zip2zip_dc4` | `en.noblocklist/c4-validation.00000-of-00008.json.gz` |
 
-Their `_sub1k` variants select pinned subsets from the same files. These names
-do not identify multilingual mC4 or a C4-100-domains/Paloma evaluation. The presets
-alone do not establish equivalence to the paper's corpus definitions. Before
-comparing against a paper result, match its dataset/configuration and filtering
-to the experiment artifacts. See [#20](https://github.com/epfl-dlab/zip2zip-plus-plus/issues/20)
-for the audit summary. Task IDs are retained so existing result keys remain readable.
+The paper's appendix, "Perplexity corpora and the fixed subsets," specifies the
+full WikiText-2 (raw) test set and fixed subsets of **1,000 documents per corpus**
+for Pile, mC4, and dC4, drawn once with **seed 1234**. Use
+`--preset perplexity_subset` for this corpus/subset setup, with a 1024-token
+window. Its C4 `_sub1k` tasks select subsets from the files listed above, and
+results are logged under `subset_ppl/`. The `perplexity` preset instead scores
+the configured validation files without the 1,000-document subsampling.
 
 For checkpoint PPL comparisons, use `eval_harness.py` consistently. The two PPL
 presets currently omit `apply_chat_template` and `fewshot_as_multiturn`, while

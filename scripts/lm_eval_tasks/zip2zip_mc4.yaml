@@ -1,5 +1,5 @@
-# Historical task ID: rolling perplexity on the English C4 shard below.
-# This is not multilingual mC4. See docs/evaluation.md for corpus mapping.
+# Paper benchmark mC4 (C4/en): rolling perplexity on the validation shard below.
+# See docs/evaluation.md for the corpus mapping and paper subset preset.
 task: zip2zip_mc4
 dataset_path: allenai/c4
 test_split: validation
