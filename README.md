@@ -7,6 +7,26 @@ This repository contains the distributed training implementation and the data
 pipeline. The user-facing Hugging Face runtime lives in
 [zip2zip](https://github.com/epfl-dlab/zip2zip).
 
+Try the [Zip2Zip++ demo](https://zip2zip-tokenizer-main-zygo.vercel.app/) — it
+visualizes the hypertoken codebook and compares original, optimal, and
+model-produced tokenizations side by side.
+
+## Released models
+
+All released checkpoints live in the
+[epfl-dlab/zip2zip++ collection](https://huggingface.co/collections/epfl-dlab/zip2zip).
+
+Each model repository follows the revision contract described in
+[Release a Zip2Zip++ checkpoint](#release-a-zip2zip-checkpoint): load the `hf`
+revision for inference.
+
+| Model | Base model | Params |
+|---|---|---|
+| [`epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct`](https://huggingface.co/epfl-dlab/zip2zip-pp-Llama-3.2-1B-Instruct) | `meta-llama/Llama-3.2-1B-Instruct` | 1B |
+| [`epfl-dlab/zip2zip-pp-Llama-3.2-3B-Instruct`](https://huggingface.co/epfl-dlab/zip2zip-pp-Llama-3.2-3B-Instruct) | `meta-llama/Llama-3.2-3B-Instruct` | 3B |
+| [`epfl-dlab/zip2zip-pp-Phi-3.5-mini-instruct`](https://huggingface.co/epfl-dlab/zip2zip-pp-Phi-3.5-mini-instruct) | `microsoft/Phi-3.5-mini-instruct` | 3.8B |
+| [`epfl-dlab/zip2zip-pp-Phi-3-medium-4k-instruct`](https://huggingface.co/epfl-dlab/zip2zip-pp-Phi-3-medium-4k-instruct) | `microsoft/Phi-3-medium-4k-instruct` | 14B |
+
 ## Setup
 
 ```bash
