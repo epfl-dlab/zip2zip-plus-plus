@@ -17,7 +17,7 @@ Each of the four Zip2Zip++ model repositories has two revisions:
 
 | Revision | Content |
 |---|---|
-| `main` | Original zip2zip-core checkpoint for resume/reproduction |
+| `main` | Original zip2zip-plus-plus checkpoint for resume/reproduction |
 | `hf` | Validated self-contained export for `zip2zip` inference |
 
 Publish only through the guarded command:

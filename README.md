@@ -1,4 +1,4 @@
-# zip2zip-core
+# zip2zip-plus-plus
 
 Training, evaluation, and release tooling for **Zip2Zip++**, a language-model
 architecture with inference-time adaptive tokenization via LZW hypertokens.
@@ -10,8 +10,8 @@ pipeline. The user-facing Hugging Face runtime lives in
 ## Setup
 
 ```bash
-git clone --recurse-submodules https://github.com/epfl-dlab/zip2zip-core.git
-cd zip2zip-core
+git clone --recurse-submodules https://github.com/Saibo-creator/zip2zip-plus-plus.git
+cd zip2zip-plus-plus
 uv sync
 ```
 
@@ -76,7 +76,7 @@ Each model repository uses the same revision contract:
 
 | Revision | Contents | Intended use |
 |---|---|---|
-| `main` | Original `model.pt`, `meta.pt`, and checkpoint files | Resume and reproduction with zip2zip-core |
+| `main` | Original `model.pt`, `meta.pt`, and checkpoint files | Resume and reproduction with zip2zip-plus-plus |
 | `hf` | Config, tokenizer, encoders, and sharded safetensors | Inference with `zip2zip` |
 
 Users must load the `hf` revision:
@@ -113,6 +113,6 @@ the paper live in the `ext/zip2zip-hyperenc_probe` submodule. See its
 
 ## License
 
-zip2zip-core is released under the MIT License (see [LICENSE](LICENSE)). The
+zip2zip-plus-plus is released under the MIT License (see [LICENSE](LICENSE)). The
 vendored submodules keep their own licenses: `ext/zip2zip` (Apache-2.0),
 `ext/zip2zip-compression` (MIT), `ext/torchtitan` (BSD-3-Clause).

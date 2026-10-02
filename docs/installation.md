@@ -11,8 +11,8 @@
 Clone with submodules:
 
 ```bash
-git clone --recurse-submodules https://github.com/epfl-dlab/zip2zip-core.git
-cd zip2zip-core
+git clone --recurse-submodules https://github.com/Saibo-creator/zip2zip-plus-plus.git
+cd zip2zip-plus-plus
 ```
 
 Install everything (creates venv, builds zip2zip-compression from Rust, installs torchtitan from submodule):
