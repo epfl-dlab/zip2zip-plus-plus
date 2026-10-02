@@ -1,9 +1,9 @@
-# Historical task ID: rolling perplexity on the English C4 noblocklist shard below.
-# This is not C4-100-domains/Paloma. See docs/evaluation.md for corpus mapping.
+# Paper benchmark dC4 (C4/en.noblocklist): rolling perplexity on the shard below.
+# See docs/evaluation.md for the corpus mapping and paper subset preset.
 task: zip2zip_dc4
 dataset_path: allenai/c4
 test_split: validation
-# Pin one validation shard from the noblocklist (deduped) variant; same
+# Pin one validation shard from the variant without bad-word filtering; same
 # rationale as zip2zip_mc4 — avoid pulling the train split.
 dataset_kwargs:
   data_files:
