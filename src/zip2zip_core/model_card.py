@@ -40,7 +40,7 @@ def write_model_card(path: str, repo_id: str, step: int, train_args: dict):
         "",
         f"# {repo_id.split('/')[-1]}",
         "",
-        "Training checkpoint from [zip2zip-core](https://github.com/epfl-dlab/zip2zip-core).",
+        "Training checkpoint from [zip2zip-plus-plus](https://github.com/epfl-dlab/zip2zip-plus-plus).",
         "This is a **candidate** model (not production-ready).",
         "",
         "## Training Config",
