@@ -1,8 +1,5 @@
-# Rolling-perplexity over multilingual C4 (mC4).
-# Uses allenai/c4 with the "multilingual" config; HF requires a language
-# subset, so we default to English ("en"). To evaluate on a different
-# language change `dataset_name`, e.g. "fr", "de", "es", or to pull from the
-# legacy "mc4" dataset, edit dataset_path accordingly.
+# Historical task ID: rolling perplexity on the English C4 shard below.
+# This is not multilingual mC4. See docs/evaluation.md for corpus mapping.
 task: zip2zip_mc4
 dataset_path: allenai/c4
 test_split: validation

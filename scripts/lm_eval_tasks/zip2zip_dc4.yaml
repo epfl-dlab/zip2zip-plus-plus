@@ -1,8 +1,5 @@
-# Rolling-perplexity over deduplicated/uncleaned C4 ("dC4").
-# Uses allenai/c4 with the "en.noblocklist" config (deduplicated, no blocklist
-# filter — the variant typically referred to as dC4 in pretraining ablations).
-# Override `dataset_name` if you mean a different variant, e.g. "en.noclean",
-# or point dataset_path at allenai/dolma's c4 subset.
+# Historical task ID: rolling perplexity on the English C4 noblocklist shard below.
+# This is not C4-100-domains/Paloma. See docs/evaluation.md for corpus mapping.
 task: zip2zip_dc4
 dataset_path: allenai/c4
 test_split: validation

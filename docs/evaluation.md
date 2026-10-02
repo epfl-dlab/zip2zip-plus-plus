@@ -2,16 +2,41 @@
 
 ## Internal eval (loss/ppl/accuracy)
 
-Evaluate a checkpoint on held-out data (no gradient):
+For internal diagnostics with a compatible Llama checkpoint, use a batch size of
+one:
 
 ```bash
-bash scripts/eval_lm.sh /path/to/checkpoint
+LOCAL_BATCH_SIZE=1 bash scripts/eval_lm.sh /path/to/checkpoint
 
 # Specify model config and max_subtokens
-bash scripts/eval_lm.sh /path/to/checkpoint 400M 2
+MODEL_CONFIG=400M MAX_SUBTOKENS=2 LOCAL_BATCH_SIZE=1 \
+  bash scripts/eval_lm.sh /path/to/checkpoint
 ```
 
-Arguments: `<checkpoint_dir> [model_config=1B] [max_subtokens=4]`
+The checkpoint directory is the only positional argument; model settings are
+environment variables. The wrapper uses the default Llama tokenizer and fixed
+evaluation settings, so it does not automatically adapt to arbitrary checkpoints.
+For Phi and checkpoint-aware benchmark evaluation, use `eval_harness.py` below.
+
+**Known limitation ([#21](https://github.com/epfl-dlab/zip2zip-plus-plus/issues/21)).**
+With more than one sequence per batch, the internal relaxed loss/PPL/BPB can use
+stale candidate lengths from another sequence's codebook. `LOCAL_BATCH_SIZE=1`
+avoids this bug; set it explicitly because the wrapper still defaults to 8.
+The batched helper remains unfixed. Training loss, relaxed accuracy, and the
+separate multi-view scoring in `eval_harness.py` do not use this faulty calculation.
+
+### Historical research utilities
+
+- `measure_segmentation_shift.py` uses no protected token IDs. For
+  training-faithful measurements on shards containing special tokens, adapt its
+  compressor settings to the tokenizer/checkpoint first.
+- `sweep_finemath_merge_size.sh` retains historical `wo_remap` names but does not
+  disable remapping or enable the hyper-causal mask. Inspect the actual flags
+  before reusing it; the run name does not define the experimental condition.
+- For non-Llama tokenizers, direct callers of `Zip2ZipDataset` must supply the
+  tokenizer's `disabled_ids`;
+  the backward-compatible `None` default uses Llama special-token IDs. The normal
+  training entry point supplies the derived IDs explicitly.
 
 ## lm-evaluation-harness
 
@@ -72,13 +97,37 @@ override preset values.
 | Preset | Use case |
 |--------|----------|
 | `default` | Full MC + generation benchmarks, 2-shot, chat template (paper Table 3 set + triviaqa) |
-| `perplexity` | Byte-level PPL on wikitext/pile/mc4/dc4, 1024-token rolling window |
+| `perplexity` | Byte-level PPL on WikiText, Pile, and two English C4 variants; 1024-token rolling window |
 | `default_base` | Same as `default` but no chat template (from-scratch/non-instruct models) |
-| `perplexity_subset` | Quick PPL: full wikitext + pinned 1k-doc subsets of pile/mc4/dc4, logged under `subset_ppl/` |
+| `perplexity_subset` | Quick PPL: full WikiText + pinned 1k-doc subsets of Pile and the same English C4 variants, logged under `subset_ppl/` |
 | `postsft` | Paper Table 2 generation set: MATH-500, HumanEval-instruct, IFEval — per-task few-shot, chat template |
 | `smoke` | 20 samples/task, no W&B — quick sanity check |
 
 `TASKS=...` env var (or `--tasks`) restricts a preset to one task without editing the YAML.
+
+### Perplexity corpus names and comparison protocol
+
+The C4 task IDs are historical aliases. Both use `allenai/c4`, with these exact
+validation files:
+
+| Task ID | Validation file |
+|---|---|
+| `zip2zip_mc4` | `en/c4-validation.00000-of-00008.json.gz` |
+| `zip2zip_dc4` | `en.noblocklist/c4-validation.00000-of-00008.json.gz` |
+
+Their `_sub1k` variants select pinned subsets from the same files. These names
+do not identify multilingual mC4 or a C4-100-domains/Paloma evaluation. The presets
+alone do not establish equivalence to the paper's corpus definitions. Before
+comparing against a paper result, match its dataset/configuration and filtering
+to the experiment artifacts. See [#20](https://github.com/epfl-dlab/zip2zip-plus-plus/issues/20)
+for the audit summary. Task IDs are retained so existing result keys remain readable.
+
+For checkpoint PPL comparisons, use `eval_harness.py` consistently. The two PPL
+presets currently omit `apply_chat_template` and `fewshot_as_multiturn`, while
+`eval_harness.py` defaults both to false and the separate `eval_hf_model.py`
+defaults both to true. A shared preset name therefore does not specify identical
+protocol settings across these entry points; this is not evidence by itself that
+rolling-PPL scores differ.
 
 ### Post-SFT generation benchmarks (`postsft`, paper Table 2)
 

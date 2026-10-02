@@ -72,6 +72,13 @@ The release path requires:
 
 This check happens before either revision is uploaded.
 
+The separate `scripts/zip2zip_hf/check_export_consistency.py` utility is a limited
+development comparison, not the release validator above. It can skip comparisons
+when `meta.pt` is missing and still print a success message. Do not use that
+message to certify an export. For the four published recipes, use
+`scripts/push_checkpoint.py` without `--upload` to build and validate locally;
+the guarded path requires the matching metadata and validates the exported files.
+
 ## Manual development export
 
 For local experiments that are not one of the four releases, use the lower-level
