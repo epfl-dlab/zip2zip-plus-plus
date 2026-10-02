@@ -1,6 +1,6 @@
 # Export and interoperability
 
-zip2zip-core training checkpoints and user-facing `zip2zip` models use two
+zip2zip-plus-plus training checkpoints and user-facing `zip2zip` models use two
 different formats. A production model repository intentionally keeps both:
 
 | Revision | Format | Purpose |

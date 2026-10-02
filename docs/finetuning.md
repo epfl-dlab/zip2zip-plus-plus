@@ -67,7 +67,7 @@ Three things worth knowing about how it behaves:
 
 ## Overview
 
-zip2zip-core supports finetuning from existing HuggingFace Llama checkpoints. The decoder weights are loaded from the pretrained model, while the hyper-encoder and other zip2zip-specific components are randomly initialized and trained from scratch.
+zip2zip-plus-plus supports finetuning from existing HuggingFace Llama checkpoints. The decoder weights are loaded from the pretrained model, while the hyper-encoder and other zip2zip-specific components are randomly initialized and trained from scratch.
 
 ## Quick start
 
@@ -233,7 +233,7 @@ effective value).
 
 The released model uses two hyper-encoders — one embedding hypertokens on the
 input side (from `tok_embeddings`), one scoring them on the output side (from
-`lm_head`); zip2zip-core originally tied them into one, which a diagnostic showed
+`lm_head`); zip2zip-plus-plus originally tied them into one, which a diagnostic showed
 forces a single vector to straddle two geometries. The v0.5-untied run
 (2026-07-18, on top of v0.4-digitsafe) validated untying: every MC task moved up
 toward the uncompressed control (ARC-c acc_norm .540 → .561, now past the

@@ -1,7 +1,7 @@
 # Project structure
 
 ```text
-zip2zip-core/
+zip2zip-plus-plus/
 ├── src/zip2zip_core/
 │   ├── model.py          # Training model and hyper-encoders
 │   ├── configs.py        # Llama and Phi model configurations
@@ -29,7 +29,7 @@ zip2zip-core/
 
 ## Responsibility split
 
-- `zip2zip-core` owns data preparation, training, raw checkpoints, evaluation,
+- `zip2zip-plus-plus` owns data preparation, training, raw checkpoints, evaluation,
   conversion, and release validation.
 - `zip2zip` owns the lightweight user-facing tokenizer, model loader, and
   generation runtime.

@@ -2666,7 +2666,7 @@ name = "zip2zip-compression"
 source = { directory = "ext/zip2zip-compression" }
 
 [[package]]
-name = "zip2zip-core"
+name = "zip2zip-plus-plus"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
