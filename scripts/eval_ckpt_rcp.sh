@@ -143,6 +143,9 @@ EVAL_MODE=${EVAL_MODE:-}
 # "0" normalizes to off so it cannot half-trigger the :+ passthrough.
 EVAL_MAX_SUBTOKENS=${EVAL_MAX_SUBTOKENS:-}
 [ "$EVAL_MAX_SUBTOKENS" = "0" ] && EVAL_MAX_SUBTOKENS=""
+# EVAL_MAX_CODEBOOK_SIZE: eval-only LZW codebook-capacity override (0..ckpt max).
+# Unset ("") follows meta.pt; "0" is a valid override (0 merges -> base mode).
+EVAL_MAX_CODEBOOK_SIZE=${EVAL_MAX_CODEBOOK_SIZE:-}
 # DISABLE_DIGIT_IDS=1: diagnostic — digits never LZW-merge into hypertokens.
 # "0" is normalized to off ("" ) so it cannot half-trigger the :+ passthrough.
 DISABLE_DIGIT_IDS=${DISABLE_DIGIT_IDS:-}
@@ -219,6 +222,8 @@ TASKS_SUFFIX=${TASKS:+_${TASKS//,/-}}
 # from overwriting one another.
 MODE_TAG=$(printf '%s' "${EVAL_MODE:-auto}" | tr -cs '[:alnum:]._-' '_')
 VARIANT_TAG="mode-${MODE_TAG}"
+[ -n "$EVAL_MAX_SUBTOKENS" ] && VARIANT_TAG="${VARIANT_TAG}-ms${EVAL_MAX_SUBTOKENS}"
+[ -n "$EVAL_MAX_CODEBOOK_SIZE" ] && VARIANT_TAG="${VARIANT_TAG}-cb${EVAL_MAX_CODEBOOK_SIZE}"
 [ -n "$DISABLE_DIGIT_IDS" ] && VARIANT_TAG="${VARIANT_TAG}-nodigits"
 [ -n "$DISABLE_MATHSYM_IDS" ] && VARIANT_TAG="${VARIANT_TAG}-nomathsym"
 [ -n "$NO_ONLINE_CODEBOOK_MASK" ] && VARIANT_TAG="${VARIANT_TAG}-legacycbmask"
@@ -347,6 +352,7 @@ echo "  RULER_LEN:   ${RULER_LENGTHS:-<preset default>}"
 echo "  ROPE_SOURCE: ${ROPE_SOURCE:-<checkpoint base>}"
 echo "  VARIANT:     $VARIANT_TAG"
 echo "  EVAL_MS:     ${EVAL_MAX_SUBTOKENS:-<checkpoint>}"
+echo "  EVAL_CB:     ${EVAL_MAX_CODEBOOK_SIZE:-<checkpoint>}"
 echo "  WANDB:       $WANDB${WANDB_NAME:+ (name: eval-$WANDB_NAME)}${WANDB_PROJECT:+ (project: $WANDB_PROJECT)}"
 echo "  RESUME_ID:   ${RESUME_WANDB_ID:-<none>}${RESUME_WANDB_ID:+ (prefix: $WANDB_PREFIX${WANDB_STEP:+, step: $WANDB_STEP})}"
 echo "  LOGFILE:     $LOGFILE"
@@ -362,6 +368,7 @@ if [ -n "$CKPT_DIR" ]; then
         --output_path "$OUTPUT_JSON" \
         ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
         ${EVAL_MAX_SUBTOKENS:+--eval_max_subtokens "$EVAL_MAX_SUBTOKENS"} \
+        ${EVAL_MAX_CODEBOOK_SIZE:+--eval_max_codebook_size "$EVAL_MAX_CODEBOOK_SIZE"} \
         ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
         ${DISABLE_MATHSYM_IDS:+--disable_mathsym_ids} \
         ${NO_ONLINE_CODEBOOK_MASK:+--no_online_codebook_mask} \
@@ -381,6 +388,7 @@ else
         --output_path "$OUTPUT_JSON" \
         ${EVAL_MODE:+--eval_mode "$EVAL_MODE"} \
         ${EVAL_MAX_SUBTOKENS:+--eval_max_subtokens "$EVAL_MAX_SUBTOKENS"} \
+        ${EVAL_MAX_CODEBOOK_SIZE:+--eval_max_codebook_size "$EVAL_MAX_CODEBOOK_SIZE"} \
         ${DISABLE_DIGIT_IDS:+--disable_digit_ids} \
         ${DISABLE_MATHSYM_IDS:+--disable_mathsym_ids} \
         ${NO_ONLINE_CODEBOOK_MASK:+--no_online_codebook_mask} \
@@ -396,10 +404,12 @@ fi
 # Same audit as the pipeline: the results JSON must record the flags we asked
 # for — a silently dropped flag fails loudly instead of producing numbers from
 # the wrong distribution.
-if [ -n "${EVAL_MODE:-}" ] || [ -n "${EVAL_MAX_SUBTOKENS:-}" ] || [ -n "${DISABLE_DIGIT_IDS:-}" ] || [ -n "${DISABLE_MATHSYM_IDS:-}" ]; then
-    python - "$OUTPUT_JSON" "${EVAL_MODE:-}" "${EVAL_MAX_SUBTOKENS:-}" "${DISABLE_DIGIT_IDS:-}" "${DISABLE_MATHSYM_IDS:-}" <<'PY'
+if [ -n "${EVAL_MODE:-}" ] || [ -n "${EVAL_MAX_SUBTOKENS:-}" ] || [ -n "${EVAL_MAX_CODEBOOK_SIZE:-}" ] || [ -n "${DISABLE_DIGIT_IDS:-}" ] || [ -n "${DISABLE_MATHSYM_IDS:-}" ]; then
+    python - "$OUTPUT_JSON" "${EVAL_MODE:-}" "${EVAL_MAX_SUBTOKENS:-}" "${EVAL_MAX_CODEBOOK_SIZE:-}" "${DISABLE_DIGIT_IDS:-}" "${DISABLE_MATHSYM_IDS:-}" <<'PY'
 import json, sys
-path, want_mode, want_ms, want_digits, want_syms = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+path, want_mode, want_ms, want_cb, want_digits, want_syms = (
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+)
 args = json.load(open(path))["args"]
 if want_mode:
     got = args["eval_mode"]
@@ -407,6 +417,9 @@ if want_mode:
 if want_ms:
     got = args.get("eval_max_subtokens")
     assert got == int(want_ms), f"eval-max-subtokens audit FAILED: {path} recorded {got!r}, expected {want_ms}"
+if want_cb:
+    got = args.get("eval_max_codebook_size")
+    assert got == int(want_cb), f"eval-max-codebook-size audit FAILED: {path} recorded {got!r}, expected {want_cb}"
 if want_digits:
     got = args.get("disable_digit_ids")
     assert got is True, f"digit-flag audit FAILED: {path} recorded disable_digit_ids={got!r}, expected True"

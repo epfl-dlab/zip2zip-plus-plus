@@ -236,18 +236,28 @@ def _load_zip2zip_checkpoint(
                 f"eval_max_subtokens must be positive, got {eval_max_subtokens}"
             )
         if eval_max_subtokens != checkpoint_max_subtokens:
-            if cfg.hyper_encoder_type not in ("hierarchical", "fast_hierarchical"):
-                raise ValueError(
-                    "eval_max_subtokens can only change checkpoint max_subtokens "
-                    "for hierarchical encoders. Flat hyper-encoders have "
-                    "length-shaped positional embeddings, so this override would "
-                    "not load the checkpoint safely."
+            if cfg.hyper_encoder_type in ("hierarchical", "fast_hierarchical"):
+                cfg = dataclasses.replace(cfg, max_subtokens=eval_max_subtokens)
+                print(
+                    "[zip2zip-lm-eval] eval max_subtokens override: "
+                    f"checkpoint={checkpoint_max_subtokens} eval={eval_max_subtokens}"
                 )
-            cfg = dataclasses.replace(cfg, max_subtokens=eval_max_subtokens)
-            print(
-                "[zip2zip-lm-eval] eval max_subtokens override: "
-                f"checkpoint={checkpoint_max_subtokens} eval={eval_max_subtokens}"
-            )
+            elif eval_max_subtokens > checkpoint_max_subtokens:
+                raise ValueError(
+                    "eval_max_subtokens cannot exceed checkpoint max_subtokens "
+                    f"({checkpoint_max_subtokens}) for Flat hyper-encoders. "
+                    "Flat hyper-encoders have length-shaped positional embeddings, "
+                    "so widening max_subtokens would not load the checkpoint safely."
+                )
+            else:
+                # Narrowing (1 <= eval_max_subtokens < checkpoint_max_subtokens) on
+                # a flat hyper-encoder: keep cfg.max_subtokens at the checkpoint's
+                # width so pos_embed loads strict=True and codebook tensors
+                # right-pad with pad_token_id, while LZW uses eval_max_subtokens.
+                print(
+                    "[zip2zip-lm-eval] eval max_subtokens narrowed on flat encoder: "
+                    f"checkpoint={checkpoint_max_subtokens} eval={eval_max_subtokens}"
+                )
 
     # Build straight on the target device: a CPU build followed by .to(device)
     # would hold a second fp32 copy of the model in host memory.
@@ -295,6 +305,7 @@ class Zip2ZipLM(LM):
         disable_digit_ids: bool = False,
         disable_mathsym_ids: bool = False,
         eval_max_subtokens: int | None = None,
+        eval_max_codebook_size: int | None = None,
         trim_stop_strings: bool = True,
         multi_view: bool = True,
         preserve_leading_space: bool = True,
@@ -330,8 +341,33 @@ class Zip2ZipLM(LM):
         self.checkpoint_max_subtokens = int(
             (self.train_args or {}).get("max_subtokens", self.cfg.max_subtokens)
         )
-        self.eval_max_subtokens = int(self.cfg.max_subtokens)
-        if self.cfg.max_codebook_size == 0 and eval_mode == "compressed":
+        self.eval_max_subtokens = (
+            int(eval_max_subtokens)
+            if eval_max_subtokens is not None
+            else int(self.cfg.max_subtokens)
+        )
+        self.checkpoint_max_codebook_size = int(self.cfg.max_codebook_size)
+        if eval_max_codebook_size is None:
+            self.eval_max_codebook_size = self.checkpoint_max_codebook_size
+        else:
+            eval_max_codebook_size = int(eval_max_codebook_size)
+            if eval_max_codebook_size < 0:
+                raise ValueError(
+                    f"eval_max_codebook_size must be non-negative, got {eval_max_codebook_size}"
+                )
+            if eval_max_codebook_size > self.checkpoint_max_codebook_size:
+                raise ValueError(
+                    f"eval_max_codebook_size ({eval_max_codebook_size}) cannot exceed "
+                    f"checkpoint max_codebook_size ({self.checkpoint_max_codebook_size})"
+                )
+            self.eval_max_codebook_size = eval_max_codebook_size
+            if self.eval_max_codebook_size != self.checkpoint_max_codebook_size:
+                print(
+                    "[zip2zip-lm-eval] eval max_codebook_size override: "
+                    f"checkpoint={self.checkpoint_max_codebook_size} "
+                    f"eval={self.eval_max_codebook_size}"
+                )
+        if self.checkpoint_max_codebook_size == 0 and eval_mode == "compressed":
             # With max_codebook_size=0 the compressor is an exact identity, so
             # compressed scoring equals base scoring numerically — but slower
             # and mislabeled in the results JSON. Control checkpoints are
@@ -339,6 +375,19 @@ class Zip2ZipLM(LM):
             print("[zip2zip-lm-eval] checkpoint was trained with "
                   "max_codebook_size=0 (uncompressed control) — auto-switching "
                   "eval_mode to 'base'.")
+            eval_mode = "base"
+        elif (
+            self.eval_max_codebook_size == 0 or self.eval_max_subtokens == 1
+        ) and eval_mode == "compressed":
+            reason = (
+                "eval_max_codebook_size=0"
+                if self.eval_max_codebook_size == 0
+                else "eval_max_subtokens=1"
+            )
+            print(
+                f"[zip2zip-lm-eval] {reason} disables all LZW merges — "
+                "auto-switching eval_mode to 'base'."
+            )
             eval_mode = "base"
         # The harness/launchers default the tokenizer to Llama-3. If the
         # checkpoint's meta.pt recorded the training tokenizer, prefer it over
@@ -543,8 +592,8 @@ class Zip2ZipLM(LM):
 
         self._compressor_kwargs = dict(
             initial_vocab_size=self.cfg.vocab_size,
-            max_codebook_size=self.cfg.max_codebook_size,
-            max_subtokens=self.cfg.max_subtokens,
+            max_codebook_size=self.eval_max_codebook_size,
+            max_subtokens=self.eval_max_subtokens,
             pad_token_id=self.cfg.pad_token_id,
             disabled_ids=self._disabled_ids,
         )
@@ -564,7 +613,12 @@ class Zip2ZipLM(LM):
         # (pre-rename alias) on the model_args string.
         if "max_seq_len" in kwargs and "max_length" not in kwargs:
             kwargs["max_length"] = kwargs.pop("max_seq_len")
-        for int_key in ("max_length", "batch_size"):
+        for int_key in (
+            "max_length",
+            "batch_size",
+            "eval_max_subtokens",
+            "eval_max_codebook_size",
+        ):
             if int_key in kwargs:
                 kwargs[int_key] = int(kwargs[int_key])
         if "hyper_causal_mask" in kwargs:
@@ -1426,20 +1480,28 @@ class Zip2ZipLM(LM):
     def _manager_updates_to_tensor(
         self, flat_updates: List[int], indices: List[int]
     ) -> torch.LongTensor:
-        """Reshape the manager's flat (num_entries * S,) update list into the
-        (1, len(indices), max_subtokens) tensor the model expects.
+        """Reshape the manager's flat (num_entries * S_comp,) update list into
+        the (1, len(indices), cfg.max_subtokens) tensor the model expects.
 
-        The rust manager pads each entry to `max_subtokens` and emits them in
-        slot order; only the first `len(indices)` rows are real, the rest are
-        padding from the unused tail of the codebook buffer.
+        The rust manager pads each entry to ``self.eval_max_subtokens`` and
+        emits them in slot order; when ``eval_max_subtokens`` narrows a flat
+        hyper-encoder, right-pad each row with ``pad_token_id`` up to the
+        model's ``cfg.max_subtokens``.
         """
-        S = self.cfg.max_subtokens
+        S_comp = self.eval_max_subtokens
+        S_model = self.cfg.max_subtokens
+        pad = self.cfg.pad_token_id
         n = len(indices)
         if n == 0:
             return torch.zeros(
-                (1, 0, S), dtype=torch.long, device=self._device
+                (1, 0, S_model), dtype=torch.long, device=self._device
             )
-        rows = [flat_updates[i * S : (i + 1) * S] for i in range(n)]
+        rows = []
+        for i in range(n):
+            entry = list(flat_updates[i * S_comp : (i + 1) * S_comp])
+            if len(entry) < S_model:
+                entry.extend([pad] * (S_model - len(entry)))
+            rows.append(entry[:S_model])
         return torch.tensor([rows], dtype=torch.long, device=self._device)
 
     def _strip_pad(self, entry: List[int]) -> List[int]:
@@ -1712,10 +1774,10 @@ class Zip2ZipLM(LM):
         seed_indices = list(indices[0])
         # Build hyper→base dict from the seeded entries (used to expand
         # generated hyper tokens back into base tokens for stop-string checks).
-        S = cfg.max_subtokens
+        S_comp = self.eval_max_subtokens
         hyper_to_base: dict[int, List[int]] = {}
         for row, slot in enumerate(seed_indices):
-            entry = flat[0][row * S : (row + 1) * S]
+            entry = flat[0][row * S_comp : (row + 1) * S_comp]
             hyper_to_base[V + slot] = self._strip_pad(entry)
 
         # Resets the hyper-embedding buffers only. Those live on the model and
@@ -1782,7 +1844,7 @@ class Zip2ZipLM(LM):
             new_flat, new_indices = manager.update_codebooks([expansion])
             new_idx_list = list(new_indices[0])
             for row, slot in enumerate(new_idx_list):
-                entry = new_flat[0][row * S : (row + 1) * S]
+                entry = new_flat[0][row * S_comp : (row + 1) * S_comp]
                 hyper_to_base[V + slot] = self._strip_pad(entry)
 
             updates_t = self._manager_updates_to_tensor(new_flat[0], new_idx_list)

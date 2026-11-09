@@ -201,8 +201,12 @@ def main():
                    help="Override task sampling settings with deterministic greedy decoding.")
     p.add_argument("--eval_max_subtokens", type=int, default=None,
                    help="Eval-only override for LZW max_subtokens. Unset follows "
-                        "the checkpoint meta.pt; changing it is supported for "
-                        "hierarchical hyper-encoders only.")
+                        "the checkpoint meta.pt; flat hyper-encoders support "
+                        "narrowing (1..checkpoint max_subtokens), hierarchical "
+                        "encoders support any positive value.")
+    p.add_argument("--eval_max_codebook_size", type=int, default=None,
+                   help="Eval-only override for LZW max_codebook_size "
+                        "(0..checkpoint max_codebook_size). Unset follows meta.pt.")
     p.add_argument("--no_hyper_causal_mask", action="store_true",
                    help="Disable hyper_causal_mask in the model forward.")
     p.add_argument("--no_online_codebook_mask", action="store_true",
@@ -287,6 +291,7 @@ def main():
         disable_digit_ids=args.disable_digit_ids,
         disable_mathsym_ids=args.disable_mathsym_ids,
         eval_max_subtokens=args.eval_max_subtokens,
+        eval_max_codebook_size=args.eval_max_codebook_size,
         trim_stop_strings=not args.legacy_untrimmed_stops,
         multi_view=not args.no_multi_view,
         preserve_leading_space=not args.legacy_stripped_generation,
@@ -303,6 +308,8 @@ def main():
     args.eval_mode = lm.eval_mode
     args.checkpoint_max_subtokens = lm.checkpoint_max_subtokens
     args.eval_max_subtokens = lm.eval_max_subtokens
+    args.checkpoint_max_codebook_size = lm.checkpoint_max_codebook_size
+    args.eval_max_codebook_size = lm.eval_max_codebook_size
     args.base_token_positions = lm.cfg.base_token_positions
     args.two_axis_rope = lm.cfg.two_axis_rope
     args.gated_compressed_rope = bool(
@@ -340,6 +347,10 @@ def main():
     print(
         f"[eval_harness] max_subtokens: checkpoint="
         f"{args.checkpoint_max_subtokens} eval={args.eval_max_subtokens}"
+    )
+    print(
+        f"[eval_harness] max_codebook_size: checkpoint="
+        f"{args.checkpoint_max_codebook_size} eval={args.eval_max_codebook_size}"
     )
     print(
         f"[eval_harness] decoder RoPE: base_positions="
