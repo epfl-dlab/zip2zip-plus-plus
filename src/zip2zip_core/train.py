@@ -881,7 +881,12 @@ def load_checkpoint(model, optimizer, resume_dir, device, random_weights=False):
             print("Curriculum transition detected — skipping optimizer state load (will re-init)")
     elif os.path.exists(opt_path):
         opt_state = torch.load(opt_path, map_location="cpu")
-        set_optimizer_state_dict(model, optimizer, optim_state_dict=opt_state, options=set_opts)
+        # In MAX_CODEBOOK_SIZE=0 control runs, hyper_encoder parameters never
+        # receive gradients and therefore have no entries in opt_state["state"].
+        opt_opts = StateDictOptions(
+            full_state_dict=True, broadcast_from_rank0=True, strict=False
+        )
+        set_optimizer_state_dict(model, optimizer, optim_state_dict=opt_state, options=opt_opts)
     else:
         if dist.get_rank() == 0:
             print("No optimizer.pt found — optimizer will start fresh")
