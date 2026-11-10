@@ -413,7 +413,12 @@ path, want_mode, want_ms, want_cb, want_digits, want_syms = (
 args = json.load(open(path))["args"]
 if want_mode:
     got = args["eval_mode"]
-    assert got == want_mode, f"eval-mode audit FAILED: {path} recorded {got!r}, expected {want_mode!r}"
+    expected_mode = (
+        "base"
+        if (want_ms == "1" or want_cb == "0") and want_mode == "compressed"
+        else want_mode
+    )
+    assert got == expected_mode, f"eval-mode audit FAILED: {path} recorded {got!r}, expected {expected_mode!r}"
 if want_ms:
     got = args.get("eval_max_subtokens")
     assert got == int(want_ms), f"eval-max-subtokens audit FAILED: {path} recorded {got!r}, expected {want_ms}"

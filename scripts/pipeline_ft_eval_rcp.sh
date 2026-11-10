@@ -288,15 +288,33 @@ echo "========================================"
 
 # ---------- phase 0: preflight (fail fast, before any GPU work) ----------
 if [ -e "$OUTPUT_DIR" ]; then
-    echo "FATAL: output dir already exists: $OUTPUT_DIR"
-    if [ -n "${PRETRAIN_DATA_DIR:-}" ]; then
-        echo "Two-stage mode: to KEEP the finished pretraining in ${OUTPUT_DIR}-pt,"
-        echo "delete only $OUTPUT_DIR and resubmit with PRETRAIN_REUSE=1."
-        echo "Do NOT pick a fresh RUN_NAME — that would redo the pretraining from zero."
+    if [ -n "${AUTO_RESUME:-}" ] && [ "${AUTO_RESUME}" != "0" ]; then
+        _has_complete=0
+        for _d in "$OUTPUT_DIR"/step_*; do
+            [ -d "$_d" ] || continue
+            if [ -f "$_d/model.pt" ] && [ -f "$_d/meta.pt" ]; then
+                _has_complete=1
+                break
+            fi
+        done
+        if [ "$_has_complete" = "1" ]; then
+            echo "[pipeline] AUTO_RESUME=1: existing output dir has complete checkpoint(s): $OUTPUT_DIR"
+        else
+            echo "[pipeline] AUTO_RESUME=1: $OUTPUT_DIR has no complete step_*/ checkpoint yet (preempted before first save) — cleaning for fresh start"
+            rm -rf "$OUTPUT_DIR"
+        fi
+        unset _has_complete _d
     else
-        echo "Pick a fresh RUN_NAME — this pipeline never reuses or suffixes dirs."
+        echo "FATAL: output dir already exists: $OUTPUT_DIR"
+        if [ -n "${PRETRAIN_DATA_DIR:-}" ]; then
+            echo "Two-stage mode: to KEEP the finished pretraining in ${OUTPUT_DIR}-pt,"
+            echo "delete only $OUTPUT_DIR and resubmit with PRETRAIN_REUSE=1."
+            echo "Do NOT pick a fresh RUN_NAME — that would redo the pretraining from zero."
+        else
+            echo "Pick a fresh RUN_NAME — this pipeline never reuses or suffixes dirs."
+        fi
+        exit 1
     fi
-    exit 1
 fi
 if [ ! -d "$DATA_DIR" ] || ! ls "$DATA_DIR"/shard_*.npy >/dev/null 2>&1; then
     echo "FATAL: DATA_DIR missing or has no shard_*.npy: $DATA_DIR"
@@ -413,10 +431,14 @@ PY
 fi
 
 # ---------- phase 1: train (the launcher owns its env/venv/flags) ----------
-echo "=== phase 1/4: training ==="
-bash "$PROJECT_DIR/scripts/finetune_phi35_rcp.sh"
-
 FINAL_CKPT="$OUTPUT_DIR/step_$STEPS"
+if [ -n "${AUTO_RESUME:-}" ] && [ "${AUTO_RESUME}" != "0" ] && [ -f "$FINAL_CKPT/model.pt" ] && [ -f "$FINAL_CKPT/meta.pt" ]; then
+    echo "=== phase 1/4: training already complete ($FINAL_CKPT) — skipping to eval (AUTO_RESUME=1) ==="
+else
+    echo "=== phase 1/4: training ==="
+    bash "$PROJECT_DIR/scripts/finetune_phi35_rcp.sh"
+fi
+
 if [ ! -f "$FINAL_CKPT/model.pt" ]; then
     echo "FATAL: training finished but $FINAL_CKPT/model.pt is missing."
     echo "If a '(1)'-suffixed sibling of $OUTPUT_DIR exists, something pre-created"

@@ -477,7 +477,9 @@ def test_flat_checkpoint_pareto_narrowing_score_and_generate(tmp_path, monkeypat
 
 def test_eval_ckpt_launcher_pareto_flags_and_audit(tmp_path):
     launcher = REPO / "scripts" / "eval_ckpt_rcp.sh"
+    pipeline = REPO / "scripts" / "pipeline_ft_eval_rcp.sh"
     subprocess.run(["bash", "-n", str(launcher)], check=True)
+    subprocess.run(["bash", "-n", str(pipeline)], check=True)
 
     base_env = {
         **os.environ,
@@ -534,6 +536,14 @@ def test_eval_ckpt_launcher_pareto_flags_and_audit(tmp_path):
     )
     subprocess.run(
         [sys.executable, "-", str(res_json), "", "2", "0", "1", ""],
+        input=audit_prog,
+        text=True,
+        check=True,
+    )
+    # Even if EVAL_MODE=compressed is passed alongside cb=0 or ms=1, the audit
+    # recognizes the automatic switch to eval_mode="base".
+    subprocess.run(
+        [sys.executable, "-", str(res_json), "compressed", "2", "0", "1", ""],
         input=audit_prog,
         text=True,
         check=True,

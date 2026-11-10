@@ -1488,7 +1488,9 @@ class Zip2ZipLM(LM):
         hyper-encoder, right-pad each row with ``pad_token_id`` up to the
         model's ``cfg.max_subtokens``.
         """
-        S_comp = self.eval_max_subtokens
+        S_comp = int(
+            getattr(self, "eval_max_subtokens", None) or self.cfg.max_subtokens
+        )
         S_model = self.cfg.max_subtokens
         pad = self.cfg.pad_token_id
         n = len(indices)
@@ -1774,7 +1776,9 @@ class Zip2ZipLM(LM):
         seed_indices = list(indices[0])
         # Build hyper→base dict from the seeded entries (used to expand
         # generated hyper tokens back into base tokens for stop-string checks).
-        S_comp = self.eval_max_subtokens
+        S_comp = int(
+            getattr(self, "eval_max_subtokens", None) or cfg.max_subtokens
+        )
         hyper_to_base: dict[int, List[int]] = {}
         for row, slot in enumerate(seed_indices):
             entry = flat[0][row * S_comp : (row + 1) * S_comp]
