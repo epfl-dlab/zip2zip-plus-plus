@@ -292,7 +292,7 @@ if [ -e "$OUTPUT_DIR" ]; then
         _has_complete=0
         for _d in "$OUTPUT_DIR"/step_*; do
             [ -d "$_d" ] || continue
-            if [ -f "$_d/model.pt" ] && [ -f "$_d/meta.pt" ]; then
+            if [ -s "$_d/model.pt" ] && [ -s "$_d/meta.pt" ]; then
                 _has_complete=1
                 break
             fi
@@ -432,7 +432,7 @@ fi
 
 # ---------- phase 1: train (the launcher owns its env/venv/flags) ----------
 FINAL_CKPT="$OUTPUT_DIR/step_$STEPS"
-if [ -n "${AUTO_RESUME:-}" ] && [ "${AUTO_RESUME}" != "0" ] && [ -f "$FINAL_CKPT/model.pt" ] && [ -f "$FINAL_CKPT/meta.pt" ]; then
+if [ -n "${AUTO_RESUME:-}" ] && [ "${AUTO_RESUME}" != "0" ] && [ -s "$FINAL_CKPT/model.pt" ] && [ -s "$FINAL_CKPT/meta.pt" ]; then
     echo "=== phase 1/4: training already complete ($FINAL_CKPT) — skipping to eval (AUTO_RESUME=1) ==="
 else
     echo "=== phase 1/4: training ==="

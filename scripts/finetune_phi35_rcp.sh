@@ -344,10 +344,10 @@ if [ -n "$AUTO_RESUME" ] && [ "$AUTO_RESUME" != "0" ] && [ -z "$RESUME_FROM" ]; 
         [ -d "$_d" ] || continue
         _n=${_d##*/step_}
         case "$_n" in ''|*[!0-9]*) continue ;; esac
-        if [ -f "$_d/model.pt" ] && [ -f "$_d/meta.pt" ]; then
+        if [ -s "$_d/model.pt" ] && [ -s "$_d/meta.pt" ]; then
             if [ "$_n" -gt "$_latest_step" ]; then _latest_step=$_n; _latest_complete=$_d; fi
         else
-            echo "[finetune_rcp] AUTO_RESUME: skipping incomplete checkpoint $_d (no meta.pt)"
+            echo "[finetune_rcp] AUTO_RESUME: skipping incomplete checkpoint $_d (missing or empty model.pt/meta.pt)"
         fi
     done
     if [ -n "$_latest_complete" ]; then

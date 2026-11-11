@@ -633,12 +633,21 @@ def save_checkpoint(model, optimizer, step, args, output_dir, hf_repo=None,
             _hf_upload_thread.join()
 
         os.makedirs(ckpt_dir, exist_ok=True)
-        torch.save(model_sd, os.path.join(ckpt_dir, "model.pt"))
+
+        # Write to a temp file and rename, so a preemption mid-write can never
+        # leave a truncated file under the final name (os.replace is atomic).
+        def _atomic_save(obj, name):
+            final_path = os.path.join(ckpt_dir, name)
+            tmp_path = final_path + ".tmp"
+            torch.save(obj, tmp_path)
+            os.replace(tmp_path, final_path)
+
+        _atomic_save(model_sd, "model.pt")
         if optim_sd is not None:
-            torch.save(optim_sd, os.path.join(ckpt_dir, "optimizer.pt"))
-        torch.save(
+            _atomic_save(optim_sd, "optimizer.pt")
+        _atomic_save(
             {"step": step, "args": vars(args), "loader_state": loader_state},
-            os.path.join(ckpt_dir, "meta.pt"),
+            "meta.pt",
         )
         if loader_state is None:
             print(f"[Rank 0] Saved checkpoint at step {step} "
@@ -2773,6 +2782,11 @@ def main():
                     )
                     for ck, cv in kids:
                         print_entry(ck, cv, indent=1, ref=parent_val)
+    elif step % args.save_freq == 0 and not args.hf_repo:
+        # The periodic save in the loop already wrote step_{step}; re-saving it
+        # only reopens a complete checkpoint for writing.
+        if rank == 0:
+            print(f"[Rank 0] Final checkpoint step_{step} already saved — skipping re-save")
     else:
         save_checkpoint(model, optimizer, step, args, args.output_dir, hf_repo=args.hf_repo,
                         dataloader=dataloader)
