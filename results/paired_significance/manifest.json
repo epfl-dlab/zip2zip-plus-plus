@@ -1,0 +1,86 @@
+{
+  "scope": "Four original-paper comparisons; no sharedS. Frozen question hashes and binary outcomes only.",
+  "comparisons": [
+    {
+      "comparison": "4B gsm8k",
+      "file": "4B_gsm8k.csv",
+      "N": 1319,
+      "sha256": "12dcf08fb7624bf7d6f15ee987b411f81b587eae56763315627d04fc62e1b4d0",
+      "metric": "combined strict-when-present, otherwise flexible exact_match",
+      "sources": [
+        {
+          "results_sha256": "ad7ab2e004e67c20cbd192997c74e4ed88ea4a436bae46a5d1ef832013551afb",
+          "samples_parent_sha256": "43b305c759652081d265b8c020848bba38ebb38939d3ac651ca842f0384b900e",
+          "samples_extracted_sha256": "43b305c759652081d265b8c020848bba38ebb38939d3ac651ca842f0384b900e",
+          "original_wandb_table_sha256": "50ad506b3934ad0578de528bd983244c772966b47f46eec649e2dcd6fa842b69",
+          "user_download_sha256": "ebae59715406fb25f08675ed6848119626f330e5701181747b28545a0bc4c624"
+        },
+        {
+          "results_sha256": "d614ba91dddefebf24dc48f457f291acde62d5377726577a3759fe928fa44645",
+          "samples_parent_sha256": "884e0a9807eb7b1e89dff9c1c0b5a81025cbf2c527e4ea1b514bceff6f450c10",
+          "samples_extracted_sha256": "884e0a9807eb7b1e89dff9c1c0b5a81025cbf2c527e4ea1b514bceff6f450c10",
+          "original_wandb_table_sha256": "a8b57ebb548bbb33d6c1df5e8410aa085ec9d3b358541f23cbaba993a0835e93",
+          "user_download_sha256": "a8b57ebb548bbb33d6c1df5e8410aa085ec9d3b358541f23cbaba993a0835e93"
+        }
+      ]
+    },
+    {
+      "comparison": "4B math500",
+      "file": "4B_math500.csv",
+      "N": 500,
+      "sha256": "a39a434ec16c41f99ba663c7bf0dfffdd9b71b960c59a6880627511c7d0d7a14",
+      "metric": "math_verify,none",
+      "sources": [
+        {
+          "results_sha256": "c4f0504fd776176ce658f1538b8c6fb22134eef12567d479d3c58b170a7936d2",
+          "samples_parent_sha256": "ca8c7c0db64cd3e8dbd8960493b42e08b651c03a69a38cb2e785583a0f25267a",
+          "samples_extracted_sha256": "8a2cceedc63e2802ee3c9a71e1bacffe323d066869af11646c2210724c72f847"
+        },
+        {
+          "results_sha256": "8f00c9b7e647e122268ab9480d93df6b188461ac61a8341188f1200c7920dfaf",
+          "samples_parent_sha256": "a5f71fd5c4eafbbbd50f79e351691a10ed3dd345cff53b198c916f753570c372",
+          "samples_extracted_sha256": "f374be62558990f09d70bd1827f3c58570a1cc42dc420e13164a5a58fb863b78"
+        }
+      ]
+    },
+    {
+      "comparison": "14B gsm8k",
+      "file": "14B_gsm8k.csv",
+      "N": 1319,
+      "sha256": "77adb6aeef27afccc787a36ae6bb14b7c2191d19ad8a31b6836608f7ec0dad56",
+      "metric": "combined strict-when-present, otherwise flexible exact_match",
+      "sources": [
+        {
+          "results_sha256": "e6791bfe67245bb7943d9e05fbcdf1ddb1254d3f63574b1f24352a8f6c7f5243",
+          "samples_parent_sha256": "df7fcc1e1f5f4ab13008c7487a61817681928fbea67f3c2d993eb83fd5d7de00",
+          "samples_extracted_sha256": "aa6eb58c821d9d72dab1696e0e2497975a1d23f4abb5806fd30c5f9f75f74923"
+        },
+        {
+          "results_sha256": "bb5a86342c3b2cbb4416fa351f4f83fffe141bf7765b72c1c705001d901b0c87",
+          "samples_parent_sha256": "fbb391d5e3d44b0389284529408c81498f20b4430ca498881f33fc027796336d",
+          "samples_extracted_sha256": "377548550379becb4f134cd3796fa8b6364fe555174cf245d4739dadd8b43023"
+        }
+      ]
+    },
+    {
+      "comparison": "14B math500",
+      "file": "14B_math500.csv",
+      "N": 500,
+      "sha256": "c24b8c6bd4c144e14c7f89eb73ed64f9b53425a4780bfce11ee807daa250cf47",
+      "metric": "math_verify,none",
+      "sources": [
+        {
+          "results_sha256": "7f66ced45e8fdaf91c7b2ee66ac8237fca11dc2be2bf837ef3369b8ed28abcab",
+          "samples_parent_sha256": "797cd358e4555dfafc2c150e380fd75f6eb660ed2a9dc57181b753d64ec67457",
+          "samples_extracted_sha256": "43dec9a4233f7fa0cefdcb3942f950c51da1b482817dd8b09b2502b182b1e64b"
+        },
+        {
+          "results_sha256": "edca9128935720df7de53400245fa35024de51ce1c86ecb5ffbf98212da28b8a",
+          "samples_parent_sha256": "cc39692c839ac1ba647007c69bef3b3bc42cb654de6b476391379178de1d0db8",
+          "samples_extracted_sha256": "10cc341432d18681239783d63384c0c3285d7a56e13029bc335ba01192141550"
+        }
+      ]
+    }
+  ],
+  "family_size": 4
+}

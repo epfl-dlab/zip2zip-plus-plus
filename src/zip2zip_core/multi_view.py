@@ -16,11 +16,13 @@ non-empty prefix of (y1..yn):
 
     p*(x | ctx) = p(y1 | ctx) + sum over L in 2..n of p(h_L | ctx)
 
-where h_L is the codebook entry expanding to (y1..yL), when it exists. Since
-the canonical target is in the set, p* >= p_strict always, so the multi-view
-perplexity is a lower (more favorable) bound and strict/multi-view bracket
-the model's true quality. For a base-token target the set degenerates to the
-singleton {x} and multi-view equals strict.
+where h_L is the codebook entry expanding to (y1..yL), when it exists. For
+a fixed target-start conditional distribution with an admissible canonical
+target, strict probability <= exact span marginal <= first-token bound;
+the corresponding perplexity inequalities are reversed. Each comparison
+conditions on the canonical prefix and the fixed dictionary for that target
+span. For a base-token target the set degenerates to the singleton {x} and
+multi-view equals strict.
 
 Availability note for the bound: LZW dictionaries are prefix-closed — an entry
 W·z is only ever inserted when W is already an entry — so every prefix entry
@@ -28,8 +30,9 @@ of a target was created strictly before the target itself. Whenever the
 canonical target is a legal emission, so is every first-token candidate; no
 decode-time replay is needed for the bound. The exact scorer additionally
 considers entries matching interior substrings, filters them against the
-dictionary state at the start of the target, and replays decoder state along
-each non-canonical prefix.
+dictionary state specified by the scoring protocol at the start of the target,
+and recomputes model conditionals along each non-canonical prefix while freezing
+that dictionary.
 
 Aggregation is denominator-free by design: lm-eval reports every rolling
 perplexity metric as a monotone function of sum(loglik)/D for some per-task

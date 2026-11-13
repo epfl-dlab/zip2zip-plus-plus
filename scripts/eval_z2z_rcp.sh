@@ -30,11 +30,11 @@
 #   LIMIT=20        Per-task sample limit for smoke tests
 #   LIMIT=          Full evaluation (default)
 #   TASKS=gsm8k     Comma-separated task override (default: preset's task list)
-#   Z2Z_SCRATCH=...     Your PVC scratch dir (default: /dlabscratch1/gentilin)
+#   Z2Z_SCRATCH=...     Your PVC scratch dir (default: $Z2Z_SCRATCH)
 #
 set -euo pipefail
 
-Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/gentilin}
+Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/$(id -un)}
 export HF_HOME=$Z2Z_SCRATCH/.cache/huggingface
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false

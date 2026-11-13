@@ -62,7 +62,7 @@
 #                   before 2026-09 did: SentencePiece tokenizers (Phi) then drop
 #                   one leading space, which breaks HumanEval indentation. Only
 #                   for bit-exact reproduction of old generation samples.
-#   Z2Z_SCRATCH=...     Your PVC scratch dir (default: /dlabscratch1/gentilin)
+#   Z2Z_SCRATCH=...     Your PVC scratch dir (default: $Z2Z_SCRATCH)
 #   WANDB=1         Log results/samples/compression to W&B (default: off, JSON+log
 #                   only). Requires WANDB_API_KEY in the job env.
 #   WANDB_ENTITY=. W&B entity (default: epfl-dlab)
@@ -89,7 +89,7 @@
 #
 set -euo pipefail
 
-Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/gentilin}
+Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/$(id -un)}
 export HF_HOME=$Z2Z_SCRATCH/.cache/huggingface
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false

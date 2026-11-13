@@ -1,0 +1,73 @@
+{
+  "family_size": 4,
+  "comparisons": [
+    {
+      "comparison": "4B gsm8k",
+      "N": 1319,
+      "metric": "combined strict-when-present, otherwise flexible exact_match",
+      "status": "verified",
+      "correct_zip2zip": 469,
+      "correct_zip2zippp": 894,
+      "accuracy_zip2zip": 0.3555724033358605,
+      "accuracy_zip2zippp": 0.6777862016679302,
+      "delta_pp": 32.221379833206974,
+      "both_correct": 409,
+      "both_wrong": 365,
+      "zip2zip_only": 60,
+      "zip2zippp_only": 485,
+      "p_raw": 1.2461635477345725e-83,
+      "p_holm": 4.98465419093829e-83
+    },
+    {
+      "comparison": "4B math500",
+      "N": 500,
+      "metric": "math_verify,none",
+      "status": "verified",
+      "correct_zip2zip": 76,
+      "correct_zip2zippp": 119,
+      "accuracy_zip2zip": 0.152,
+      "accuracy_zip2zippp": 0.238,
+      "delta_pp": 8.6,
+      "both_correct": 52,
+      "both_wrong": 357,
+      "zip2zip_only": 24,
+      "zip2zippp_only": 67,
+      "p_raw": 7.348549184628526e-06,
+      "p_holm": 1.4697098369257052e-05
+    },
+    {
+      "comparison": "14B gsm8k",
+      "N": 1319,
+      "metric": "combined strict-when-present, otherwise flexible exact_match",
+      "status": "verified",
+      "correct_zip2zip": 678,
+      "correct_zip2zippp": 916,
+      "accuracy_zip2zip": 0.5140257771038665,
+      "accuracy_zip2zippp": 0.6944655041698257,
+      "delta_pp": 18.043972706595905,
+      "both_correct": 551,
+      "both_wrong": 276,
+      "zip2zip_only": 127,
+      "zip2zippp_only": 365,
+      "p_raw": 1.043473427834156e-27,
+      "p_holm": 3.1304202835024677e-27
+    },
+    {
+      "comparison": "14B math500",
+      "N": 500,
+      "metric": "math_verify,none",
+      "status": "verified",
+      "correct_zip2zip": 112,
+      "correct_zip2zippp": 148,
+      "accuracy_zip2zip": 0.224,
+      "accuracy_zip2zippp": 0.296,
+      "delta_pp": 7.2,
+      "both_correct": 82,
+      "both_wrong": 322,
+      "zip2zip_only": 30,
+      "zip2zippp_only": 66,
+      "p_raw": 0.00030559732759326285,
+      "p_holm": 0.00030559732759326285
+    }
+  ]
+}

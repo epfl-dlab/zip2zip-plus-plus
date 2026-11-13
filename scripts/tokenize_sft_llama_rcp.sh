@@ -24,7 +24,7 @@
 #
 set -euo pipefail
 
-Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/gentilin}
+Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/$(id -un)}
 export HF_HOME=${HF_HOME:-$Z2Z_SCRATCH/.cache/huggingface}
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false

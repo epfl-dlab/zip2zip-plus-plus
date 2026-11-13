@@ -10,9 +10,9 @@
 #     --gpu 4 --cpu 16 --memory 128Gi \
 #     --pvc dlab-scratch:/mnt --large-shm --node-pools default \
 #     --environment RUN_NAME=andrea-z2z-phi35-4B-eosfix-v0.2 \
-#     --environment DATA_DIR=/dlabscratch1/gentilin/datasets/phi-1B-sft-8shards-eosfix \
+#     --environment DATA_DIR=$Z2Z_SCRATCH/datasets/phi-1B-sft-8shards-eosfix \
 #     --environment WANDB_API_KEY=$WANDB_API_KEY \
-#     -- bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh
+#     -- bash $Z2Z_SCRATCH/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh
 #
 # Phases (all logged to one pipeline log, job aborts on the first failure):
 #   0. preflight   hard-fail on: existing output dir (no silent "(1)" suffixes),
@@ -174,7 +174,7 @@
 #       --environment FINAL_LIMIT=8 ...
 set -euo pipefail
 
-Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/gentilin}
+Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/$(id -un)}
 export HF_HOME=${HF_HOME:-$Z2Z_SCRATCH/.cache/huggingface}
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false

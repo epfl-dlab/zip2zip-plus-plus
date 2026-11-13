@@ -1,5 +1,7 @@
 # Finetuning from Pretrained Weights
 
+Set `Z2Z_SCRATCH` to your cluster scratch directory before adapting the Run:AI examples, for example `export Z2Z_SCRATCH=/dlabscratch1/your-cluster-user`. The wrappers default to `/dlabscratch1/$(id -un)` inside the cluster container. Pass the variable through your scheduler environment when overriding it.
+
 ## Current standard recipe: v0.6.4
 
 **Launch every new finetune with `RECIPE=v0.6.4`.** One name selects the whole
@@ -13,7 +15,7 @@ runai submit --name ft-<short-name> \
   --environment WANDB_API_KEY=$WANDB_API_KEY \
   --environment RUN_NAME=andrea-z2z-phi35-4B-<change>-1BData-<version>-Zip2zipCore \
   --environment RECIPE=v0.6.4 \
-  -- "bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
+  -- "bash $Z2Z_SCRATCH/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
 ```
 
 v0.6.4 resolves to these five levers — each one a validated win, each documented
@@ -672,7 +674,7 @@ runai-rcp-prod submit --name ft-onlinecb-v065 \
   --environment WANDB_API_KEY=$WANDB_API_KEY \
   --environment RUN_NAME=andrea-z2z-phi35-4B-onlinecb-1BData-v0.6.5-Zip2zipCore \
   --environment RECIPE=v0.6.5 \
-  -- "bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
+  -- "bash $Z2Z_SCRATCH/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
 ```
 
 Before an 8k launch, the required gate is every CPU invariant suite plus a
@@ -847,13 +849,13 @@ runai-rcp-prod submit --name smoke-z2z-v066 \
   --gpu 4 --cpu 16 --memory 128Gi \
   --pvc dlab-scratch:/mnt --large-shm --node-pools h100 \
   --environment WANDB=0 --environment NUM_WORKERS=0 \
-  --environment DATA_DIR=/dlabscratch1/gentilin/datasets/phi-1B-sft-8shards-eosfix \
+  --environment DATA_DIR=$Z2Z_SCRATCH/datasets/phi-1B-sft-8shards-eosfix \
   --environment RUN_NAME=andrea-z2z-phi35-4B-baseview25-smoke-v0.6.6 \
   --environment RECIPE=v0.6.6 --environment SEED=42 \
   --environment STEPS=20 --environment SAVE_FREQ=20 --environment LOG_FREQ=1 \
   --environment SMOKE_EVERY=20 --environment SMOKE_LIMIT=8 \
   --environment FINAL_LIMIT=8 --environment SKIP_FULL_PPL=1 \
-  -- "bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
+  -- "bash $Z2Z_SCRATCH/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
 ```
 
 The full seed-42 v0.6.6 run is:
@@ -864,10 +866,10 @@ runai-rcp-prod submit --name ft-z2z-v066 \
   --gpu 4 --cpu 16 --memory 128Gi \
   --pvc dlab-scratch:/mnt --large-shm --node-pools h100 \
   --environment WANDB=0 --environment NUM_WORKERS=0 \
-  --environment DATA_DIR=/dlabscratch1/gentilin/datasets/phi-1B-sft-8shards-eosfix \
+  --environment DATA_DIR=$Z2Z_SCRATCH/datasets/phi-1B-sft-8shards-eosfix \
   --environment RUN_NAME=andrea-z2z-phi35-4B-baseview25-1BData-v0.6.6-Zip2zipCore \
   --environment RECIPE=v0.6.6 --environment SEED=42 \
-  -- "bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
+  -- "bash $Z2Z_SCRATCH/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
 ```
 
 The four-H100 v0.7.1 smoke is:
@@ -878,13 +880,13 @@ runai-rcp-prod submit --name smoke-z2z-v071 \
   --gpu 4 --cpu 16 --memory 128Gi \
   --pvc dlab-scratch:/mnt --large-shm --node-pools h100 \
   --environment WANDB=0 --environment NUM_WORKERS=0 \
-  --environment DATA_DIR=/dlabscratch1/gentilin/datasets/phi-1B-sft-8shards-eosfix \
+  --environment DATA_DIR=$Z2Z_SCRATCH/datasets/phi-1B-sft-8shards-eosfix \
   --environment RUN_NAME=andrea-z2z-phi35-4B-gatedrope-lowfreq-smoke-v0.7.1 \
   --environment RECIPE=v0.7.1 --environment SEED=42 \
   --environment STEPS=20 --environment SAVE_FREQ=20 --environment LOG_FREQ=1 \
   --environment SMOKE_EVERY=20 --environment SMOKE_LIMIT=8 \
   --environment FINAL_LIMIT=8 --environment SKIP_FULL_PPL=1 \
-  -- "bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
+  -- "bash $Z2Z_SCRATCH/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
 ```
 
 The full seed-42 v0.7.1 run is:
@@ -895,16 +897,16 @@ runai-rcp-prod submit --name ft-z2z-v071 \
   --gpu 4 --cpu 16 --memory 128Gi \
   --pvc dlab-scratch:/mnt --large-shm --node-pools h100 \
   --environment WANDB=0 --environment NUM_WORKERS=0 \
-  --environment DATA_DIR=/dlabscratch1/gentilin/datasets/phi-1B-sft-8shards-eosfix \
+  --environment DATA_DIR=$Z2Z_SCRATCH/datasets/phi-1B-sft-8shards-eosfix \
   --environment RUN_NAME=andrea-z2z-phi35-4B-gatedrope-lowfreq-1BData-v0.7.1-Zip2zipCore \
   --environment RECIPE=v0.7.1 --environment SEED=42 \
-  -- "bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
+  -- "bash $Z2Z_SCRATCH/code/zip2zip-core/scripts/pipeline_ft_eval_rcp.sh"
 ```
 
 ## Canonical RCP locations and run conventions
 
 Single source of truth for where things live on the cluster (`$SCRATCH =
-/dlabscratch1/gentilin`); update this table in the same commit as any change.
+$Z2Z_SCRATCH`); update this table in the same commit as any change.
 
 | What | Path | Notes |
 |---|---|---|

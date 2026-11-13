@@ -9,8 +9,8 @@
 #     --image ghcr.io/jkminder/dlab-runai-images/pytorch:master \
 #     --gpu 1 --cpu 8 --memory 64Gi \
 #     --pvc dlab-scratch:/mnt --large-shm --node-pools default \
-#     --environment CKPT_DIR='/dlabscratch1/gentilin/zip2zip-outputs/<run>/step_8000' \
-#     -- bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/diagnose_ckpt_rcp.sh
+#     --environment CKPT_DIR='$Z2Z_SCRATCH/zip2zip-outputs/<run>/step_8000' \
+#     -- bash $Z2Z_SCRATCH/code/zip2zip-core/scripts/diagnose_ckpt_rcp.sh
 #
 # Env vars:
 #   CKPT_DIR=...    (required) step_N checkpoint dir
@@ -22,7 +22,7 @@
 #   REPLAY_ONLY=1   stop after the train-style replay/denominator diagnostic
 set -euo pipefail
 
-Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/gentilin}
+Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/$(id -un)}
 export HF_HOME=$Z2Z_SCRATCH/.cache/huggingface
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false

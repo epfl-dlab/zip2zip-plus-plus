@@ -189,6 +189,12 @@ def main():
                         "Phi-3-medium-4k checkpoint.")
     p.add_argument("--fail_on_truncation", action="store_true",
                    help="Abort instead of silently left-truncating an overlength request.")
+    p.add_argument("--allow_legacy_boundary_merges", action="store_true",
+                   help="Reproduce historical boundary selection, excluding crossing token spans; excluded base-token counts are recorded.")
+    p.add_argument("--deterministic_eval", action="store_true",
+                   help="Use deterministic PyTorch kernels and cuBLAS workspace configuration; record the numerical protocol.")
+    p.add_argument("--audit_generation", action="store_true",
+                   help="Save per-task prompt/generation token counts and emitted base ids.")
     p.add_argument("--no_kv_cache", action="store_true",
                    help="Generate by re-running the full prefix for every sampled "
                         "token instead of caching keys and values. The pre-2026-09 "
@@ -264,6 +270,18 @@ def main():
     preset_info = _apply_preset(p)
     args = p.parse_args()
 
+    # Seeded greedy decoding alone does not make CUDA reductions repeatable.
+    # Configure before loading the model or creating a CUDA context. Keep this
+    # opt-in so historical results retain their original numerical protocol.
+    import torch
+    if args.deterministic_eval:
+        workspace = os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        if workspace not in (":4096:8", ":16:8"):
+            raise ValueError("deterministic_eval requires CUBLAS_WORKSPACE_CONFIG=:4096:8 or :16:8")
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
     ckpt_dir = _resolve_ckpt_dir(args)
     tasks = (
         DEFAULT_TASKS
@@ -299,6 +317,8 @@ def main():
         rope_source=args.rope_source,
         fail_on_truncation=args.fail_on_truncation,
         use_kv_cache=not args.no_kv_cache,
+        audit_generation=args.audit_generation,
+        allow_legacy_boundary_merges=args.allow_legacy_boundary_merges,
     )
     # The adapter auto-enables digit protection for checkpoints trained with it
     # and auto-switches control checkpoints (max_codebook_size=0) to base mode —
@@ -499,6 +519,88 @@ def main():
     if not args.no_log_samples:
         print_samples(results)
 
+    generation_by_task = {}
+    for record in lm.generation_audit_records:
+        task = record["task"] or "unknown"
+        totals = generation_by_task.setdefault(task, {
+            "requests": 0, "prompt_base_tokens": 0, "prompt_compressed_tokens": 0,
+            "generated_base_tokens": 0, "generated_model_tokens": 0,
+            "prompt_tokens_dropped": 0, "hit_model_token_cap": 0,
+        })
+        totals["requests"] += 1
+        for key in totals.keys() - {"requests"}:
+            totals[key] += record[key]
+    for totals in generation_by_task.values():
+        for key, num, den in [
+            ("input_compression_ratio", "prompt_base_tokens", "prompt_compressed_tokens"),
+            ("gen_compression_ratio", "generated_base_tokens", "generated_model_tokens"),
+        ]:
+            totals[key] = totals[num] / totals[den] if totals[den] else None
+
+    if args.output_path:
+        out_dir = os.path.dirname(os.path.abspath(args.output_path))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(args.output_path, "w") as f:
+            json.dump(
+                {
+                    "results": results.get("results"),
+                    "configs": results.get("configs"),
+                    # Task versions and the harness's own config record (model
+                    # args, harness/transformers versions): the protocol a paper
+                    # number was produced under must be readable from the JSON.
+                    "versions": results.get("versions"),
+                    "config": results.get("config"),
+                    "compression": compression,
+                    "generation_compression_by_task": generation_by_task,
+                    "numerical_protocol": {
+                        "torch_version": torch.__version__,
+                        "cuda_version": torch.version.cuda,
+                        "gpu": torch.cuda.get_device_name(lm._device) if lm._device.type == "cuda" else None,
+                        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+                        "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+                        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+                        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+                        "matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+                    },
+                    "multi_view": multi_view,
+                    "eval_wall_seconds": eval_wall_seconds,
+                    "ckpt_dir": ckpt_dir,
+                    "tasks": tasks,
+                    "args": vars(args),
+                },
+                f,
+                indent=2,
+                default=str,
+            )
+        print(f"Saved results JSON to {args.output_path}")
+        # Per-sample generations next to the results. With RESUME_WANDB_ID the
+        # launcher runs the harness with --no_wandb, so the W&B sample tables
+        # that gsm8k's paired (McNemar) analyses relied on are never written;
+        # without this file a follow-up eval's generations are gone for good.
+        # Generation tasks only: MC and perplexity samples have no downstream
+        # consumer and would add ~1e2 MB per default eval to the PVC.
+        configs = results.get("configs") or {}
+        gen_samples = {
+            task: rows
+            for task, rows in (results.get("samples") or {}).items()
+            if (configs.get(task) or {}).get("output_type") == "generate_until"
+        }
+        if not args.no_log_samples and gen_samples:
+            stem, _ = os.path.splitext(args.output_path)
+            samples_path = f"{stem}_samples.json"
+            with open(samples_path, "w") as f:
+                json.dump(gen_samples, f, default=str)
+            print(f"Saved per-sample generations to {samples_path}")
+
+        if args.audit_generation:
+            stem, _ = os.path.splitext(args.output_path)
+            with open(f"{stem}_generation_audit.json", "w") as f:
+                json.dump({"description": "Emitted token counts before textual stop trimming; input counts cover generation prompts only.",
+                           "by_task": generation_by_task,
+                           "records": lm.generation_audit_records}, f)
+            print(f"Saved generation audit to {stem}_generation_audit.json")
+
     if not args.no_wandb:
         from zip2zip_core.project import WANDB_ENTITY, WANDB_PROJECT
         from lm_eval.loggers import WandbLogger
@@ -571,50 +673,6 @@ def main():
             wandb_logger.log_eval_samples(results["samples"])
         print(f"[eval_harness] Results logged to W&B: {wandb_logger.run.url}")
 
-    if args.output_path:
-        out_dir = os.path.dirname(os.path.abspath(args.output_path))
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        with open(args.output_path, "w") as f:
-            json.dump(
-                {
-                    "results": results.get("results"),
-                    "configs": results.get("configs"),
-                    # Task versions and the harness's own config record (model
-                    # args, harness/transformers versions): the protocol a paper
-                    # number was produced under must be readable from the JSON.
-                    "versions": results.get("versions"),
-                    "config": results.get("config"),
-                    "compression": compression,
-                    "multi_view": multi_view,
-                    "eval_wall_seconds": eval_wall_seconds,
-                    "ckpt_dir": ckpt_dir,
-                    "tasks": tasks,
-                    "args": vars(args),
-                },
-                f,
-                indent=2,
-                default=str,
-            )
-        print(f"Saved results JSON to {args.output_path}")
-        # Per-sample generations next to the results. With RESUME_WANDB_ID the
-        # launcher runs the harness with --no_wandb, so the W&B sample tables
-        # that gsm8k's paired (McNemar) analyses relied on are never written;
-        # without this file a follow-up eval's generations are gone for good.
-        # Generation tasks only: MC and perplexity samples have no downstream
-        # consumer and would add ~1e2 MB per default eval to the PVC.
-        configs = results.get("configs") or {}
-        gen_samples = {
-            task: rows
-            for task, rows in (results.get("samples") or {}).items()
-            if (configs.get(task) or {}).get("output_type") == "generate_until"
-        }
-        if not args.no_log_samples and gen_samples:
-            stem, _ = os.path.splitext(args.output_path)
-            samples_path = f"{stem}_samples.json"
-            with open(samples_path, "w") as f:
-                json.dump(gen_samples, f, default=str)
-            print(f"Saved per-sample generations to {samples_path}")
 
 
 if __name__ == "__main__":

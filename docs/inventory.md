@@ -2,8 +2,8 @@
 
 ## Zip2Zip++ release targets
 
-The guarded release path supports exactly four base-model families. Fill in the
-final repository IDs when the releases are created.
+The guarded release path supports exactly four base-model families. The public
+repository IDs are listed below.
 
 | Release | Base model | HF repository |
 |---|---|---|

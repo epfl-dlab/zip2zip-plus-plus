@@ -11,10 +11,10 @@ Creates one W&B run per invocation with:
 
 Usage (cluster, where WANDB_API_KEY is set):
     python scripts/log_results_to_wandb.py \
-        --json  /dlabscratch1/gentilin/logs/eval/results_<...>.json \
+        --json  $Z2Z_SCRATCH/logs/eval/results_<...>.json \
         --name  eval-MC-andrea-z2z-phi35-4B-repro-1BData-v0.1-Zip2zipCore-fixed \
-        --notes "RCP log: /dlabscratch1/gentilin/logs/eval/eval_<...>.log" \
-        --log   /dlabscratch1/gentilin/logs/eval/eval_<...>.log
+        --notes "RCP log: $Z2Z_SCRATCH/logs/eval/eval_<...>.log" \
+        --log   $Z2Z_SCRATCH/logs/eval/eval_<...>.log
 """
 
 from __future__ import annotations

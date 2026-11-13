@@ -115,6 +115,8 @@ See [Export and interoperability](docs/export.md) for format details.
 
 ## Paper reproduction
 
+The four original-run GSM8K/MATH-500 paired tests and their frozen binary outcomes are documented in [Paired significance](docs/reproducibility/paired_significance.md). This reproduces the statistics without model inference or optional dependencies.
+
 The hyper-encoder embedding probes (substitution and sequence probes) used in
 the paper live in the `ext/zip2zip-plus-plus-hyperenc-probe` submodule. See its
 [README](ext/zip2zip-plus-plus-hyperenc-probe/README.md) for reproduction commands.

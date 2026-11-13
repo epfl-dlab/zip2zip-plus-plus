@@ -197,11 +197,11 @@ its W&B run so the numbers sit next to `final/gsm8k/*`:
 runai submit --name postsft-v064 \
   --image ghcr.io/jkminder/dlab-runai-images/pytorch:master \
   --gpu 1 --cpu 8 --memory 64Gi --pvc dlab-scratch:/mnt --large-shm --node-pools h100 \
-  --environment CKPT_DIR=/dlabscratch1/gentilin/zip2zip-outputs/<run>/step_8000 \
+  --environment CKPT_DIR=$Z2Z_SCRATCH/zip2zip-outputs/<run>/step_8000 \
   --environment TOKENIZER=microsoft/Phi-3.5-mini-instruct \
   --environment PRESET=postsft \
   --environment RESUME_WANDB_ID=<run id> --environment WANDB_STEP=8000 \
-  -- bash /dlabscratch1/gentilin/code/zip2zip-core/scripts/eval_ckpt_rcp.sh
+  -- bash $Z2Z_SCRATCH/code/zip2zip-core/scripts/eval_ckpt_rcp.sh
 ```
 
 W&B keys follow `log_results_to_wandb.py`'s `<task>/<metric>_<filter>` flattening:
@@ -259,8 +259,10 @@ does not invoke the builder, and an explicit rebuild requires `--overwrite`.
 
 ## RCP cluster wrappers (Run:AI)
 
+Set `Z2Z_SCRATCH` to your own cluster scratch directory in the examples below. The wrappers default to `/dlabscratch1/$(id -un)` inside the cluster container.
+
 Three `runai submit`-ready wrappers, all under `scripts/`, sharing the `Z2Z_SCRATCH` env var
-(default `/dlabscratch1/gentilin`, override per-user) for cache/log/output paths:
+(default `/dlabscratch1/$(id -un)` inside the container, override per-user) for cache/log/output paths:
 
 - **`eval_ckpt_rcp.sh`** — evaluates a zip2zip *training checkpoint* (`model.pt` + `meta.pt`)
   hosted on HF, via `eval_harness.py` + the `Zip2ZipLM` adapter. Used for MS2/MS3/MS4

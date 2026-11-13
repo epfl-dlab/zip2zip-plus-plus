@@ -32,8 +32,8 @@
 #
 #   LIMIT=20        Run only 20 samples per task (quick smoke test)
 #   LIMIT=          Full evaluation (default)
-#   HF_HOME=...     HuggingFace cache dir (default: /dlabscratch1/gentilin/.cache/huggingface)
-#   Z2Z_SCRATCH=...     Your PVC scratch dir (default: /dlabscratch1/gentilin)
+#   HF_HOME=...     HuggingFace cache dir (default: $Z2Z_SCRATCH/.cache/huggingface)
+#   Z2Z_SCRATCH=...     Your PVC scratch dir (default: $Z2Z_SCRATCH)
 #
 # ── Expected results (paper Table 3, Phi-3.5-4B Base, 2-shot) ───────────
 #
@@ -43,7 +43,7 @@
 set -euo pipefail
 
 # ---------- paths ----------
-Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/gentilin}
+Z2Z_SCRATCH=${Z2Z_SCRATCH:-/dlabscratch1/$(id -un)}
 export HF_HOME=${HF_HOME:-$Z2Z_SCRATCH/.cache/huggingface}
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false

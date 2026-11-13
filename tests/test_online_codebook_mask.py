@@ -458,7 +458,7 @@ def main():
                 remap_codebook=False,
             )
             next(iter(limited_dataset))
-        except RuntimeError:
+        except ValueError:
             active_input_raises = True
     check("O9_dataset_guards",
           remap_raises and mode_raises and active_input_raises,

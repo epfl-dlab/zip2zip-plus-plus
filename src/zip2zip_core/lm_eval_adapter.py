@@ -313,6 +313,8 @@ class Zip2ZipLM(LM):
         rope_source: str | None = None,
         fail_on_truncation: bool = False,
         use_kv_cache: bool = True,
+        audit_generation: bool = False,
+        allow_legacy_boundary_merges: bool = False,
     ):
         super().__init__()
         if not torch.cuda.is_available() and device.startswith("cuda"):
@@ -552,6 +554,9 @@ class Zip2ZipLM(LM):
         # (e.g. scripts/eval_harness.py) after simple_evaluate returns.
         # in_*: full (context + continuation) sequences fed for scoring.
         # gen_*: tokens emitted by generate_until.
+        self.allow_legacy_boundary_merges = bool(allow_legacy_boundary_merges)
+        self.audit_generation = bool(audit_generation)
+        self.generation_audit_records = []
         self.compression_stats = {
             "in_comp": 0,
             "in_base": 0,
@@ -635,6 +640,10 @@ class Zip2ZipLM(LM):
             kwargs["fail_on_truncation"] = kwargs["fail_on_truncation"].lower() in ("1", "true", "yes")
         if "use_kv_cache" in kwargs:
             kwargs["use_kv_cache"] = kwargs["use_kv_cache"].lower() in ("1", "true", "yes")
+        if "allow_legacy_boundary_merges" in kwargs:
+            kwargs["allow_legacy_boundary_merges"] = kwargs["allow_legacy_boundary_merges"].lower() in ("1", "true", "yes")
+        if "audit_generation" in kwargs:
+            kwargs["audit_generation"] = kwargs["audit_generation"].lower() in ("1", "true", "yes")
         if additional_config:
             for k in ("batch_size", "device"):
                 if k not in kwargs and additional_config.get(k) is not None:
@@ -1165,6 +1174,27 @@ class Zip2ZipLM(LM):
             spans.append((cursor, cursor + length))
             cursor += length
 
+        omitted = sum(
+            end - cont_start_base
+            for start, end in spans
+            if start < cont_start_base < end
+        )
+        if omitted:
+            self.compression_stats["boundary_omitted_base_tokens"] = (
+                self.compression_stats.get("boundary_omitted_base_tokens", 0) + omitted
+            )
+            self.compression_stats["boundary_crossing_requests"] = (
+                self.compression_stats.get("boundary_crossing_requests", 0) + 1
+            )
+            if reject_unavailable_targets and not getattr(self, "allow_legacy_boundary_merges", False):
+                raise RuntimeError(
+                    "compressed token crosses the context/continuation boundary; "
+                    f"the boundary intersects {omitted} target base token(s). "
+                    "Use an aligned boundary for complete scoring. "
+                    "allow_legacy_boundary_merges=True reproduces the historical "
+                    "boundary selection and records excluded base tokens."
+                )
+
         x = torch.tensor(compressed[:-1], dtype=torch.long, device=self._device).unsqueeze(0)
         cb = self._codebook_to_tensor(codebook).to(self._device).unsqueeze(0)
         codebook_counts = None
@@ -1456,6 +1486,9 @@ class Zip2ZipLM(LM):
                 lp, _, n_comp, _, mv_lp, nh, exact_lp = self._score(
                     full_ids,
                     cont_start_base=len(prefix_tokens),
+                    # Keep target coverage consistent with the harness
+                    # byte/word denominators.
+                    reject_unavailable_targets=True,
                     compute_multi_view=True,
                 )
                 total += lp
@@ -1667,6 +1700,7 @@ class Zip2ZipLM(LM):
                 )
             ctx_ids = ctx_ids[-max_ctx:]
 
+        prompt_base_tokens = len(ctx_ids)
         seq = list(ctx_ids)
         gen_ids: List[int] = []
         # One prefill, then one token per step. The loop keeps the uncached
@@ -1693,6 +1727,17 @@ class Zip2ZipLM(LM):
             logits = self._generation_forward(seq, cache)
         self.compression_stats["gen_comp"] += len(gen_ids)
         self.compression_stats["gen_base"] += len(gen_ids)
+        if getattr(self, "audit_generation", False):
+            self.generation_audit_records.append({
+                "prompt_base_tokens": prompt_base_tokens,
+                "prompt_compressed_tokens": prompt_base_tokens,
+                "generated_base_tokens": len(gen_ids),
+                "generated_model_tokens": len(gen_ids),
+                "generated_base_ids": list(gen_ids),
+                "generated_token_spans": [1] * len(gen_ids),
+                "max_gen_toks": max_gen_toks,
+                "hit_model_token_cap": len(gen_ids) == max_gen_toks,
+            })
         return self._trim_stops(self._decode_generation(gen_ids), until)
 
     @torch.no_grad()
@@ -1797,6 +1842,9 @@ class Zip2ZipLM(LM):
             compressed, cache, updates_t, updates_indices
         )
 
+        prompt_base_tokens = len(ctx_ids)
+        prompt_compressed_tokens = len(compressed)
+        generated_token_spans = []
         gen_base_ids: List[int] = []
         n_gen_comp = 0  # sampled compressed tokens that emitted >= 1 base token
         position_length = prompt_position_length()
@@ -1826,10 +1874,12 @@ class Zip2ZipLM(LM):
                 gen_base_ids.extend(expansion[:cut])
                 if cut > 0:
                     n_gen_comp += 1
+                    generated_token_spans.append(cut)
                 break
 
             gen_base_ids.extend(expansion)
             n_gen_comp += 1
+            generated_token_spans.append(len(expansion))
             position_length += position_span
 
             if until:
@@ -1861,6 +1911,17 @@ class Zip2ZipLM(LM):
 
         self.compression_stats["gen_comp"] += n_gen_comp
         self.compression_stats["gen_base"] += len(gen_base_ids)
+        if getattr(self, "audit_generation", False):
+            self.generation_audit_records.append({
+                "prompt_base_tokens": prompt_base_tokens,
+                "prompt_compressed_tokens": prompt_compressed_tokens,
+                "generated_base_tokens": len(gen_base_ids),
+                "generated_model_tokens": n_gen_comp,
+                "generated_base_ids": list(gen_base_ids),
+                "generated_token_spans": generated_token_spans,
+                "max_gen_toks": max_gen_toks,
+                "hit_model_token_cap": n_gen_comp == max_gen_toks,
+            })
         return self._trim_stops(self._decode_generation(gen_base_ids), until)
 
     def generate_until(self, requests) -> List[str]:
@@ -1878,6 +1939,8 @@ class Zip2ZipLM(LM):
             top_k = int(gen_kwargs.get("top_k", 0) or 0)
 
             ctx_ids = self.tok_encode(ctx) if ctx else []
+            prompt_original_tokens = len(ctx_ids)
+            audit_before = len(getattr(self, "generation_audit_records", []))
             if self.eval_mode == "compressed":
                 text = self._generate_compressed(
                     ctx_ids, until, max_gen_toks, do_sample, temperature, top_p, top_k
@@ -1886,5 +1949,19 @@ class Zip2ZipLM(LM):
                 text = self._generate_base(
                     ctx_ids, until, max_gen_toks, do_sample, temperature, top_p, top_k
                 )
+            if getattr(self, "audit_generation", False):
+                if len(self.generation_audit_records) == audit_before:
+                    self.generation_audit_records.append({
+                        "prompt_base_tokens": 0, "prompt_compressed_tokens": 0,
+                        "generated_base_tokens": 0, "generated_model_tokens": 0,
+                        "generated_base_ids": [], "generated_token_spans": [],
+                        "max_gen_toks": max_gen_toks, "hit_model_token_cap": False,
+                    })
+                record = self.generation_audit_records[-1]
+                record.update(task=getattr(req, "task_name", None),
+                              doc_id=getattr(req, "doc_id", None),
+                              prompt_original_base_tokens=prompt_original_tokens,
+                              prompt_tokens_dropped=prompt_original_tokens-record["prompt_base_tokens"],
+                              until=until, response=text)
             out.append(text)
         return out
